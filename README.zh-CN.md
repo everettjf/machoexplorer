@@ -148,4 +148,4 @@ cmake --build build --config Release
 MIT，详见 [LICENSE](LICENSE)。
 
 ## Star History
-[![Star History Chart](https://api.star-history.com/svg?repos=everettjf/MachOExplorer)](https://star-history.com/#everettjf/MachOExplorer)
+[![Star History Chart](https://star-history.dera.page/svg?repos=everettjf/MachOExplorer)](https://star-history.dera.page/#everettjf/MachOExplorer)
