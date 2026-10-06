@@ -3,6 +3,7 @@
 //  Copyright © 2017 everettjf. All rights reserved.
 //
 #include "AboutDialog.h"
+#include <QPushButton>
 #include "ui_AboutDialog.h"
 #include "src/base/AppInfo.h"
 #include "src/utility/Utility.h"
@@ -25,6 +26,11 @@ AboutDialog::AboutDialog(QWidget *parent) :
             .arg(AppInfo::Instance().GetAppVersion());
 
     ui->label_info->setText(info);
+    auto *discordButton = new QPushButton(tr("Discord"), this);
+    ui->horizontalLayout->insertWidget(0, discordButton);
+    connect(discordButton, &QPushButton::clicked, this, [] {
+        util::openURL("https://discord.gg/eGzEaP6TzR");
+    });
 }
 
 AboutDialog::~AboutDialog()

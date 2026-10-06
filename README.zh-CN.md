@@ -1,5 +1,7 @@
 # MachOExplorer
 
+[Discord](https://discord.gg/eGzEaP6TzR)
+
 > 一个聚焦 Apple 二进制的桌面分析工具——支持 Mach-O、Fat/Universal、`.a` Archive 与 dyld shared cache，为逆向与二进制审查而生。
 
 语言：简体中文 | [English](README.md)
