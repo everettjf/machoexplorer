@@ -134,3 +134,7 @@ if(MOEX_ENABLE_FUZZ)
         message(WARNING "MOEX_ENABLE_FUZZ requires Clang/libFuzzer; skipping moex-fuzz-parse")
     endif()
 endif()
+
+# Exercise the production GitHub response decoder without opening the GUI or network.
+add_executable(moex-release-info-test ../tests/regression/release_info_test.cpp)
+target_link_libraries(moex-release-info-test PRIVATE Qt${QT_VERSION_MAJOR}::Core)

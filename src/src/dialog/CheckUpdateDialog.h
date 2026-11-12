@@ -1,6 +1,6 @@
 //
 //  Created by everettjf
-//  Copyright © 2017 everettjf. All rights reserved.
+//  Copyright © 2017 AtomSprout. All rights reserved.
 //
 #ifndef CHECKUPDATEDIALOG_H
 #define CHECKUPDATEDIALOG_H
@@ -25,14 +25,12 @@ public:
 
 private slots:
     void on_pushButton_clicked();
-    void slot_appversion_detected(bool,QString);
 
     void on_pushButton_2_clicked();
 
-signals:
-    void signal_appversion_detected(bool,QString);
-
 private:
+    void showRelease(const QByteArray &body);
+    QString downloadUrl = "https://github.com/everettjf/MachOExplorer/releases/latest";
     Ui::CheckUpdateDialog *ui;
     QNetworkAccessManager *manager;
     QNetworkRequest request;

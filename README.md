@@ -54,7 +54,7 @@ metadata (Objective-C, Swift, code signing) — in one window, or fully scripted
 ### Productivity & UX
 - Parsing runs **off the UI thread**, so opening a large binary or a multi-gigabyte shared cache keeps the window responsive.
 - Tables: per-column filter, copy row(s), CSV export, keyboard navigation.
-- Built-in update check with reminder options.
+- Built-in update check reads stable GitHub Releases over HTTPS. Successful results are cached for one hour; downloads open the matching release in your browser.
 
 ### Automation
 - Headless `--cli` mode prints the full analysis as text or **stable JSON** — ideal for scripting, diffing, and CI.

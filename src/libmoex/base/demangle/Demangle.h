@@ -1,6 +1,6 @@
 //
 //  Created by everettjf
-//  Copyright © 2017 everettjf. All rights reserved.
+//  Copyright © 2017 AtomSprout. All rights reserved.
 //
 // C++ (Itanium) symbol demangling via the C++ runtime. No extra dependency:
 // abi::__cxa_demangle ships with both libstdc++ and libc++.

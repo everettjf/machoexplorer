@@ -1,6 +1,6 @@
 //
 //  Created by everettjf
-//  Copyright © 2017 everettjf. All rights reserved.
+//  Copyright © 2017 AtomSprout. All rights reserved.
 //
 // Small dependency-free SHA-1 / SHA-256 used to compute code-signing cdhash.
 // libmoex must not depend on Qt, so we cannot use QCryptographicHash here.

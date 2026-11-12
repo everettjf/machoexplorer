@@ -8,4 +8,6 @@ ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 "${ROOT_DIR}/tests/regression/run_cache_tools_smoke.sh" "${1:-}"
 "${ROOT_DIR}/tests/regression/run_crash_regression.sh"
 
+"${ROOT_DIR}/build/moex-release-info-test"
+
 echo "regression-all: passed"

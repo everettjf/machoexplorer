@@ -1,6 +1,6 @@
 //
 //  Created by everettjf
-//  Copyright © 2017 everettjf. All rights reserved.
+//  Copyright © 2017 AtomSprout. All rights reserved.
 //
 #ifndef MOEXHELPER_H
 #define MOEXHELPER_H

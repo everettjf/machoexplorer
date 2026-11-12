@@ -1,6 +1,6 @@
 //
 //  Created by everettjf
-//  Copyright © 2017 everettjf. All rights reserved.
+//  Copyright © 2017 AtomSprout. All rights reserved.
 //
 #ifndef LAYOUTCONTROLLER_H
 #define LAYOUTCONTROLLER_H
