@@ -13,6 +13,7 @@ int main(int argc, char **argv) {
     };
     const auto info = ReleaseInfo::parse(release("v2.0.16"));
     check(!info.version.isNull(), "stable GitHub response");
+    check(!ReleaseInfo::parse(release("v2.0.16", "https://github.com/everettjf/machoexplorer/releases/tag/v2.0.16")).version.isNull(), "canonical lowercase repository URL");
     check(QVersionNumber::compare(info.version,ReleaseInfo::parseVersion("2.0.9"))>0,"numeric ordering");
     check(QVersionNumber::compare(info.version,ReleaseInfo::parseVersion("2.0.17"))<0,"newer local build");
     check(ReleaseInfo::parseVersion(" v2.0.16\n")==info.version,"trim and prefix");

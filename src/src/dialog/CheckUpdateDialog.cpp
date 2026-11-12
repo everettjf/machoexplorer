@@ -27,7 +27,7 @@ CheckUpdateDialog::CheckUpdateDialog(QWidget *parent) :
         showRelease(cachedBody);
         return;
     }
-    request.setUrl(QUrl("https://api.github.com/repos/everettjf/MachOExplorer/releases/latest"));
+    request.setUrl(QUrl("https://api.github.com/repos/everettjf/machoexplorer/releases/latest"));
     request.setRawHeader("Accept", "application/vnd.github+json");
     request.setRawHeader("User-Agent", "MachOExplorer-update-check");
     request.setAttribute(QNetworkRequest::RedirectPolicyAttribute, QNetworkRequest::ManualRedirectPolicy);

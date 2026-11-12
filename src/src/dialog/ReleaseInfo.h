@@ -29,7 +29,7 @@ struct ReleaseInfo {
                            QUrl(object.value("html_url").toString())};
         if (result.version.isNull() || result.url.scheme() != "https"
             || result.url.host() != "github.com" || result.url.port(-1) != -1 || !result.url.userInfo().isEmpty()
-            || !result.url.path().startsWith("/everettjf/MachOExplorer/releases/tag/")
+            || !result.url.path().startsWith("/everettjf/machoexplorer/releases/tag/", Qt::CaseInsensitive)
             || result.url.hasQuery() || result.url.hasFragment()) return {};
         return result;
     }

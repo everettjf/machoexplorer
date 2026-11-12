@@ -30,7 +30,7 @@ private slots:
 
 private:
     void showRelease(const QByteArray &body);
-    QString downloadUrl = "https://github.com/everettjf/MachOExplorer/releases/latest";
+    QString downloadUrl = "https://github.com/everettjf/machoexplorer/releases/latest";
     Ui::CheckUpdateDialog *ui;
     QNetworkAccessManager *manager;
     QNetworkRequest request;
