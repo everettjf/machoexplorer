@@ -121,7 +121,9 @@ cask "machoexplorer" do
   url "${URL}"
   name "MachOExplorer"
   desc "Mach-O and archive explorer"
-  homepage "https://github.com/everettjf/MachOExplorer"
+  homepage "https://atomsprout.com/machoexplorer/"
+
+  depends_on :macos
 
   app "MachOExplorer.app"
 end
