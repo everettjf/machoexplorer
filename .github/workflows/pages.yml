@@ -33,6 +33,8 @@ jobs:
         with:
           enablement: true
 
+      - name: Redirect legacy website to AtomSprout
+        run: python3 scripts/redirect-legacy-site.py site machoexplorer
       - name: Upload site artifact
         uses: actions/upload-pages-artifact@v3
         with:

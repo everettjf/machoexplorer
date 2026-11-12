@@ -4,7 +4,7 @@
 #define MyAppName "MachOExplorer"
 #define MyAppVersion "1.0"
 #define MyAppPublisher "everettjf"
-#define MyAppURL "https://everettjf.github.io"
+#define MyAppURL "https://atomsprout.com/"
 #define MyAppExeName "MachOExplorer.exe"
 
 [Setup]
