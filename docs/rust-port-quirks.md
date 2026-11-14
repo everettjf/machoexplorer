@@ -71,3 +71,17 @@ marked `QUIRK(parity)` in the code. Revisit them once the oracle is retired.
 | Capstone version | Rust bundles Capstone 5.0.6 (`capstone` crate 0.14); the C++ oracle used Homebrew 5.0.9. Same options (default syntax, detail off, no SKIPDATA). No instruction text differed on any compared binary (arm64/arm64e, x86_64, armv7). |
 | `Xref Report` node | Work is bounded: at most 4x the file size is scanned per Mach-O header (only reachable when crafted sections alias the same bytes; C++ scans each in full), and a pointer read that falls outside the file fails instead of reading out of bounds. |
 | `Xref Report` node | The sweep does not use the bundled Capstone 5.0.6 but private decoders that match the oracle's Capstone 5.0.9 (the two differ: 5.0.6 rejects the x86-64 `movsxd r32, r/m32` encoding `63 /r` without REX.W, which ends a sweep early). They match 5.0.9 exactly on everything tested (see the module docs of `macho/xref.rs`), with known gaps in corners that real code does not reach: a few EVEX encodings whose validity depends on masking together with other prefix bits, and 32-bit x86 near jumps under a 67 prefix. Such bytes can only be met as data inside `__text`, where they may end the sweep a little earlier or later than Capstone did. |
+
+## Differential run on system binaries
+
+`tests/golden/compare_live.py` compared the full JSON dump of the Rust tool
+with the C++ oracle on every Mach-O under 3 MB in `/bin`, `/sbin`,
+`/usr/bin`, `/usr/sbin`, `/usr/libexec` and `/usr/lib` (macOS 27.2):
+1263 files, 1258 identical, 5 different. All five fall into the intentional
+differences above:
+
+| File | Node | Cause |
+|---|---|---|
+| `/usr/bin/trace`, `/usr/libexec/cryptexd`, `/usr/libexec/kcgend` (arm64) | Swift Semantic Graph | The C++ tool passed names through a shell, which ate quote characters inside strings such as `Job '%{public}@' which …`. The port never uses a shell, so the text is shown as stored. |
+| `/usr/libexec/dhcp6d` (x86_64) | `__text` disassembly | The bundled Capstone 5.0.6 rejects `63 /r` without REX.W (`movsxd r32, r/m32`), which Capstone 5.0.9 (used by the oracle) decodes. The byte sequence sits inside a jump table, so the C++ output had one extra, meaningless row before stopping. |
+| `/usr/bin/usbdiagnose` (x86_64) | Chained Fixups | The C++ walk read one byte before the start of the Mach-O slice (out of bounds for a thin file); the port stops there. |
