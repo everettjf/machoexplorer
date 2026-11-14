@@ -2,7 +2,7 @@
 #
 # MOEX_BIN overrides the binary under test (default: target/release/moex).
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 MOEX_BIN="${MOEX_BIN:-${ROOT_DIR}/target/release/moex}"
 
 require_moex() {

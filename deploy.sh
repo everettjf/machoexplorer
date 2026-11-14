@@ -147,7 +147,7 @@ if [[ "${NO_BUMP}" -eq 0 ]]; then
 fi
 
 if [[ "${NO_PUSH}" -eq 0 ]]; then
-  git push origin master
+  git push origin HEAD
 fi
 
 if [[ "${NO_TAG}" -eq 0 ]]; then

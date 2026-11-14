@@ -70,7 +70,7 @@ require_cmd awk
 require_cmd sed
 
 if [[ -z "$VERSION" ]]; then
-  VERSION="$(sed -n 's/^#define LIBMOEX_VERSION \"\\(.*\\)\"/\\1/p' "${ROOT_DIR}/src/libmoex/ver.h" | head -1)"
+  VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' "${ROOT_DIR}/Cargo.toml" | head -1)"
 fi
 if [[ -z "$VERSION" ]]; then
   echo "Cannot determine version. Pass --version." >&2

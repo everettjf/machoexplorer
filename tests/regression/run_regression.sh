@@ -1,15 +1,11 @@
 #!/usr/bin/env bash
+# Parser regression: every case in cases.txt must parse (`moex parse`).
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-PARSER_BIN="${ROOT_DIR}/build/moex-parse"
+source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 CASE_FILE="${ROOT_DIR}/tests/regression/cases.txt"
 
-if [[ ! -x "${PARSER_BIN}" ]]; then
-  echo "missing parser binary: ${PARSER_BIN}"
-  echo "build first: cmake --build build -j8"
-  exit 2
-fi
+require_moex
 
 if [[ ! -f "${CASE_FILE}" ]]; then
   echo "missing cases file: ${CASE_FILE}"
@@ -25,7 +21,7 @@ while IFS= read -r relpath; do
     echo "[skip] missing case ${relpath}"
     continue
   fi
-  if ! "${PARSER_BIN}" "${abspath}"; then
+  if ! "${MOEX_BIN}" parse "${abspath}"; then
     FAIL=1
   fi
 done < "${CASE_FILE}"

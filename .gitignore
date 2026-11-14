@@ -1,38 +1,16 @@
 .DS_Store
 
-release/
-
-# Clion
-.idea/
-cmake-build-debug/
-cmake-build-release/
-
-# Qt Creator
-build-MachOExplorer-Desktop_Qt_5_12_3_clang_64bit-Debug/
-build-MachOExplorer-Desktop_Qt_5_12_3_clang_64bit-Release/
-build-MachOExplorer-Desktop_Qt_5_12_3_clang_64bit-Profile/
-
-build-MachOExplorer-Desktop_Qt_5_12_3_MSVC2017_64bit-Debug/
-build-MachOExplorer-Desktop_Qt_5_12_3_MSVC2017_64bit-Release/
-build-MachOExplorer-Desktop_Qt_5_12_3_MSVC2017_64bit-Profile/
-
-src/MachOExplorer.pro.user
-
-# vscode cmake-tools extension
-.vscode/
-
-
-build_macos/
-build_windows/
-build-win/
-build/
-src/build/
-
-.qtcreator/
-src/.qtcreator/
-
-dist/
-tmp/
-
 # Rust
 target/
+
+# Local oracle build (retired C++ implementation, see tests/golden/oracle)
+build/
+
+# Packaging output
+dist/
+release/
+tmp/
+
+# Editors
+.idea/
+.vscode/

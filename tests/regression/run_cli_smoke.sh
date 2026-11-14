@@ -1,103 +1,91 @@
 #!/usr/bin/env bash
+# Smoke test of `moex dump` (the replacement for `MachOExplorer --cli`).
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
-BUILD_DIR="${ROOT_DIR}/build"
-APP_BUNDLE_BIN="${BUILD_DIR}/MachOExplorer.app/Contents/MacOS/MachOExplorer"
-PLAIN_BIN="${BUILD_DIR}/MachOExplorer"
+source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 SAMPLE_FILE="${ROOT_DIR}/sample/simple"
 FAT_SAMPLE_FILE="${ROOT_DIR}/sample/complex"
-OUT_TEXT="/tmp/moex-cli-smoke.txt"
-OUT_JSON="/tmp/moex-cli-smoke.json"
-OUT_FAT="/tmp/moex-cli-smoke-fat.txt"
 
-# Prefer the macOS .app bundle; fall back to the plain binary (Linux/Windows).
-# DIR_CASE is a directory used to verify the parser rejects directory paths.
-if [[ -x "${APP_BUNDLE_BIN}" ]]; then
-  APP_BIN="${APP_BUNDLE_BIN}"
-  DIR_CASE="${BUILD_DIR}/MachOExplorer.app"
-elif [[ -x "${PLAIN_BIN}" ]]; then
-  APP_BIN="${PLAIN_BIN}"
-  DIR_CASE="${BUILD_DIR}"
-else
-  echo "cli-smoke: missing app binary in ${BUILD_DIR}; build first"
-  exit 2
-fi
+require_moex
 
 if [[ ! -f "${SAMPLE_FILE}" ]]; then
   echo "cli-smoke: missing sample file: ${SAMPLE_FILE}"
   exit 2
 fi
 
-"${APP_BIN}" --cli --max-rows 8 "${SAMPLE_FILE}" >"${OUT_TEXT}"
-"${APP_BIN}" --cli --format json --max-rows 8 "${SAMPLE_FILE}" >"${OUT_JSON}"
-"${APP_BIN}" --cli --format json --name-filter "Mach Header" --table-mode summary "${SAMPLE_FILE}" >"${OUT_JSON}.filtered"
+TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/moex-cli-smoke.XXXXXX")"
+trap 'rm -rf "${TMP_DIR}"' EXIT
+OUT_TEXT="${TMP_DIR}/smoke.txt"
+OUT_JSON="${TMP_DIR}/smoke.json"
+OUT_FAT="${TMP_DIR}/smoke-fat.txt"
 
-if command -v rg >/dev/null 2>&1; then
-  text_header_cmd=(rg -q "^file:")
-  json_field_cmd=(rg -q '"analysis"')
-  schema_field_cmd=(rg -q '"schemaVersion"')
-  path_field_cmd=(rg -q '"path"')
-  summary_mode_cmd=(rg -q '"tableMode": "summary"')
-else
-  text_header_cmd=(grep -qE "^file:")
-  json_field_cmd=(grep -qE '"analysis"')
-  schema_field_cmd=(grep -qE '"schemaVersion"')
-  path_field_cmd=(grep -qE '"path"')
-  summary_mode_cmd=(grep -qE '"tableMode": "summary"')
-fi
+"${MOEX_BIN}" dump --max-rows 8 "${SAMPLE_FILE}" >"${OUT_TEXT}"
+"${MOEX_BIN}" dump --format json --max-rows 8 "${SAMPLE_FILE}" >"${OUT_JSON}"
+"${MOEX_BIN}" dump --format json --name-filter "Mach Header" --table-mode summary "${SAMPLE_FILE}" >"${OUT_JSON}.filtered"
 
-if ! "${text_header_cmd[@]}" "${OUT_TEXT}"; then
+if ! grep -qE "^file:" "${OUT_TEXT}"; then
   echo "cli-smoke: missing text output header"
   exit 1
 fi
 
-if ! "${json_field_cmd[@]}" "${OUT_JSON}"; then
+if ! grep -qE '"analysis"' "${OUT_JSON}"; then
   echo "cli-smoke: missing json analysis field"
   exit 1
 fi
 
-if ! "${schema_field_cmd[@]}" "${OUT_JSON}"; then
+if ! grep -qE '"schemaVersion"' "${OUT_JSON}"; then
   echo "cli-smoke: missing schemaVersion field"
   exit 1
 fi
 
-if ! "${path_field_cmd[@]}" "${OUT_JSON}"; then
+if ! grep -qE '"path"' "${OUT_JSON}"; then
   echo "cli-smoke: missing node path field"
   exit 1
 fi
 
-"${APP_BIN}" --cli --format json --max-rows=4 --output "${OUT_JSON}" "${SAMPLE_FILE}" >/dev/null
+rm -f "${OUT_JSON}"
+"${MOEX_BIN}" dump --format json --max-rows=4 --output "${OUT_JSON}" "${SAMPLE_FILE}" >/dev/null
 if [[ ! -s "${OUT_JSON}" ]]; then
   echo "cli-smoke: output file not written"
   exit 1
 fi
 
-if ! "${summary_mode_cmd[@]}" "${OUT_JSON}.filtered"; then
+if ! grep -qE '"tableMode": "summary"' "${OUT_JSON}.filtered"; then
   echo "cli-smoke: filtered summary output missing tableMode"
   exit 1
 fi
 
-if "${APP_BIN}" --cli "${DIR_CASE}" >/tmp/moex-cli-bundle.out 2>/tmp/moex-cli-bundle.err; then
-  echo "cli-smoke: app bundle path should fail gracefully"
-  exit 1
-fi
-
-if ! (
-  if command -v rg >/dev/null 2>&1; then
-    rg -q "Application bundles are directories|Path is a directory" /tmp/moex-cli-bundle.err
-  else
-    grep -qE "Application bundles are directories|Path is a directory" /tmp/moex-cli-bundle.err
+# Directories (including .app bundles) must be rejected with a clear message.
+mkdir -p "${TMP_DIR}/Fake.app" "${TMP_DIR}/plain-dir"
+check_dir_rejected() {
+  local dir_case="$1" message="$2"
+  if "${MOEX_BIN}" dump "${dir_case}" >"${TMP_DIR}/dir.out" 2>"${TMP_DIR}/dir.err"; then
+    echo "cli-smoke: directory path should fail gracefully: ${dir_case}"
+    exit 1
   fi
-); then
-  echo "cli-smoke: app bundle rejection message missing"
+  if ! grep -q "${message}" "${TMP_DIR}/dir.err"; then
+    echo "cli-smoke: rejection message missing for ${dir_case}: ${message}"
+    exit 1
+  fi
+}
+check_dir_rejected "${TMP_DIR}/Fake.app" "Application bundles are directories"
+check_dir_rejected "${TMP_DIR}/plain-dir" "Path is a directory"
+
+# Invalid arguments exit with 2, analysis failures with 1.
+set +e
+"${MOEX_BIN}" dump >/dev/null 2>&1
+usage_rc=$?
+"${MOEX_BIN}" dump "${TMP_DIR}/does-not-exist" >/dev/null 2>&1
+missing_rc=$?
+set -e
+if [[ "${usage_rc}" -ne 2 || "${missing_rc}" -ne 1 ]]; then
+  echo "cli-smoke: unexpected exit codes (usage=${usage_rc} missing-file=${missing_rc})"
   exit 1
 fi
 
-# Fat binaries exercise FatHeaderViewNode, which must produce a table without
-# crashing on an unset GetRAW callback.
+# Fat binaries exercise the Fat Header view.
 if [[ -f "${FAT_SAMPLE_FILE}" ]]; then
-  if ! "${APP_BIN}" --cli "${FAT_SAMPLE_FILE}" >"${OUT_FAT}" 2>/dev/null; then
+  if ! "${MOEX_BIN}" dump "${FAT_SAMPLE_FILE}" >"${OUT_FAT}" 2>/dev/null; then
     echo "cli-smoke: fat binary analysis failed"
     exit 1
   fi

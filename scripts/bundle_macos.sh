@@ -49,7 +49,7 @@ fi
 rm -rf "${APP_DIR}"
 mkdir -p "${APP_DIR}/Contents/MacOS" "${APP_DIR}/Contents/Resources"
 cp "${BIN_DIR}/MachOExplorer" "${APP_DIR}/Contents/MacOS/MachOExplorer"
-# The CLI ships inside the bundle; Homebrew links it as `moex`.
+# The CLI ships inside the bundle next to the GUI binary.
 cp "${BIN_DIR}/moex" "${APP_DIR}/Contents/MacOS/moex"
 [[ -f "${ICON_PATH}" ]] && cp "${ICON_PATH}" "${APP_DIR}/Contents/Resources/MachOExplorer.icns"
 

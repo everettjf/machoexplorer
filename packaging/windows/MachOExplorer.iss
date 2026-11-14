@@ -6,7 +6,7 @@
   #define MyAppName "MachOExplorer"
 #endif
 #ifndef MyAppVersion
-  #define MyAppVersion "2.0.0"
+  #define MyAppVersion "3.0.0"
 #endif
 #define MyAppPublisher "everettjf"
 #define MyAppURL "https://github.com/everettjf/MachOExplorer"
