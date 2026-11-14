@@ -118,6 +118,19 @@ if(MOEX_BUILD_PARSER_TOOL)
         tools/moex_cache_extract_main.cpp
     )
     target_include_directories(moex-cache-extract PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+    # Qt-free full dump CLI; golden-baseline oracle for the Rust rewrite.
+    add_executable(moex-dump
+        ${LIBMOEX_SOURCE}
+        ${LIBMOEX_HEADER}
+        tools/moex_dump_main.cpp
+    )
+    target_include_directories(moex-dump PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    if(CAPSTONE_INCLUDE_DIR AND CAPSTONE_LIBRARY)
+        target_compile_definitions(moex-dump PRIVATE MOEX_HAS_CAPSTONE=1)
+        target_include_directories(moex-dump PRIVATE ${CAPSTONE_INCLUDE_DIR})
+        target_link_libraries(moex-dump PRIVATE ${CAPSTONE_LIBRARY})
+    endif()
 endif()
 
 if(MOEX_ENABLE_FUZZ)

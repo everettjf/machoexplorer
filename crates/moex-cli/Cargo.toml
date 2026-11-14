@@ -1,0 +1,14 @@
+[package]
+name = "moex-cli"
+description = "MachOExplorer command-line tools"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "moex"
+path = "src/main.rs"
+
+[dependencies]
+moex-core.workspace = true
+clap.workspace = true

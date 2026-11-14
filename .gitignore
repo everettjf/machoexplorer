@@ -33,3 +33,6 @@ src/.qtcreator/
 
 dist/
 tmp/
+
+# Rust
+target/

@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=MachOExplorer
+Comment=Explore Mach-O, fat, archive and dyld shared cache files
+Exec=MachOExplorer %f
+Icon=machoexplorer
+Terminal=false
+Categories=Development;Debugger;

@@ -1,0 +1,61 @@
+name: Rust
+
+on:
+  push:
+    branches: [master, "feat/rust-gpui-rewrite"]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  core:
+    name: core + cli (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-24.04, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release --locked -p moex-core -p moex-cli
+      # Unit tests, golden comparison against the C++ baselines and
+      # malformed-input robustness.
+      - name: Test
+        run: cargo test --release --locked -p moex-core -p moex-cli
+      - name: Regression scripts
+        if: runner.os != 'Windows'
+        run: tests/regression/run_all.sh
+
+  app:
+    name: gui (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-24.04, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libx11-xcb-dev \
+            libxcb1-dev libfontconfig-dev libfreetype-dev libvulkan-dev \
+            libasound2-dev libssl-dev pkg-config clang
+      - name: Build GUI
+        run: cargo build --locked -p moex-app
+      # Headless-window UI tests need a GPU/display stack; run them where the
+      # runner provides one.
+      - name: GUI tests
+        if: runner.os == 'macOS'
+        env:
+          MOEX_NO_UPDATE_CHECK: "1"
+        run: cargo test --locked -p moex-app

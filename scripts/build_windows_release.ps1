@@ -1,13 +1,9 @@
 Param(
-    [string]$QtBin = "",
-    [string]$QtPrefix = "",
-    [string]$BuildDir = "build-win",
-    [string]$Config = "Release",
     [string]$Version = "",
     [string]$Tag = "",
     [string]$Repo = "",
-    [string]$CMakePath = "",
     [string]$ISCCPath = "",
+    [switch]$SkipTests,
     [switch]$SkipUpload,
     [switch]$NoClobber
 )
@@ -20,26 +16,22 @@ function Require-Command([string]$name) {
     }
 }
 
-function Get-VersionFromHeader([string]$path) {
-    if (!(Test-Path $path)) {
-        throw "Version file not found: $path"
+function Get-WorkspaceVersion([string]$cargoToml) {
+    $line = Select-String -Path $cargoToml -Pattern '^version = "([^"]+)"' | Select-Object -First 1
+    if (-not $line) {
+        throw "Failed to parse workspace version from $cargoToml"
     }
-    $verLine = Select-String -Path $path -Pattern 'LIBMOEX_VERSION "([^"]+)"' | Select-Object -First 1
-    if (-not $verLine) {
-        throw "Failed to parse version from $path"
-    }
-    return $verLine.Matches[0].Groups[1].Value
+    return $line.Matches[0].Groups[1].Value
 }
 
 Require-Command gh
 
 $root = Split-Path -Parent $PSScriptRoot
-$verFile = Join-Path $root "src/libmoex/ver.h"
 $stagePath = Join-Path $root "dist/windows/MachOExplorer"
 $installerDir = Join-Path $root "dist/windows/installer"
 
 if ([string]::IsNullOrWhiteSpace($Version)) {
-    $Version = Get-VersionFromHeader $verFile
+    $Version = Get-WorkspaceVersion (Join-Path $root "Cargo.toml")
 }
 if ([string]::IsNullOrWhiteSpace($Tag)) {
     $Tag = "v$Version"
@@ -54,22 +46,12 @@ if ($Repo) {
 gh auth status | Out-Null
 gh release view $Tag @repoArgs | Out-Null
 
-$installerArgs = @(
-    "-BuildDir", $BuildDir,
-    "-Config", $Config,
-    "-Version", $Version
-)
-if (-not [string]::IsNullOrWhiteSpace($QtBin)) {
-    $installerArgs += @("-QtBin", $QtBin)
-}
-if (-not [string]::IsNullOrWhiteSpace($QtPrefix)) {
-    $installerArgs += @("-QtPrefix", $QtPrefix)
-}
-if (-not [string]::IsNullOrWhiteSpace($CMakePath)) {
-    $installerArgs += @("-CMakePath", $CMakePath)
-}
+$installerArgs = @{ Version = $Version }
 if (-not [string]::IsNullOrWhiteSpace($ISCCPath)) {
-    $installerArgs += @("-ISCCPath", $ISCCPath)
+    $installerArgs["ISCCPath"] = $ISCCPath
+}
+if ($SkipTests) {
+    $installerArgs["SkipTests"] = $true
 }
 
 & (Join-Path $PSScriptRoot "build_windows_installer.ps1") @installerArgs

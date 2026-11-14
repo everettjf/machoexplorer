@@ -1,0 +1,22 @@
+[package]
+name = "moex-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+moex-core = { path = "../crates/moex-core" }
+
+[[bin]]
+name = "parse_dump"
+path = "fuzz_targets/parse_dump.rs"
+test = false
+doc = false
+bench = false
+
+# Not part of the main workspace: built only by `cargo fuzz`.
+[workspace]

@@ -1,0 +1,5 @@
+# Test inputs must be byte-exact on every platform.
+tests/corpus/bin/* binary
+tests/golden/baseline/* binary
+sample/simple binary
+sample/complex binary
