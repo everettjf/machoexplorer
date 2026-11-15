@@ -1,9 +1,10 @@
 //! C++ (Itanium ABI) symbol demangling.
 //!
-//! On macOS the system C++ runtime (`libc++abi`, always present) does the
-//! work, which is exactly what the previous implementation used. Elsewhere
-//! the pure-Rust `cpp_demangle` crate is used; its output can differ from
-//! the runtime demangler for some heavily templated names.
+//! On macOS and Linux the C++ runtime's own `__cxa_demangle` does the work
+//! (`libc++abi` and `libstdc++`; the latter is linked anyway for the Swift
+//! demangler). Windows has no such runtime, so the pure-Rust `cpp_demangle`
+//! crate is used there; its text differs for special names (it prints
+//! `{vtable(Foo)}` for `vtable for Foo`) and some heavily templated ones.
 
 /// Demangle an Itanium-mangled name (starting with `_Z`). `None` when the
 /// name is not valid.
@@ -14,11 +15,12 @@ pub fn demangle_itanium(mangled: &[u8]) -> Option<String> {
     imp::demangle(mangled).filter(|s| !s.is_empty())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 mod imp {
     use std::ffi::{c_char, c_int, c_void, CStr, CString};
 
-    #[link(name = "c++abi")]
+    #[cfg_attr(target_os = "macos", link(name = "c++abi"))]
+    #[cfg_attr(target_os = "linux", link(name = "stdc++"))]
     extern "C" {
         fn __cxa_demangle(
             mangled_name: *const c_char,
@@ -50,14 +52,19 @@ mod imp {
             if out.is_null() {
                 return None;
             }
-            let text = (status == 0).then(|| crate::hex::utf8_safe(CStr::from_ptr(out).to_bytes()));
+            // libstdc++ still separates nested template closers (`> >`).
+            let text = (status == 0).then(|| {
+                crate::hex::utf8_safe(CStr::from_ptr(out).to_bytes())
+                    .replace("> >", ">>")
+                    .replace("> >", ">>")
+            });
             free(out.cast());
             text
         }
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 mod imp {
     pub fn demangle(mangled: &[u8]) -> Option<String> {
         let sym = cpp_demangle::Symbol::new(mangled).ok()?;

@@ -1139,7 +1139,8 @@ mod tests {
             String::from_utf8(r.json()).unwrap(),
             format!(
                 "{{\"event\":\"plan\",\"image\":\"/usr/lib/libfoo.dylib\",\"output\":\"{}\",\"mode\":\"compact\",\"size\":8448,\"segments\":2}}\n",
-                out.display()
+                // Windows paths hold backslashes, which JSON escapes.
+                String::from_utf8(json_escape(out.display().to_string().as_bytes())).unwrap()
             )
         );
     }
