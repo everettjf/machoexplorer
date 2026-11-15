@@ -121,7 +121,7 @@ cask "machoexplorer" do
   url "${URL}"
   name "MachOExplorer"
   desc "Mach-O and archive explorer"
-  homepage "https://atomsprout.com/machoexplorer/"
+  homepage "https://asp.run/machoexplorer/"
 
   depends_on :macos
 
