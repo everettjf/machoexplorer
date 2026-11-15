@@ -1,0 +1,117 @@
+name: Release packages (Linux, Windows)
+
+# Builds the Linux tarball and the Windows installer + portable zip for an
+# existing release tag. The macOS DMG is built, signed and notarized locally by
+# deploy.sh; this workflow adds the other two platforms to the same release.
+#
+# Run it once with upload=false to inspect the artifacts, then with upload=true.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to build and attach to (e.g. v3.0.0)"
+        required: true
+      ref:
+        description: "Git ref to build (defaults to the tag)"
+        required: false
+        default: ""
+      upload:
+        description: "Upload the packages to the GitHub release"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  linux:
+    name: Linux tarball
+    # The oldest supported runner, so the binaries need the oldest glibc.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || inputs.tag }}
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential pkg-config clang \
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libx11-xcb-dev \
+            libxcb1-dev libfontconfig-dev libfreetype-dev libvulkan-dev \
+            libasound2-dev libssl-dev
+      - name: Package
+        shell: bash
+        run: |
+          tag='${{ inputs.tag }}'
+          scripts/package_linux.sh --version "${tag#v}"
+      - name: Smoke test
+        shell: bash
+        run: |
+          tag='${{ inputs.tag }}'
+          mkdir -p smoke
+          tar -C smoke -xzf dist/linux/MachOExplorer-*.tar.gz
+          bin="$(echo smoke/MachOExplorer-*/bin)"
+          test "$("${bin}/moex" --version)" = "moex ${tag#v}"
+          "${bin}/moex" dump sample/simple > /dev/null
+          # Every shared library the GUI needs must resolve.
+          ldd "${bin}/MachOExplorer"
+          ! ldd "${bin}/MachOExplorer" | grep -q "not found"
+          (cd dist/linux && sha256sum MachOExplorer-*.tar.gz)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: dist/linux/MachOExplorer-*.tar.gz
+          if-no-files-found: error
+      - name: Upload to release
+        if: inputs.upload
+        shell: bash
+        run: gh release upload '${{ inputs.tag }}' dist/linux/MachOExplorer-*.tar.gz --clobber
+
+  windows:
+    name: Windows installer + portable zip
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || inputs.tag }}
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Inno Setup if missing
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "C:\Program Files (x86)\Inno Setup 6\ISCC.exe")) {
+            choco install innosetup -y --no-progress
+          }
+      - name: Package
+        shell: pwsh
+        run: |
+          $version = '${{ inputs.tag }}'.TrimStart('v')
+          ./scripts/build_windows_release.ps1 -Version $version -Tag '${{ inputs.tag }}' -SkipUpload -SkipTests
+      - name: Smoke test
+        shell: pwsh
+        run: |
+          $version = '${{ inputs.tag }}'.TrimStart('v')
+          $out = & dist/windows/MachOExplorer/moex.exe --version
+          if ($out -ne "moex $version") { throw "unexpected version output: $out" }
+          & dist/windows/MachOExplorer/moex.exe dump sample/simple | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "moex dump failed" }
+          Get-FileHash dist/windows/*.zip, dist/windows/installer/*.exe -Algorithm SHA256 | Format-List
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: |
+            dist/windows/MachOExplorer-*-windows-x64-portable.zip
+            dist/windows/installer/MachOExplorer-Setup-*.exe
+          if-no-files-found: error
+      - name: Upload to release
+        if: inputs.upload
+        shell: pwsh
+        run: |
+          $files = @(Get-ChildItem dist/windows/*.zip, dist/windows/installer/*.exe | ForEach-Object { $_.FullName })
+          gh release upload '${{ inputs.tag }}' @files --clobber
