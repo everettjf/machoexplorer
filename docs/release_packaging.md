@@ -7,11 +7,21 @@ is passed explicitly.
 | Platform | Script | Output | Status |
 | --- | --- | --- | --- |
 | macOS | `deploy.sh`, `scripts/bundle_macos.sh` | `dist/macos/MachOExplorer.app`, `dist/macos/MachOExplorer.dmg` | Used for releases |
-| Windows | `scripts/build_windows_installer.ps1`, `scripts/build_windows_release.ps1` | `dist/windows/installer/MachOExplorer-Setup-<version>.exe`, `dist/windows/MachOExplorer-<version>-windows-x64-portable.zip` | Not yet verified |
-| Linux | `scripts/package_linux.sh` | `dist/linux/MachOExplorer-<version>-linux-<arch>.tar.gz` | Not yet verified |
+| Windows | `scripts/build_windows_installer.ps1`, `scripts/build_windows_release.ps1` | `dist/windows/installer/MachOExplorer-Setup-<version>.exe`, `dist/windows/MachOExplorer-<version>-windows-x64-portable.zip` | Built in CI for releases; GUI not yet run on a desktop |
+| Linux | `scripts/package_linux.sh` | `dist/linux/MachOExplorer-<version>-linux-<arch>.tar.gz` | Built in CI for releases; GUI not yet run on a desktop |
 
-"Not yet verified" means the script exists and matches the Cargo build, but
-nobody has run it on that platform yet.
+The Windows and Linux packages are built by the manually triggered workflow
+`.github/workflows/release-packages.yml` (GitHub-hosted runners: `windows-latest`, `ubuntu-22.04`). Give it the
+release tag; run it with `upload=false` to get the packages as workflow
+artifacts, or `upload=true` to attach them to the GitHub release:
+
+```bash
+gh workflow run release-packages.yml -f tag=v<x.y.z> -f upload=true
+```
+
+The workflow smoke-tests the packaged `moex` (version and a dump of
+`sample/simple`). The desktop app is built but nobody has yet run it on a real
+Windows or Linux desktop, and the Windows binaries are not code-signed.
 
 ## Version bump
 
@@ -139,7 +149,7 @@ onto `PATH`.
 
 ## Windows Installer
 
-Not yet verified on a Windows machine.
+Run in CI by the release-packages workflow; not yet run on a developer's Windows machine.
 
 - Installer tool: **Inno Setup 6**
 - Inno Setup script: `packaging/windows/MachOExplorer.iss`
@@ -189,7 +199,7 @@ Notes:
 
 ## Linux Tarball
 
-Not yet verified on a Linux machine.
+Run in CI by the release-packages workflow; not yet run on a developer's Linux machine.
 
 ```bash
 scripts/package_linux.sh [--version X.Y.Z]

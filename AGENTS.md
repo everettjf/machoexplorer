@@ -6,7 +6,7 @@ This guide describes how autonomous contributors should work in this repository 
 - App: `MachOExplorer` (Rust, GUI built on GPUI via `gpui-kit` 0.9.1)
 - Domain: Mach-O / Fat Mach-O / `.a` archive / dyld shared cache analysis
 - Current release line: `v3.0.x`. The version lives in one place: `[workspace.package] version` in the root `Cargo.toml`.
-- Platforms: macOS is built, tested and run locally. Windows and Linux builds are wired in CI and in the packaging scripts but are not yet verified by anyone; do not claim they work until someone has built and run them.
+- Platforms: macOS is built, tested and run locally. Windows and Linux are built and their core tests run in CI, and their release packages are built by `.github/workflows/release-packages.yml`, but nobody has yet run the desktop app on a real Windows or Linux desktop; describe them as previews until someone has.
 - The earlier C++/Qt implementation (last release `v2.0.17`) is gone from the tree. No Qt, CMake or system Capstone is needed; Capstone is compiled from the source bundled in the `capstone` crate.
 
 ## Repository Layout
@@ -31,6 +31,7 @@ This guide describes how autonomous contributors should work in this repository 
 - `packaging/`: `macos/MachOExplorer.icns`, `linux/machoexplorer.desktop` + icon, `windows/MachOExplorer.iss` (Inno Setup)
 - `deploy.sh`: one-command macOS release pipeline (bump/test/bundle/sign/notarize/tag/release/homebrew)
 - `.github/workflows/rust.yml`: CI (macOS / Linux / Windows matrix)
+- `.github/workflows/release-packages.yml`: manually triggered; builds the Linux tarball and the Windows installer + portable zip for a release tag and can attach them to the GitHub release
 - `docs/`: `release_packaging.md`, `analysis-notes.md` (what the analysis shows, changes from the C++ releases, known limits)
 
 ## Build & Run (macOS)
@@ -107,7 +108,7 @@ Flags:
 Do not run `deploy.sh` unless explicitly asked: it signs, pushes to `master`, tags and publishes.
 
 ## Windows Packaging Guidance
-Not yet verified: these scripts have not been run on a Windows machine since the Rust rewrite.
+These scripts run in CI through the release-packages workflow (`gh workflow run release-packages.yml -f tag=v<x.y.z> -f upload=true`); they have not been run on a developer's Windows machine.
 
 - Installer tool for classic Next/Next/Finish: **Inno Setup 6**
 - Build helper:
@@ -121,7 +122,7 @@ powershell -ExecutionPolicy Bypass -File scripts/build_windows_release.ps1
 - The installer helper needs `cargo` (MSVC toolchain) and finds `ISCC` on `PATH` or in the default Inno Setup 6 install directory (`-ISCCPath` overrides). It links the C runtime statically (`-C target-feature=+crt-static`), so no MSVC runtime DLLs are staged.
 
 ## Linux Packaging Guidance
-Not yet verified: the script has not been run on a Linux machine.
+The script runs in CI through the release-packages workflow; it has not been run on a developer's Linux machine.
 
 ```bash
 scripts/package_linux.sh

@@ -8,12 +8,14 @@ Repository: <https://github.com/everettjf/machoexplorer>
 
 Language: **English** | [简体中文](README.zh-CN.md)
 
-![MachOExplorer Screenshot](image/screenshot.png)
+| Dark theme | Light theme |
+| --- | --- |
+| ![MachOExplorer, dark theme](image/screenshot.png) | ![MachOExplorer, light theme](image/screenshot-light.png) |
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![CI](https://github.com/everettjf/MachOExplorer/actions/workflows/rust.yml/badge.svg)](https://github.com/everettjf/MachOExplorer/actions/workflows/rust.yml)
 [![Latest Release](https://img.shields.io/github/v/release/everettjf/MachOExplorer)](https://github.com/everettjf/MachOExplorer/releases/latest)
-[![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux%20%26%20Windows%20(unverified)-lightgrey)](#install)
+[![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey)](#install)
 
 MachOExplorer turns an opaque Mach-O file into a navigable tree. Open a binary and drill from the
 file structure all the way down to load commands, sections, symbols, disassembly, and Apple-specific
@@ -93,8 +95,8 @@ is meant to degrade gracefully instead of crashing.
 | Platform | Status |
 | --- | --- |
 | macOS 13 or later (Apple silicon and Intel) | Supported. Signed and notarized releases. |
-| Linux | Not yet verified. The build is wired in CI and in `scripts/package_linux.sh`, but nobody has built or run it yet. |
-| Windows | Not yet verified. The build is wired in CI and in `scripts/build_windows_installer.ps1`, but nobody has built or run it yet. |
+| Linux (x86_64, glibc 2.35 or later) | Preview. A tarball is built and its command-line tool is tested in CI; the desktop app has not been tried on a real desktop yet. |
+| Windows 10 or later (x64) | Preview. An installer and a portable zip are built and the command-line tool is tested in CI; the desktop app has not been tried on a real desktop yet. The binaries are not code-signed, so SmartScreen may warn. |
 
 ### macOS
 - Download the latest release: <https://github.com/everettjf/MachOExplorer/releases/latest>
@@ -107,8 +109,20 @@ brew update && brew tap everettjf/homebrew-tap && brew install --cask machoexplo
 The app bundle also contains the command-line tool, at
 `MachOExplorer.app/Contents/MacOS/moex`.
 
-### Linux / Windows
-Build from source (see [Build from source](#build-from-source)) and please report what you find.
+### Linux
+Download `MachOExplorer-<version>-linux-x86_64.tar.gz` from the
+[latest release](https://github.com/everettjf/MachOExplorer/releases/latest) and unpack it. The
+binaries are `bin/MachOExplorer` and `bin/moex`; a `.desktop` file and an icon are under `share/`.
+The desktop app needs a Vulkan-capable GPU driver.
+
+### Windows
+Download `MachOExplorer-Setup-<version>.exe` (installer) or
+`MachOExplorer-<version>-windows-x64-portable.zip` from the
+[latest release](https://github.com/everettjf/MachOExplorer/releases/latest). Both contain
+`MachOExplorer.exe` and `moex.exe`, and need no extra runtime.
+
+Linux and Windows are previews: please [report](https://github.com/everettjf/MachOExplorer/issues)
+what you find.
 
 Attaching to a process by memory snapshot is macOS only. Swift symbols are demangled by
 Swift's own demangler, built into the tool, on every platform. C++ symbols are demangled by
@@ -188,7 +202,7 @@ cargo build --release -p moex-app      # desktop app:       target/release/MachO
 
 On macOS, `scripts/bundle_macos.sh` assembles `dist/macos/MachOExplorer.app`.
 
-On Debian/Ubuntu the desktop app needs these packages first (not yet verified):
+On Debian/Ubuntu the desktop app needs these packages first:
 
 ```bash
 sudo apt-get install -y build-essential pkg-config clang \
@@ -198,7 +212,7 @@ sudo apt-get install -y build-essential pkg-config clang \
 ```
 
 On Windows use the MSVC toolchain; the binaries are `target\release\MachOExplorer.exe` and
-`target\release\moex.exe` (not yet verified).
+`target\release\moex.exe`.
 
 See [DEVELOP.md](DEVELOP.md) for the full developer, testing, and release workflow.
 

@@ -10,8 +10,8 @@ has been removed; Qt, CMake and a system Capstone are no longer needed.
 | Platform | Status |
 | --- | --- |
 | macOS | Built, tested and run locally. Release pipeline is `deploy.sh`. |
-| Linux | Build, tests and packaging are wired in CI and `scripts/package_linux.sh`. Not yet verified: nobody has built or run it. |
-| Windows | Build, tests and packaging are wired in CI and `scripts/build_windows_*.ps1`. Not yet verified: nobody has built or run it. |
+| Linux | Built and tested in CI; release tarballs come from `.github/workflows/release-packages.yml`. The desktop app has not yet been run on a real desktop. |
+| Windows | Built and tested in CI; the installer and portable zip come from `.github/workflows/release-packages.yml`. The desktop app has not yet been run on a real desktop. |
 
 Platform-specific behaviour:
 - Attach by PID (Memory Snapshot) works on macOS only. Attach by PID (Executable Path) is implemented for macOS and Linux.

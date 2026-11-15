@@ -6,12 +6,14 @@
 
 语言：简体中文 | [English](README.md)
 
-![MachOExplorer 截图](image/screenshot.png)
+| 深色主题 | 浅色主题 |
+| --- | --- |
+| ![MachOExplorer, 深色主题](image/screenshot.png) | ![MachOExplorer, 浅色主题](image/screenshot-light.png) |
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![CI](https://github.com/everettjf/MachOExplorer/actions/workflows/rust.yml/badge.svg)](https://github.com/everettjf/MachOExplorer/actions/workflows/rust.yml)
 [![Latest Release](https://img.shields.io/github/v/release/everettjf/MachOExplorer)](https://github.com/everettjf/MachOExplorer/releases/latest)
-[![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux%20%26%20Windows%20(unverified)-lightgrey)](#安装)
+[![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey)](#安装)
 
 MachOExplorer 把一个晦涩的 Mach-O 文件变成可导航的树。打开一个二进制，从文件结构一路钻取到
 load command、section、符号、反汇编，以及 Apple 特有的元数据（Objective-C、Swift、代码签名）——
@@ -88,8 +90,8 @@ load command、section、符号、反汇编，以及 Apple 特有的元数据（
 | 平台 | 状态 |
 | --- | --- |
 | macOS 13 及以上（Apple silicon 与 Intel） | 支持。发布包已签名并公证。 |
-| Linux | 尚未验证。构建已接入 CI 和 `scripts/package_linux.sh`，但还没有人实际构建或运行过。 |
-| Windows | 尚未验证。构建已接入 CI 和 `scripts/build_windows_installer.ps1`，但还没有人实际构建或运行过。 |
+| Linux（x86_64，glibc 2.35 及以上） | 预览。压缩包由 CI 构建，命令行工具在 CI 中测试过；桌面应用还没有在真实桌面环境里试用过。 |
+| Windows 10 及以上（x64） | 预览。安装程序和免安装压缩包由 CI 构建，命令行工具在 CI 中测试过；桌面应用还没有在真实桌面环境里试用过。程序没有代码签名，SmartScreen 可能会提示。 |
 
 ### macOS
 - 下载最新版本：<https://github.com/everettjf/MachOExplorer/releases/latest>
@@ -101,8 +103,17 @@ brew update && brew tap everettjf/homebrew-tap && brew install --cask machoexplo
 
 应用包内同时带有命令行工具，位于 `MachOExplorer.app/Contents/MacOS/moex`。
 
-### Linux / Windows
-请从源码构建（见[从源码构建](#从源码构建)），并欢迎反馈实际情况。
+### Linux
+从[最新发布](https://github.com/everettjf/MachOExplorer/releases/latest)下载
+`MachOExplorer-<版本>-linux-x86_64.tar.gz` 并解压。可执行文件是 `bin/MachOExplorer` 和 `bin/moex`，
+`share/` 下带有 `.desktop` 文件和图标。桌面应用需要支持 Vulkan 的显卡驱动。
+
+### Windows
+从[最新发布](https://github.com/everettjf/MachOExplorer/releases/latest)下载
+`MachOExplorer-Setup-<版本>.exe`（安装程序）或 `MachOExplorer-<版本>-windows-x64-portable.zip`（免安装）。
+两者都包含 `MachOExplorer.exe` 和 `moex.exe`，不需要额外的运行库。
+
+Linux 和 Windows 目前是预览状态，欢迎[反馈](https://github.com/everettjf/MachOExplorer/issues)实际使用情况。
 
 通过内存快照附加进程仅限 macOS。Swift 符号由内置的 Swift 官方 demangler 还原，所有平台均可用。
 C++ 符号在 macOS 和 Linux 上由 C++ 运行库还原，在 Windows 上由 `cpp_demangle` crate 还原，
@@ -177,7 +188,7 @@ cargo build --release -p moex-app      # 桌面应用：  target/release/MachOEx
 
 在 macOS 上，`scripts/bundle_macos.sh` 会组装出 `dist/macos/MachOExplorer.app`。
 
-在 Debian/Ubuntu 上，桌面应用需要先安装以下依赖（尚未验证）：
+在 Debian/Ubuntu 上，桌面应用需要先安装以下依赖：
 
 ```bash
 sudo apt-get install -y build-essential pkg-config clang \
@@ -187,7 +198,7 @@ sudo apt-get install -y build-essential pkg-config clang \
 ```
 
 在 Windows 上请使用 MSVC 工具链；产物为 `target\release\MachOExplorer.exe` 和
-`target\release\moex.exe`（尚未验证）。
+`target\release\moex.exe`。
 
 完整的开发、测试与发布流程见 [DEVELOP.md](DEVELOP.md)。
 
