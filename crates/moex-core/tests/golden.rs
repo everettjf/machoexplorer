@@ -181,6 +181,10 @@ fn reproducible_here(name: &str) -> bool {
     match name {
         "cxx_arm64" => cfg!(target_os = "macos"),
         "dyld_chained_x86_64.dylib" | "dyld_classic_x86_64.dylib" => !cfg!(windows),
+        // Capstone formats one negative 32-bit immediate differently when
+        // built with MSVC (`mov w28, #-0xffffffff80000000` for
+        // `#-0x80000000`).
+        "complex" => !cfg!(windows),
         _ => true,
     }
 }

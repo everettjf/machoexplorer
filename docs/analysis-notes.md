@@ -101,6 +101,8 @@ private decoders.
 - Capstone 5.0.6 (bundled by the `capstone` crate) does not know some recent
   arm64e instructions (`pacibsppc` and similar) and rejects the x86-64
   `63 /r` encoding without REX.W; such bytes show as data rows.
+- On Windows, Capstone prints some negative 32-bit arm64 immediates
+  sign-extended to 64 bits (`#-0xffffffff80000000` for `#-0x80000000`).
 - Xref register tracking is a linear sweep, not data-flow analysis: a label
   reached both by fall-through and by a jump is treated as fall-through.
   Instructions patched by relocations in object files are not resolved.
