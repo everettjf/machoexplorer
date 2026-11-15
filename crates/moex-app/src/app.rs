@@ -219,19 +219,13 @@ fn register_actions(cx: &mut App) {
 fn window_options(cx: &App) -> WindowOptions {
     let ws = &AppState::get(cx).settings.window;
     let bounds = Bounds::centered(None, size(px(ws.width), px(ws.height)), cx);
-    let titlebar = if cfg!(target_os = "macos") {
-        TitlebarOptions {
-            title: Some(APP_NAME.into()),
-            appears_transparent: false,
-            traffic_light_position: None,
-        }
-    } else {
-        // Windows/Linux draw the title bar (with the menu bar) in-window.
-        TitlebarOptions {
-            title: Some(APP_NAME.into()),
-            appears_transparent: true,
-            traffic_light_position: Some(point(px(9.), px(9.))),
-        }
+    // The title bar is drawn in-window on every platform so that it follows
+    // the app's theme rather than the system appearance (a native macOS bar
+    // stays dark under a light theme when the system is in dark mode).
+    let titlebar = TitlebarOptions {
+        title: Some(APP_NAME.into()),
+        appears_transparent: true,
+        traffic_light_position: Some(point(px(9.), px(9.))),
     };
     WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),

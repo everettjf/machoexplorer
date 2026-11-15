@@ -101,6 +101,14 @@ pub struct MainWindow {
 pub const INFO_DEFAULT: &str = "# Hi, have a nice day !";
 
 impl MainWindow {
+    /// Text of the window title: the app name, then the open file's name.
+    fn title_text(&self) -> SharedString {
+        match &self.path {
+            Some(path) => format!("{APP_NAME} — {}", crate::util::file_name(path)).into(),
+            None => APP_NAME.into(),
+        }
+    }
+
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         // macOS uses the native menu bar; elsewhere the menus are drawn in
         // the window's title bar. (Debug builds can force the in-window bar
@@ -827,8 +835,20 @@ impl Render for MainWindow {
                 Some(Drag::Split { .. }) | Some(Drag::Column { .. }) => d.cursor_col_resize(),
                 _ => d,
             })
-            .when_some(self.menu_bar.clone(), |d, bar| {
-                d.child(TitleBar::new().child(bar))
+            .map(|d| match self.menu_bar.clone() {
+                Some(bar) => d.child(TitleBar::new().child(bar)),
+                // macOS keeps the native menu bar; the in-window bar only
+                // carries the title.
+                None => d.child(
+                    TitleBar::new().child(
+                        div()
+                            .flex_1()
+                            .text_center()
+                            .text_size(px(crate::theme::UI_SIZE))
+                            .text_color(pal.muted)
+                            .child(self.title_text()),
+                    ),
+                ),
             })
             .child(
                 div()
