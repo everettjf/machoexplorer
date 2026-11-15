@@ -34,7 +34,7 @@ jobs:
     # The oldest supported runner, so the binaries need the oldest glibc.
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ref || inputs.tag }}
       - uses: dtolnay/rust-toolchain@stable
@@ -64,7 +64,7 @@ jobs:
           ldd "${bin}/MachOExplorer"
           ! ldd "${bin}/MachOExplorer" | grep -q "not found"
           (cd dist/linux && sha256sum MachOExplorer-*.tar.gz)
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: linux
           path: dist/linux/MachOExplorer-*.tar.gz
@@ -78,7 +78,7 @@ jobs:
     name: Windows installer + portable zip
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ref || inputs.tag }}
       - uses: dtolnay/rust-toolchain@stable
@@ -102,7 +102,7 @@ jobs:
           & dist/windows/MachOExplorer/moex.exe dump sample/simple | Out-Null
           if ($LASTEXITCODE -ne 0) { throw "moex dump failed" }
           Get-FileHash dist/windows/*.zip, dist/windows/installer/*.exe -Algorithm SHA256 | Format-List
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: windows
           path: |
