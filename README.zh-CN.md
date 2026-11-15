@@ -21,6 +21,11 @@ load command、section、符号、反汇编，以及 Apple 特有的元数据（
 3.x 版本使用 Rust 重写，界面基于 [GPUI](https://www.gpui.rs/)，取代了 2.x 的 C++/Qt 实现。
 如果你用过 2.x 的命令行工具，请看[从 2.x 迁移](#从-2x-迁移)。
 
+> **想找旧的 C++/Qt 版本？** `v2.0.17` 及之前的版本用 C++ 和 Qt 开发，从 3.x 开始改用 Rust 开发。
+> 最后一版 C++/Qt 源码保留在 [`qt-final`](https://github.com/everettjf/MachOExplorer/tree/qt-final) 这个 tag
+> 和 [`legacy-qt`](https://github.com/everettjf/MachOExplorer/tree/legacy-qt) 分支上，
+> 旧版安装包仍可在[发布页](https://github.com/everettjf/MachOExplorer/releases)下载。
+
 ## 目录
 - [功能](#功能)
 - [支持的格式](#支持的格式)

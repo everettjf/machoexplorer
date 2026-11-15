@@ -24,6 +24,12 @@ Version 3 is a rewrite in Rust with a [GPUI](https://www.gpui.rs/) interface; it
 C++/Qt implementation of the 2.x releases. If you used the 2.x command-line tools, see
 [Migrating from 2.x](#migrating-from-2x).
 
+> **Looking for the old C++/Qt version?** Versions up to `v2.0.17` were written in C++ with Qt;
+> from version 3 on, MachOExplorer is written in Rust. The last C++/Qt source is kept at the
+> [`qt-final`](https://github.com/everettjf/MachOExplorer/tree/qt-final) tag and on the
+> [`legacy-qt`](https://github.com/everettjf/MachOExplorer/tree/legacy-qt) branch, and the old builds
+> are still on the [releases page](https://github.com/everettjf/MachOExplorer/releases).
+
 ## Contents
 - [Features](#features)
 - [Supported formats](#supported-formats)
