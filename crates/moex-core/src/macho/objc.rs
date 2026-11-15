@@ -512,6 +512,8 @@ mod tests {
     /// decoders, which work on file offsets.
     fn header(bytes: Vec<u8>) -> MachHeader {
         MachHeader {
+            size: bytes.len() as u64,
+            big_endian: false,
             image: Arc::new(image(bytes)),
             offset: 0,
             is64: true,

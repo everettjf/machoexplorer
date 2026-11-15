@@ -1,6 +1,7 @@
 use super::mach_header::mach_header_node;
 use crate::consts::FAT_HEADER_SIZE;
 use crate::hex::{as_short_hex_string, as_string};
+use crate::macho::fat::SliceContent;
 use crate::macho::FatHeader;
 use crate::names;
 use crate::view::{Content, NodeSource, Table, ViewNode};
@@ -67,7 +68,48 @@ impl NodeSource for FatNode {
         self.0
             .archs
             .iter()
-            .map(|a| mach_header_node(a.mh.clone()))
+            .map(|a| match &a.content {
+                SliceContent::MachO(mh) => mach_header_node(mh.clone()),
+                SliceContent::Archive(archive) => super::archive::node_named(
+                    archive.clone(),
+                    format!(
+                        "Archive ({})",
+                        names::arch(a.cputype, a.cpusubtype)
+                    ),
+                ),
+                SliceContent::Unknown(reason) => ViewNode::new(UnknownSlice {
+                    name: format!("Slice ({})", names::arch(a.cputype, a.cpusubtype)),
+                    reason: reason.clone(),
+                    offset: a.offset,
+                    size: a.size,
+                }),
+            })
             .collect()
+    }
+}
+
+/// A slice that is neither a Mach-O nor an archive: its bytes and why.
+struct UnknownSlice {
+    name: String,
+    reason: String,
+    offset: u64,
+    size: u64,
+}
+
+impl NodeSource for UnknownSlice {
+    fn name(&self) -> String {
+        self.name.clone()
+    }
+
+    fn content(&self) -> Content {
+        let mut t = Table::new();
+        t.set_headers(&["Information"]);
+        t.set_widths(&[300]);
+        t.add([self.reason.as_str()]);
+        Content::table(t).with_binary(self.offset, self.size)
+    }
+
+    fn children(&self) -> Vec<ViewNode> {
+        Vec::new()
     }
 }

@@ -61,6 +61,10 @@ impl ArchiveMember {
 
 pub struct Archive {
     pub image: Arc<Image>,
+    /// File offset and byte size of the archive: the whole file, or one
+    /// slice of a fat file.
+    pub offset: u64,
+    pub size: u64,
     pub members: Vec<ArchiveMember>,
 }
 
@@ -181,17 +185,27 @@ fn gnu_long_name(strtab: &[u8], off: u64) -> Option<&[u8]> {
 
 impl Archive {
     pub fn parse(image: &Arc<Image>) -> Result<Self> {
-        let file_size = image.len();
-        if !is_archive_magic(image.bytes()) {
+        Self::parse_range(image, 0, image.len())
+    }
+
+    /// Parses the archive occupying `size` bytes at `offset` (a slice of a
+    /// fat file). The range must lie inside the file.
+    pub fn parse_range(image: &Arc<Image>, offset: u64, size: u64) -> Result<Self> {
+        if !image.in_file(offset, size) {
+            return err("Malformed archive file: range exceeds file size");
+        }
+        if !is_archive_magic(image.slice(offset, size.min(MAGIC_SIZE)).unwrap_or(&[])) {
             return err("Not an archive file");
         }
-        if file_size < MAGIC_SIZE + AR_HEADER_SIZE {
+        if size < MAGIC_SIZE + AR_HEADER_SIZE {
             return err("Malformed archive file: truncated after global magic");
         }
+        // End of the archive; every member must stay below it.
+        let file_size = offset + size;
 
         let mut members = Vec::new();
         let mut strtab: &[u8] = &[];
-        let mut cur = MAGIC_SIZE;
+        let mut cur = offset + MAGIC_SIZE;
         // `cur` never exceeds `file_size + 1`, so these sums cannot overflow.
         while cur + AR_HEADER_SIZE <= file_size {
             let Some(hdr) = image.slice(cur, AR_HEADER_SIZE) else {
@@ -247,11 +261,11 @@ impl Archive {
             if kind == MemberKind::File && payload_size >= 4 {
                 let magic = image.u32(data_offset).unwrap_or(0);
                 if super::is_valid_magic(magic) && !super::is_fat_magic(magic) {
-                    mh = Some(Arc::new(MachHeader::parse_slice(
-                        image,
-                        data_offset,
-                        payload_size,
-                    )?));
+                    // A member that is not a well-formed Mach-O stays listed
+                    // as data rather than failing the whole archive.
+                    mh = MachHeader::parse_slice(image, data_offset, payload_size)
+                        .ok()
+                        .map(Arc::new);
                 }
             }
             members.push(ArchiveMember {
@@ -264,7 +278,8 @@ impl Archive {
             });
 
             cur = data_offset + payload_size;
-            if cur & 1 != 0 {
+            // Members are padded to an even offset within the archive.
+            if (cur - offset) & 1 != 0 {
                 cur += 1;
             }
         }
@@ -273,6 +288,8 @@ impl Archive {
         }
         Ok(Archive {
             image: image.clone(),
+            offset,
+            size,
             members,
         })
     }
@@ -481,8 +498,9 @@ mod tests {
             error(&[&bad]),
             "Malformed archive file: invalid member header trailer"
         );
-        // a member whose Mach-O header is truncated fails the whole archive
-        assert!(archive(&[&header("a.o/", "4"), &0xfeedfacfu32.to_le_bytes()]).is_err());
+        // a member whose Mach-O header is truncated is listed as data
+        let a = archive(&[&header("a.o/", "4"), &0xfeedfacfu32.to_le_bytes()]).unwrap();
+        assert!(!a.members[0].is_macho());
         let not_archive =
             Archive::parse(&Arc::new(Image::from_vec(b"hello world".to_vec()).unwrap()));
         assert_eq!(

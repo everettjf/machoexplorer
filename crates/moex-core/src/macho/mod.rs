@@ -102,7 +102,15 @@ impl Binary {
     pub fn headers(&self) -> Vec<Arc<MachHeader>> {
         match &self.kind {
             Kind::MachO(mh) => vec![mh.clone()],
-            Kind::Fat(fat) => fat.archs.iter().map(|a| a.mh.clone()).collect(),
+            Kind::Fat(fat) => fat
+                .archs
+                .iter()
+                .flat_map(|a| match &a.content {
+                    fat::SliceContent::MachO(mh) => vec![mh.clone()],
+                    fat::SliceContent::Archive(archive) => archive.headers(),
+                    fat::SliceContent::Unknown(_) => Vec::new(),
+                })
+                .collect(),
             Kind::Archive(archive) => archive.headers(),
             Kind::DyldSharedCache(_) => Vec::new(),
         }

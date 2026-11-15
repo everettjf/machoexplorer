@@ -7,15 +7,20 @@ use crate::macho::Archive;
 use crate::view::{Content, NodeSource, Table, ViewNode};
 use std::sync::Arc;
 
-struct ArchiveNode(Arc<Archive>);
+struct ArchiveNode(Arc<Archive>, String);
 
 pub fn node(archive: Arc<Archive>) -> ViewNode {
-    ViewNode::new(ArchiveNode(archive))
+    node_named(archive, "Archive".to_string())
+}
+
+/// The archive node under another name (a slice of a fat file).
+pub fn node_named(archive: Arc<Archive>, name: String) -> ViewNode {
+    ViewNode::new(ArchiveNode(archive, name))
 }
 
 impl NodeSource for ArchiveNode {
     fn name(&self) -> String {
-        "Archive".into()
+        self.1.clone()
     }
 
     fn content(&self) -> Content {
@@ -34,7 +39,7 @@ impl NodeSource for ArchiveNode {
                 ],
             );
         }
-        Content::table(t).with_binary(0, self.0.image.len())
+        Content::table(t).with_binary(self.0.offset, self.0.size)
     }
 
     fn children(&self) -> Vec<ViewNode> {
