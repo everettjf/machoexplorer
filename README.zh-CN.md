@@ -99,7 +99,7 @@ brew update && brew tap everettjf/homebrew-tap && brew install --cask machoexplo
 ### Linux / Windows
 请从源码构建（见[从源码构建](#从源码构建)），并欢迎反馈实际情况。
 
-部分功能仅限 macOS：通过内存快照附加进程，以及 Swift 符号还原（依赖 `xcrun swift-demangle`）。
+通过内存快照附加进程仅限 macOS。Swift 符号由内置的 Swift 官方 demangler 还原，所有平台均可用。
 C++ 符号在 macOS 上由系统 `libc++abi` 还原，在其他平台由 `cpp_demangle` crate 还原，
 因此不同平台上还原出的文本可能略有差异。
 

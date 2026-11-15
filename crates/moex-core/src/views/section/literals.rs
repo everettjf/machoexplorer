@@ -31,25 +31,57 @@ pub(super) fn cstrings(mh: &MachHeader, section: &Section) -> Table {
     t
 }
 
-/// "Floating Point Literals": the raw bytes of each `unit`-byte literal.
-// The original aborts on any non-empty literal section (its table has no
-// offset resolver and the row helper calls it unconditionally), so there is
-// no reference output; the rows are what that code was written to produce.
-// See "Intentional differences" in docs/rust-port-quirks.md.
+/// "Floating Point Literals": each `unit`-byte literal with its value.
+///
+/// 4- and 8-byte literals are IEEE 754 single and double precision numbers.
+/// A 16-byte literal has no single meaning (vector constants, masks, long
+/// doubles), so it is shown as the 128-bit little-endian integer it stores
+/// together with its reading as two doubles.
 fn literals(mh: &MachHeader, section: &Section, unit: u64) -> Table {
     let mut t = Table::new();
+    t.set_headers(&["Offset", "Description", "Value", "Bytes"]);
+    t.set_widths(&[100, 160, 320, 300]);
     for (offset, bytes) in chunks(mh, section, unit) {
+        let (description, value) = describe(bytes);
         t.add_data(
             offset,
             unit,
             [
                 as_address(offset),
-                "Floating Point Number".to_string(),
+                description.to_string(),
+                value,
                 as_hex_data(bytes),
             ],
         );
     }
     t
+}
+
+/// `(description, value)` cells for the bytes of one literal.
+fn describe(bytes: &[u8]) -> (&'static str, String) {
+    if let Ok(b) = <[u8; 4]>::try_from(bytes) {
+        ("Float", format!("{:?}", f32::from_le_bytes(b)))
+    } else if let Ok(b) = <[u8; 8]>::try_from(bytes) {
+        ("Double", format!("{:?}", f64::from_le_bytes(b)))
+    } else if let Ok(b) = <[u8; 16]>::try_from(bytes) {
+        let (lo, hi) = b.split_at(8);
+        let double = |half: &[u8]| {
+            <[u8; 8]>::try_from(half)
+                .map(f64::from_le_bytes)
+                .unwrap_or(f64::NAN)
+        };
+        (
+            "16-byte Literal",
+            format!(
+                "0x{:032X} (doubles: {:?}, {:?})",
+                u128::from_le_bytes(b),
+                double(lo),
+                double(hi)
+            ),
+        )
+    } else {
+        ("Literal", String::new())
+    }
 }
 
 pub(super) fn literals4(mh: &MachHeader, section: &Section) -> Table {

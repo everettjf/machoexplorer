@@ -2,9 +2,12 @@
 //! (32- and 64-bit), plus `__cfstring` entries and `objc_image_info`.
 //!
 //! Every decoder takes a file offset and returns `None` when the struct does
-//! not lie entirely inside the file.
+//! not lie entirely inside the file. Pointer fields are decoded (chained
+//! fixups, authenticated pointers) into the address they refer to; a field
+//! bound to a symbol of another image reads as 0 and
+//! [`ObjcResolver::pointer_at`] tells which symbol.
 
-use super::vmaddr::{SegmentSet, VmReader};
+use super::ptr::{relative_target, Pointer, PointerDecoder, Segments, SliceReader};
 use super::MachHeader;
 use crate::image::Image;
 
@@ -12,6 +15,11 @@ use crate::image::Image;
 pub const OBJC_IMAGE_IS_REPLACEMENT: u32 = 1 << 0;
 pub const OBJC_IMAGE_SUPPORTS_GC: u32 = 1 << 1;
 pub const OBJC_IMAGE_GC_ONLY: u32 = 1 << 2;
+pub const OBJC_IMAGE_OPTIMIZED_BY_DYLD: u32 = 1 << 3;
+pub const OBJC_IMAGE_SIGNED_CLASS_RO: u32 = 1 << 4;
+pub const OBJC_IMAGE_IS_SIMULATED: u32 = 1 << 5;
+pub const OBJC_IMAGE_HAS_CATEGORY_CLASS_PROPERTIES: u32 = 1 << 6;
+pub const OBJC_IMAGE_OPTIMIZED_BY_DYLD_CLOSURE: u32 = 1 << 7;
 
 /// `class_ro_t.flags` bits.
 pub const RO_META: u32 = 1 << 0;
@@ -22,17 +30,13 @@ pub const RO_HAS_CXX_STRUCTORS: u32 = 1 << 2;
 /// lists (both word sizes).
 pub const LIST_HEADER_SIZE: u64 = 8;
 
-/// `N` consecutive pointer-sized words at file offset `off`.
-fn words<const N: usize>(image: &Image, off: u64, is64: bool) -> Option<[u64; N]> {
-    let step: u64 = if is64 { 8 } else { 4 };
+/// `N` consecutive pointer-sized words at file offset `off`, each decoded
+/// as a pointer (words that are not pointers come back unchanged).
+fn words<const N: usize>(r: &ObjcResolver<'_>, off: u64) -> Option<[u64; N]> {
+    let step = r.layout.ptr_size();
     let mut out = [0u64; N];
     for (i, slot) in out.iter_mut().enumerate() {
-        let at = off.checked_add(i as u64 * step)?;
-        *slot = if is64 {
-            image.u64(at)?
-        } else {
-            u64::from(image.u32(at)?)
-        };
+        *slot = r.address_at(off.checked_add(i as u64 * step)?)?;
     }
     Some(out)
 }
@@ -66,6 +70,10 @@ impl ObjcLayout {
     /// `method_t`: name, types, imp.
     pub fn method_size(self) -> u64 {
         3 * self.ptr_size()
+    }
+    /// Relative `method_t`: three 32-bit offsets.
+    pub fn relative_method_size(self) -> u64 {
+        12
     }
     /// `ivar_t`: offset, name, type, alignment, size.
     pub fn ivar_size(self) -> u64 {
@@ -115,10 +123,26 @@ impl ObjcImageInfo {
             (OBJC_IMAGE_IS_REPLACEMENT, "OBJC_IMAGE_IS_REPLACEMENT"),
             (OBJC_IMAGE_SUPPORTS_GC, "OBJC_IMAGE_SUPPORTS_GC"),
             (OBJC_IMAGE_GC_ONLY, "OBJC_IMAGE_GC_ONLY"),
+            (OBJC_IMAGE_OPTIMIZED_BY_DYLD, "OBJC_IMAGE_OPTIMIZED_BY_DYLD"),
+            (OBJC_IMAGE_SIGNED_CLASS_RO, "OBJC_IMAGE_SIGNED_CLASS_RO"),
+            (OBJC_IMAGE_IS_SIMULATED, "OBJC_IMAGE_IS_SIMULATED"),
+            (
+                OBJC_IMAGE_HAS_CATEGORY_CLASS_PROPERTIES,
+                "OBJC_IMAGE_HAS_CATEGORY_CLASS_PROPERTIES",
+            ),
+            (
+                OBJC_IMAGE_OPTIMIZED_BY_DYLD_CLOSURE,
+                "OBJC_IMAGE_OPTIMIZED_BY_DYLD_CLOSURE",
+            ),
         ]
         .into_iter()
         .filter(|(bit, _)| self.flags & bit != 0)
         .collect()
+    }
+
+    /// The Swift ABI version byte (bits 8..16); 0 for images without Swift.
+    pub fn swift_version(&self) -> u32 {
+        (self.flags >> 8) & 0xff
     }
 }
 
@@ -132,8 +156,8 @@ pub struct CfString {
 }
 
 impl CfString {
-    pub fn read(image: &Image, off: u64, is64: bool) -> Option<Self> {
-        let [ptr, data, cstr, size] = words(image, off, is64)?;
+    pub fn read(r: &ObjcResolver<'_>, off: u64) -> Option<Self> {
+        let [ptr, data, cstr, size] = words(r, off)?;
         Some(CfString {
             ptr,
             data,
@@ -155,8 +179,8 @@ pub struct ObjcClass {
 }
 
 impl ObjcClass {
-    pub fn read(image: &Image, off: u64, is64: bool) -> Option<Self> {
-        let [isa, superclass, cache, vtable, data] = words(image, off, is64)?;
+    pub fn read(r: &ObjcResolver<'_>, off: u64) -> Option<Self> {
+        let [isa, superclass, cache, vtable, data] = words(r, off)?;
         Some(ObjcClass {
             isa,
             superclass,
@@ -191,14 +215,15 @@ pub struct ObjcClassRo {
 }
 
 impl ObjcClassRo {
-    pub fn read(image: &Image, off: u64, is64: bool) -> Option<Self> {
+    pub fn read(r: &ObjcResolver<'_>, off: u64) -> Option<Self> {
+        let image = r.image();
         let flags = image.u32(off)?;
         let instance_start = image.u32(off.checked_add(4)?)?;
         let instance_size = image.u32(off.checked_add(8)?)?;
         // 64-bit has a 4-byte `reserved` field before the pointers.
-        let rest = off.checked_add(if is64 { 16 } else { 12 })?;
+        let rest = off.checked_add(if r.is64() { 16 } else { 12 })?;
         let [ivar_layout, name, base_methods, base_protocols, ivars, weak_ivar_layout, base_properties] =
-            words(image, rest, is64)?;
+            words(r, rest)?;
         Some(ObjcClassRo {
             flags,
             instance_start,
@@ -218,10 +243,20 @@ impl ObjcClassRo {
     }
 }
 
+/// `method_list_t.entsize` flag: entries are three 32-bit relative offsets.
+pub const METHOD_LIST_IS_RELATIVE: u32 = 0x8000_0000;
+/// `method_list_t.entsize` flag: a relative name offset leads straight to
+/// the selector string instead of to a selector reference.
+pub const METHOD_LIST_DIRECT_SELECTORS: u32 = 0x4000_0000;
+/// The bits of `method_list_t.entsize` that are flags (the high half and
+/// the "uniqued" / "sorted" bits), not part of the entry size.
+pub const METHOD_LIST_FLAGS_MASK: u32 = 0xffff_0003;
+
 /// `{ entsize, count }` header of a method, ivar or property list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ObjcListHeader {
-    /// Raw value; method and ivar lists keep flags in the low two bits.
+    /// Raw value; in a method list it also carries flags, see
+    /// [`METHOD_LIST_FLAGS_MASK`]. Ivar and property lists have none.
     pub entsize: u32,
     pub count: u32,
 }
@@ -234,9 +269,19 @@ impl ObjcListHeader {
         })
     }
 
-    /// `entsize` without the two low flag bits.
-    pub fn entry_size(&self) -> u32 {
-        self.entsize & !0x3
+    /// Entry size of a method list: `entsize` without its flag bits.
+    pub fn method_entry_size(&self) -> u32 {
+        self.entsize & !METHOD_LIST_FLAGS_MASK
+    }
+
+    /// Whether a method list holds relative ("small") methods.
+    pub fn has_relative_methods(&self) -> bool {
+        self.entsize & METHOD_LIST_IS_RELATIVE != 0
+    }
+
+    /// Whether relative method names skip the selector reference.
+    pub fn has_direct_selectors(&self) -> bool {
+        self.entsize & METHOD_LIST_DIRECT_SELECTORS != 0
     }
 }
 
@@ -248,15 +293,46 @@ pub struct ObjcMethod {
 }
 
 impl ObjcMethod {
-    pub fn read(image: &Image, off: u64, is64: bool) -> Option<Self> {
-        let [name, types, imp] = words(image, off, is64)?;
+    pub fn read(r: &ObjcResolver<'_>, off: u64) -> Option<Self> {
+        let [name, types, imp] = words(r, off)?;
         Some(ObjcMethod { name, types, imp })
+    }
+
+    /// A relative method at file offset `off`, which is mapped at
+    /// `vmaddr`: three 32-bit offsets, each relative to its own field. The
+    /// name offset leads to a selector reference (a pointer to the string)
+    /// unless the list has `direct_selectors`; an `imp` offset of 0 means
+    /// no implementation.
+    pub fn read_relative(
+        r: &ObjcResolver<'_>,
+        off: u64,
+        vmaddr: u64,
+        direct_selectors: bool,
+    ) -> Option<Self> {
+        let image = r.image();
+        let rel = |i: u64| Some(image.u32(off.checked_add(4 * i)?)? as i32);
+        let target = |i: u64, rel: i32| relative_target(vmaddr.wrapping_add(4 * i), rel);
+        let (name_rel, types_rel, imp_rel) = (rel(0)?, rel(1)?, rel(2)?);
+        let name_field = target(0, name_rel);
+        let name = if direct_selectors {
+            name_field
+        } else {
+            let word = r.layout.ptr_size();
+            r.struct_offset(name_field, word)
+                .and_then(|at| r.address_at(at))
+                .unwrap_or(0)
+        };
+        Some(ObjcMethod {
+            name,
+            types: target(1, types_rel),
+            imp: if imp_rel == 0 { 0 } else { target(2, imp_rel) },
+        })
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ObjcIvar {
-    /// Address of the variable holding the ivar offset.
+    /// Address of the 32-bit variable holding the ivar offset.
     pub offset: u64,
     pub name: u64,
     pub type_: u64,
@@ -265,9 +341,10 @@ pub struct ObjcIvar {
 }
 
 impl ObjcIvar {
-    pub fn read(image: &Image, off: u64, is64: bool) -> Option<Self> {
-        let [offset, name, type_] = words(image, off, is64)?;
-        let rest = off.checked_add(if is64 { 24 } else { 12 })?;
+    pub fn read(r: &ObjcResolver<'_>, off: u64) -> Option<Self> {
+        let [offset, name, type_] = words(r, off)?;
+        let rest = off.checked_add(3 * r.layout.ptr_size())?;
+        let image = r.image();
         Some(ObjcIvar {
             offset,
             name,
@@ -285,8 +362,8 @@ pub struct ObjcProperty {
 }
 
 impl ObjcProperty {
-    pub fn read(image: &Image, off: u64, is64: bool) -> Option<Self> {
-        let [name, attributes] = words(image, off, is64)?;
+    pub fn read(r: &ObjcResolver<'_>, off: u64) -> Option<Self> {
+        let [name, attributes] = words(r, off)?;
         Some(ObjcProperty { name, attributes })
     }
 }
@@ -304,9 +381,9 @@ pub struct ObjcProtocol {
 }
 
 impl ObjcProtocol {
-    pub fn read(image: &Image, off: u64, is64: bool) -> Option<Self> {
+    pub fn read(r: &ObjcResolver<'_>, off: u64) -> Option<Self> {
         let [isa, name, protocols, instance_methods, class_methods, optional_instance_methods, optional_class_methods, instance_properties] =
-            words(image, off, is64)?;
+            words(r, off)?;
         Some(ObjcProtocol {
             isa,
             name,
@@ -331,9 +408,9 @@ pub struct ObjcCategory {
 }
 
 impl ObjcCategory {
-    pub fn read(image: &Image, off: u64, is64: bool) -> Option<Self> {
+    pub fn read(r: &ObjcResolver<'_>, off: u64) -> Option<Self> {
         let [name, cls, instance_methods, class_methods, protocols, instance_properties] =
-            words(image, off, is64)?;
+            words(r, off)?;
         Some(ObjcCategory {
             name,
             cls,
@@ -345,25 +422,33 @@ impl ObjcCategory {
     }
 }
 
-/// Resolves the virtual addresses stored in ObjC metadata.
-#[derive(Clone, Copy)]
+/// Resolves the virtual addresses and pointers stored in ObjC metadata.
 pub struct ObjcResolver<'a> {
-    pub reader: VmReader<'a>,
+    pub reader: SliceReader<'a>,
     pub layout: ObjcLayout,
+    decoder: PointerDecoder<'a>,
 }
 
 impl<'a> ObjcResolver<'a> {
     /// `is64` selects both the pointer width and which segment commands
-    /// (`LC_SEGMENT_64` or `LC_SEGMENT`) map addresses.
+    /// (`LC_SEGMENT_64` or `LC_SEGMENT`) map addresses. The fixup tables of
+    /// the image are read for this resolver alone; see
+    /// [`with_decoder`](Self::with_decoder) to share them.
     pub fn new(mh: &'a MachHeader, is64: bool) -> Self {
+        Self::with_decoder(mh, is64, PointerDecoder::new(mh))
+    }
+
+    /// Like [`new`](Self::new), decoding pointers with `decoder`.
+    pub fn with_decoder(mh: &'a MachHeader, is64: bool, decoder: PointerDecoder<'a>) -> Self {
         ObjcResolver {
-            reader: VmReader::new(mh, SegmentSet::Only64(is64)),
+            reader: SliceReader::new(mh, Segments::Only64(is64)),
             layout: ObjcLayout { is64 },
+            decoder,
         }
     }
 
     pub fn image(&self) -> &'a Image {
-        &self.reader.mh.image
+        self.reader.image()
     }
 
     pub fn is64(&self) -> bool {
@@ -376,18 +461,30 @@ impl<'a> ObjcResolver<'a> {
     }
 
     /// File offset of a `size`-byte struct at `vmaddr`; `None` for address
-    /// 0, unmapped addresses and structs that run past the end of the file.
+    /// 0, unmapped addresses and structs that run past the file contents of
+    /// their segment.
     pub fn struct_offset(&self, vmaddr: u64, size: u64) -> Option<u64> {
         self.reader.object_offset(vmaddr, size)
     }
 
-    /// Pointer-sized value stored at `vmaddr`.
-    pub fn pointer(&self, vmaddr: u64) -> Option<u64> {
-        self.reader.pointer(vmaddr, self.layout.is64)
+    /// The pointer stored at file offset `off`, decoded.
+    pub fn pointer_at(&self, off: u64) -> Option<Pointer<'a>> {
+        self.decoder.read(off, self.layout.is64)
+    }
+
+    /// The address the pointer at file offset `off` refers to; 0 for a
+    /// pointer bound to another image.
+    pub fn address_at(&self, off: u64) -> Option<u64> {
+        self.pointer_at(off).map(|p| p.address())
+    }
+
+    /// The 32-bit value at `vmaddr` (an ivar offset variable).
+    pub fn u32_at(&self, vmaddr: u64) -> Option<u32> {
+        self.reader.u32(vmaddr)
     }
 
     /// NUL-terminated string at `vmaddr`. Empty when the address is 0 or
-    /// unmapped, or no terminator is found within 1024 bytes / the file.
+    /// unmapped, or no terminator is found within 1024 bytes / the segment.
     pub fn cstring(&self, vmaddr: u64) -> &'a [u8] {
         if vmaddr == 0 {
             return &[];
@@ -405,9 +502,30 @@ impl<'a> ObjcResolver<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     fn image(bytes: Vec<u8>) -> Image {
         Image::from_vec(bytes).unwrap()
+    }
+
+    /// A header without load commands over `bytes`: enough for the
+    /// decoders, which work on file offsets.
+    fn header(bytes: Vec<u8>) -> MachHeader {
+        MachHeader {
+            image: Arc::new(image(bytes)),
+            offset: 0,
+            is64: true,
+            magic: 0,
+            cputype: 0,
+            cpusubtype: 0,
+            filetype: 0,
+            ncmds: 0,
+            sizeofcmds: 0,
+            flags: 0,
+            reserved: 0,
+            loadcmds: Vec::new(),
+            segments: Vec::new(),
+        }
     }
 
     fn le64(vals: &[u64]) -> Vec<u8> {
@@ -424,6 +542,10 @@ mod tests {
         assert_eq!((l32.class_size(), l64.class_size()), (20, 40));
         assert_eq!((l32.class_ro_size(), l64.class_ro_size()), (40, 72));
         assert_eq!((l32.method_size(), l64.method_size()), (12, 24));
+        assert_eq!(
+            (l32.relative_method_size(), l64.relative_method_size()),
+            (12, 12)
+        );
         assert_eq!((l32.ivar_size(), l64.ivar_size()), (20, 32));
         assert_eq!((l32.property_size(), l64.property_size()), (8, 16));
         assert_eq!((l32.protocol_size(), l64.protocol_size()), (32, 64));
@@ -433,17 +555,18 @@ mod tests {
 
     #[test]
     fn class_and_ro() {
-        let img = image(le64(&[1, 2, 3, 4, 0x1000_0007]));
-        let c = ObjcClass::read(&img, 0, true).unwrap();
+        let mh = header(le64(&[1, 2, 3, 4, 0x1000_0007]));
+        let r = ObjcResolver::new(&mh, true);
+        let c = ObjcClass::read(&r, 0).unwrap();
         assert_eq!((c.isa, c.superclass, c.data), (1, 2, 0x1000_0007));
         assert_eq!(c.ro_address(true), 0x1000_0000);
         assert_eq!(c.ro_address(false), 0x1000_0004);
-        assert!(ObjcClass::read(&img, 1, true).is_none());
+        assert!(ObjcClass::read(&r, 1).is_none());
 
         let mut ro = le32(&[RO_META, 8, 16, 0]);
         ro.extend(le64(&[10, 11, 12, 13, 14, 15, 16]));
-        let img = image(ro);
-        let r = ObjcClassRo::read(&img, 0, true).unwrap();
+        let mh = header(ro);
+        let r = ObjcClassRo::read(&ObjcResolver::new(&mh, true), 0).unwrap();
         assert!(r.is_meta());
         assert_eq!((r.instance_start, r.instance_size), (8, 16));
         assert_eq!(
@@ -457,34 +580,61 @@ mod tests {
             (11, 12, 13, 14, 16)
         );
 
-        let img = image(le32(&[0, 4, 8, 20, 21, 22, 23, 24, 25, 26]));
-        let r = ObjcClassRo::read(&img, 0, false).unwrap();
+        let mh = header(le32(&[0, 4, 8, 20, 21, 22, 23, 24, 25, 26]));
+        let res = ObjcResolver::new(&mh, false);
+        let r = ObjcClassRo::read(&res, 0).unwrap();
         assert!(!r.is_meta());
         assert_eq!(
             (r.ivar_layout, r.name, r.base_methods, r.base_properties),
             (20, 21, 22, 26)
         );
-        assert!(ObjcClassRo::read(&img, 4, false).is_none());
+        assert!(ObjcClassRo::read(&res, 4).is_none());
     }
 
     #[test]
     fn lists_and_entries() {
-        let img = image(le32(&[0x8000_000f, 3, 7, 8, 9, 2, 4]));
-        let h = ObjcListHeader::read(&img, 0).unwrap();
-        assert_eq!(
-            (h.entsize, h.count, h.entry_size()),
-            (0x8000_000f, 3, 0x8000_000c)
-        );
-        let m = ObjcMethod::read(&img, 8, false).unwrap();
+        let mh = header(le32(&[0x8000_000f, 3, 7, 8, 9, 2, 4]));
+        let r = ObjcResolver::new(&mh, false);
+        let h = ObjcListHeader::read(r.image(), 0).unwrap();
+        assert_eq!((h.entsize, h.count), (0x8000_000f, 3));
+        // The flag bits are not part of the entry size.
+        assert_eq!(h.method_entry_size(), 12);
+        assert!(h.has_relative_methods());
+        assert!(!h.has_direct_selectors());
+        let plain = ObjcListHeader {
+            entsize: 24 | 0x4000_0003,
+            count: 1,
+        };
+        assert_eq!(plain.method_entry_size(), 24);
+        assert!(!plain.has_relative_methods());
+        assert!(plain.has_direct_selectors());
+
+        let m = ObjcMethod::read(&r, 8).unwrap();
         assert_eq!((m.name, m.types, m.imp), (7, 8, 9));
-        let iv = ObjcIvar::read(&img, 8, false).unwrap();
+        let iv = ObjcIvar::read(&r, 8).unwrap();
         assert_eq!(
             (iv.offset, iv.name, iv.type_, iv.alignment, iv.size),
             (7, 8, 9, 2, 4)
         );
-        let p = ObjcProperty::read(&img, 8, false).unwrap();
+        let p = ObjcProperty::read(&r, 8).unwrap();
         assert_eq!((p.name, p.attributes), (7, 8));
-        assert!(ObjcIvar::read(&img, 12, false).is_none());
+        assert!(ObjcIvar::read(&r, 12).is_none());
+    }
+
+    #[test]
+    fn relative_methods() {
+        // Entry at file offset 8, mapped at 0x1008: name +0x100 (direct),
+        // types -8, no implementation; then one with an implementation.
+        let mh = header(le32(&[0, 0, 0x100, (-8i32) as u32, 0, 4, 4, 0x20]));
+        let r = ObjcResolver::new(&mh, true);
+        let m = ObjcMethod::read_relative(&r, 8, 0x1008, true).unwrap();
+        assert_eq!((m.name, m.types, m.imp), (0x1108, 0x1004, 0));
+        let m = ObjcMethod::read_relative(&r, 20, 0x1014, true).unwrap();
+        assert_eq!((m.name, m.types, m.imp), (0x1018, 0x101c, 0x103c));
+        // Through a selector reference that is not mapped: no name.
+        let m = ObjcMethod::read_relative(&r, 8, 0x1008, false).unwrap();
+        assert_eq!((m.name, m.types), (0, 0x1004));
+        assert!(ObjcMethod::read_relative(&r, 24, 0x1018, true).is_none());
     }
 
     #[test]
@@ -493,16 +643,26 @@ mod tests {
         let info = ObjcImageInfo::read(&img, 0).unwrap();
         assert_eq!(
             info.flag_names(),
-            [(1, "OBJC_IMAGE_IS_REPLACEMENT"), (4, "OBJC_IMAGE_GC_ONLY")]
+            [
+                (1, "OBJC_IMAGE_IS_REPLACEMENT"),
+                (4, "OBJC_IMAGE_GC_ONLY"),
+                (0x40, "OBJC_IMAGE_HAS_CATEGORY_CLASS_PROPERTIES")
+            ]
         );
+        assert_eq!(info.swift_version(), 0);
+        let swift = ObjcImageInfo {
+            version: 0,
+            flags: 0x0507_0740,
+        };
+        assert_eq!(swift.swift_version(), 7);
         assert!(ObjcImageInfo::read(&img, 4).is_none());
     }
 
     #[test]
     fn cfstring_both_widths() {
-        let img = image(le32(&[1, 2, 3, 4]));
+        let mh = header(le32(&[1, 2, 3, 4]));
         assert_eq!(
-            CfString::read(&img, 0, false),
+            CfString::read(&ObjcResolver::new(&mh, false), 0),
             Some(CfString {
                 ptr: 1,
                 data: 2,
@@ -510,6 +670,6 @@ mod tests {
                 size: 4
             })
         );
-        assert!(CfString::read(&img, 0, true).is_none());
+        assert!(CfString::read(&ObjcResolver::new(&mh, true), 0).is_none());
     }
 }

@@ -1,11 +1,9 @@
 //! Swift 5 reflection metadata (`__swift5_*` sections): record decoders,
 //! string readers and Swift symbol demangling.
 
-use super::vmaddr::{relative_target, VmReader};
+use super::ptr::{relative_target, SliceReader};
 use crate::hex::utf8_safe;
 use crate::image::Image;
-use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
 
 /// Leading fields of every Swift context descriptor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -124,7 +122,7 @@ fn is_printable(c: u8) -> bool {
 /// NUL-terminated string of printable ASCII at `vmaddr`, looking at no more
 /// than `max_len` bytes. Empty when the address is unmapped, the string is
 /// empty, contains a non-printable byte, or has no terminator in range.
-pub fn read_printable_cstring(reader: &VmReader<'_>, vmaddr: u64, max_len: u64) -> String {
+pub fn read_printable_cstring(reader: &SliceReader<'_>, vmaddr: u64, max_len: u64) -> String {
     let Some(bytes) = reader.bytes(vmaddr, max_len) else {
         return String::new();
     };
@@ -146,7 +144,7 @@ pub fn read_printable_cstring(reader: &VmReader<'_>, vmaddr: u64, max_len: u64) 
 
 /// Longest prefix at `vmaddr` (at most `max_len` bytes) made of identifier
 /// characters: ASCII alphanumerics and `_ $ . : < > ?` and space.
-pub fn read_identifier_text(reader: &VmReader<'_>, vmaddr: u64, max_len: u64) -> String {
+pub fn read_identifier_text(reader: &SliceReader<'_>, vmaddr: u64, max_len: u64) -> String {
     let Some(bytes) = reader.bytes(vmaddr, max_len) else {
         return String::new();
     };
@@ -162,7 +160,7 @@ pub fn read_identifier_text(reader: &VmReader<'_>, vmaddr: u64, max_len: u64) ->
 /// target is unmapped, otherwise the target address and the printable
 /// C string there (possibly empty; at most 512 bytes are examined).
 pub fn relative_cstring(
-    reader: &VmReader<'_>,
+    reader: &SliceReader<'_>,
     field_vmaddr: u64,
     rel: i32,
 ) -> Option<(u64, String)> {
@@ -174,10 +172,28 @@ pub fn relative_cstring(
     Some((target, read_printable_cstring(reader, target, 512)))
 }
 
-/// The printable strings of a `__swift5_reflstr` section as
-/// `(offset in data, bytes)`. A string ends at a NUL or at the end of the
-/// data; a run holding a non-printable byte is resumed after that byte.
-pub fn reflection_strings(data: &[u8]) -> Vec<(usize, &[u8])> {
+/// One string of a `__swift5_reflstr` section.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReflectionString<'a> {
+    /// Offset in the section data.
+    pub offset: usize,
+    pub text: &'a [u8],
+    /// False for a last string that runs to the end of the data without a
+    /// NUL.
+    pub terminated: bool,
+}
+
+impl ReflectionString<'_> {
+    /// Bytes the string occupies in the section, terminator included.
+    pub fn size(&self) -> u64 {
+        self.text.len() as u64 + u64::from(self.terminated)
+    }
+}
+
+/// The printable strings of a `__swift5_reflstr` section. A string ends at
+/// a NUL or at the end of the data; a run holding a non-printable byte is
+/// resumed after that byte.
+pub fn reflection_strings(data: &[u8]) -> Vec<ReflectionString<'_>> {
     let mut out = Vec::new();
     let mut cursor = 0usize;
     while cursor < data.len() {
@@ -189,7 +205,11 @@ pub fn reflection_strings(data: &[u8]) -> Vec<(usize, &[u8])> {
             Some(bad) => cursor += bad + 1,
             None if len == 0 => cursor += 1,
             None => {
-                out.push((cursor, run));
+                out.push(ReflectionString {
+                    offset: cursor,
+                    text: run,
+                    terminated: len < rest.len(),
+                });
                 cursor += len + 1;
             }
         }
@@ -237,243 +257,164 @@ pub fn decode_mangled_components(name: &[u8]) -> String {
     parts.join(".")
 }
 
-/// What the `swift-demangle` tool says about `name` (see
-/// [`demangle_external`]), falling back to
-/// [`decode_mangled_components`] when the tool gives nothing.
+/// Demangled form of the Swift symbol `name`, falling back to
+/// [`decode_mangled_components`] for manglings the demangler does not know.
+/// Empty when `name` is not a Swift symbol.
 pub fn demangle_symbol(name: &[u8]) -> String {
-    let external = demangle_external(name);
-    if external.is_empty() {
-        decode_mangled_components(name)
-    } else {
-        external
-    }
+    demangle(name).unwrap_or_else(|| decode_mangled_components(name))
 }
 
-/// Display text for a string found in Swift metadata: `-` when empty, the
-/// demangled form when there is one, `(mangled) <text>` for an undecodable
-/// mangled name, otherwise the text itself.
+/// Display text for a string found in Swift metadata that may be a mangled
+/// name: `-` when empty, the demangled form when there is one,
+/// `(mangled) <text>` for a symbol name that cannot be decoded at all,
+/// otherwise the text itself.
 pub fn decode_swift_like_text(text: &str) -> String {
     if text.is_empty() {
         return "-".to_string();
     }
-    let demangled = demangle_symbol(text.as_bytes());
-    if !demangled.is_empty() {
+    if let Some(demangled) = demangle_type_or_symbol(text) {
         return demangled;
     }
     if has_swift_prefix(text.as_bytes()) {
-        return format!("(mangled) {text}");
+        let components = decode_mangled_components(text.as_bytes());
+        return if components.is_empty() {
+            format!("(mangled) {text}")
+        } else {
+            components
+        };
     }
     text.to_string()
 }
 
 // ---------------------------------------------------------------------------
-// External demangler
+// Demangler
 // ---------------------------------------------------------------------------
 
-/// Results of the external demangler, keyed by the exact input bytes.
-fn cache() -> &'static Mutex<HashMap<Vec<u8>, String>> {
-    static CACHE: OnceLock<Mutex<HashMap<Vec<u8>, String>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
+/// Longer names are not demangled: nothing real comes close, and the bound
+/// keeps the work on a crafted name small.
+const MAX_MANGLED_LEN: usize = 16 * 1024;
 
-/// Entries kept before the cache is dropped and refilled.
-const CACHE_LIMIT: usize = 500_000;
-
-fn cache_get(name: &[u8]) -> Option<String> {
-    cache().lock().ok()?.get(name).cloned()
-}
-
-fn cache_put(name: &[u8], value: String) {
-    if let Ok(mut map) = cache().lock() {
-        if map.len() >= CACHE_LIMIT {
-            map.clear();
-        }
-        map.insert(name.to_vec(), value);
-    }
-}
-
-/// Whether the external tool may be asked about `name` at all.
-// Names starting with `-` or `@` would be taken as an option or a response
-// file by the tool; they are never passed (see docs/rust-port-quirks.md).
-fn may_ask_tool(name: &[u8]) -> bool {
-    !name.is_empty() && !name.contains(&0) && !matches!(name.first(), Some(b'-' | b'@'))
-}
-
-/// Whether `name` can share one tool invocation with other names: its
-/// output must be exactly one recognisable line.
-fn can_batch(name: &[u8]) -> bool {
-    name.iter().all(|&c| is_printable(c)) && !name.windows(MARKER.len()).any(|w| w == MARKER)
-}
-
-const MARKER: &[u8] = b" ---> ";
-
-/// The demangled part of the tool's output for one name
-/// (`<mangled> ---> <demangled>`), or the whole output when it has no
-/// marker or nothing after it.
-fn parse_tool_output(output: &[u8]) -> String {
-    let mut out = output;
-    while let Some((&last, rest)) = out.split_last() {
-        if last != b'\n' && last != b'\r' {
-            break;
-        }
-        out = rest;
-    }
-    let after = out
-        .windows(MARKER.len())
-        .position(|w| w == MARKER)
-        .map(|pos| pos + MARKER.len())
-        .filter(|&start| start < out.len())
-        .and_then(|start| out.get(start..));
-    utf8_safe(after.unwrap_or(out))
-}
-
-/// Runs `xcrun swift-demangle <names...>` and returns its standard output;
-/// `None` when the tool cannot be started.
-#[cfg(target_os = "macos")]
-fn run_tool(names: &[&[u8]]) -> Option<Vec<u8>> {
-    use std::os::unix::ffi::OsStrExt;
-    use std::process::{Command, Stdio};
-    if std::env::var_os("MOEX_NO_SWIFT_DEMANGLE").is_some() {
-        return None;
-    }
-    let output = Command::new("xcrun")
-        .arg("swift-demangle")
-        .args(names.iter().map(|n| std::ffi::OsStr::from_bytes(n)))
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    Some(output.stdout)
-}
-
-#[cfg(not(target_os = "macos"))]
-fn run_tool(_names: &[&[u8]]) -> Option<Vec<u8>> {
-    None
-}
-
-fn ask_tool_one(name: &[u8]) -> String {
-    run_tool(&[name])
-        .map(|out| parse_tool_output(&out))
-        .unwrap_or_default()
-}
-
-/// Demangled form of `name` according to the `swift-demangle` tool of the
-/// active Xcode toolchain (macOS only). The tool echoes names it does not
-/// recognise, so the result is empty only when the tool is unavailable or
-/// refused the name. Results are cached for the life of the process.
+/// Demangled form of a Swift symbol name (`$s…`, `_$s…`, `$S…`, `_T0…`);
+/// `None` when `name` is not one or the demangler does not understand it.
 ///
-/// Set `MOEX_NO_SWIFT_DEMANGLE` to never start the tool.
-pub fn demangle_external(name: &[u8]) -> String {
-    if !cfg!(target_os = "macos") || !may_ask_tool(name) {
-        return String::new();
-    }
-    if let Some(hit) = cache_get(name) {
-        return hit;
-    }
-    let result = ask_tool_one(name);
-    cache_put(name, result.clone());
-    result
+/// This is Swift's own demangler as bundled by the `symbolic-demangle`
+/// crate, so it works on every platform and starts no process. Unlike the
+/// `swift-demangle` tool it prints types without sugar
+/// (`Swift.Optional<Swift.Int>`, not `Swift.Int?`), and manglings newer
+/// than the bundled demangler are not understood.
+pub fn demangle(name: &[u8]) -> Option<String> {
+    demangle_all(&[name]).pop().flatten()
 }
 
-/// The single argument a POSIX shell makes of `'<name>'` when `name` itself
-/// may contain single quotes: text between a pair of embedded quotes is
-/// unquoted and the quotes disappear (`a'b'c` → `abc`). `None` when the
-/// quotes do not pair up (a syntax error for the shell) or the unquoted
-/// text holds anything a shell would interpret or split on.
-pub fn shell_single_quoted_word(name: &[u8]) -> Option<Vec<u8>> {
-    if !name.contains(&b'\'') {
-        return Some(name.to_vec());
+/// [`demangle`] for many names at once (one hand-over to the demangler
+/// thread instead of one per name); results are in input order.
+pub fn demangle_all<N: AsRef<[u8]>>(names: &[N]) -> Vec<Option<String>> {
+    let candidates: Vec<Option<String>> = names
+        .iter()
+        .map(|name| {
+            let name = name.as_ref();
+            if !looks_mangled(name) || name.len() > MAX_MANGLED_LEN || name.contains(&0) {
+                return None;
+            }
+            std::str::from_utf8(name).ok().map(str::to_string)
+        })
+        .collect();
+    if candidates.iter().all(Option::is_none) {
+        return candidates;
     }
-    let segments: Vec<&[u8]> = name.split(|&c| c == b'\'').collect();
-    // An odd number of segments means an even number of quotes.
-    if segments.len().is_multiple_of(2) {
+    worker::run(candidates)
+}
+
+/// The mangling prefixes the demangler accepts, optionally after the
+/// Mach-O underscore: `$s` / `$S` (Swift 5 / 4.2), `$e` (embedded Swift),
+/// `_T0` (Swift 4.0) and `_T` (Swift 3 and earlier).
+fn looks_mangled(name: &[u8]) -> bool {
+    let has = |name: &[u8], prefix: &[u8]| name.len() > prefix.len() && name.starts_with(prefix);
+    let bare = name.strip_prefix(b"_").unwrap_or(name);
+    [&b"$s"[..], b"$S", b"$e", b"_T"]
+        .iter()
+        .any(|p| has(bare, p))
+        || has(name, b"_T")
+}
+
+/// Demangled form of a string stored in Swift metadata: either a symbol
+/// name or a bare mangled type (`SS`, `4main5ShapeV`), which is what
+/// `__swift5_typeref` and field records hold. `None` when it is neither.
+///
+/// A bare type is only tried when the text consists of mangling characters
+/// (ASCII alphanumerics and `_`), and only believed when the result names
+/// a qualified type, so ordinary words are left alone.
+pub fn demangle_type_or_symbol(text: &str) -> Option<String> {
+    if let Some(demangled) = demangle(text.as_bytes()) {
+        return Some(demangled);
+    }
+    let plausible = !text.is_empty()
+        && !looks_mangled(text.as_bytes())
+        && text.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_');
+    if !plausible {
         return None;
     }
-    let inert = |c: &u8| c.is_ascii_alphanumeric() || b"%@_.,:/+=^-".contains(c);
-    let mut word = Vec::with_capacity(name.len());
-    for (i, segment) in segments.iter().enumerate() {
-        if i % 2 == 1 && !segment.iter().all(inert) {
-            return None;
-        }
-        word.extend_from_slice(segment);
-    }
-    Some(word)
+    demangle(format!("$s{text}").as_bytes()).filter(|d| d.contains('.') || d.contains('('))
 }
 
-/// [`demangle_external`] for a name that the original passes to the tool
-/// between single quotes without escaping it.
-// QUIRK(parity): embedded single quotes therefore vanish from the name the
-// tool sees (`XPC error '%@'` is demangled as `XPC error %@`). Names whose
-// quoting would make the shell do anything else are not passed at all; see
-// "Intentional differences" in docs/rust-port-quirks.md.
-pub fn demangle_external_shell_quoted(name: &[u8]) -> String {
-    shell_single_quoted_word(name)
-        .map(|word| demangle_external(&word))
-        .unwrap_or_default()
-}
+/// The demangler runs on a thread of its own: its printer recurses once
+/// per nesting level of the mangled name (up to a built-in limit), which
+/// takes far more stack than an arbitrary caller is sure to have left,
+/// above all in unoptimised builds.
+mod worker {
+    use std::sync::mpsc::{channel, Sender};
+    use std::sync::{Mutex, OnceLock};
+    use symbolic_common::{Language, Name, NameMangling};
+    use symbolic_demangle::{Demangle, DemangleOptions};
 
-/// Names per tool invocation and total argument bytes per invocation.
-const BATCH_NAMES: usize = 2000;
-const BATCH_BYTES: usize = 96 * 1024;
+    /// The deepest nesting the demangler follows needs about 16 MiB in an
+    /// unoptimised build (under 1 MiB optimised). Only the pages that are
+    /// touched get committed.
+    const STACK_SIZE: usize = 48 * 1024 * 1024;
 
-/// Resolves many names with as few tool invocations as possible and stores
-/// the results in the cache, so later [`demangle_external`] /
-/// [`demangle_symbol`] calls for them are lookups.
-pub fn prefetch_demangled<N: AsRef<[u8]>>(names: &[N]) {
-    if !cfg!(target_os = "macos") {
-        return;
+    type Names = Vec<Option<String>>;
+    type Request = (Names, Sender<Names>);
+
+    fn demangle_one(mangled: &str) -> Option<String> {
+        let name = Name::new(mangled, NameMangling::Mangled, Language::Swift);
+        // A name the demangler does not understand comes back unchanged.
+        name.demangle(DemangleOptions::complete())
+            .filter(|out| out != mangled)
     }
-    let mut seen = std::collections::HashSet::new();
-    let mut pending: Vec<&[u8]> = Vec::new();
-    for name in names.iter().map(AsRef::as_ref) {
-        if may_ask_tool(name) && seen.insert(name) && cache_get(name).is_none() {
-            if can_batch(name) {
-                pending.push(name);
-            } else {
-                cache_put(name, ask_tool_one(name));
-            }
-        }
+
+    /// The queue of the demangler thread, which is started on first use and
+    /// lives as long as the process. `None` when it cannot be started.
+    fn queue() -> Option<Sender<Request>> {
+        static QUEUE: OnceLock<Option<Mutex<Sender<Request>>>> = OnceLock::new();
+        let queue = QUEUE.get_or_init(|| {
+            let (tx, rx) = channel::<Request>();
+            std::thread::Builder::new()
+                .name("swift-demangle".to_string())
+                .stack_size(STACK_SIZE)
+                .spawn(move || {
+                    for (names, reply) in rx {
+                        let out = names
+                            .iter()
+                            .map(|n| n.as_deref().and_then(demangle_one))
+                            .collect();
+                        let _ = reply.send(out);
+                    }
+                })
+                .ok()
+                .map(|_| Mutex::new(tx))
+        });
+        Some(queue.as_ref()?.lock().ok()?.clone())
     }
-    let mut start = 0usize;
-    while start < pending.len() {
-        let mut end = start;
-        let mut bytes = 0usize;
-        while end < pending.len() && end - start < BATCH_NAMES {
-            let len = pending.get(end).map_or(0, |n| n.len() + 1);
-            if end > start && bytes + len > BATCH_BYTES {
-                break;
-            }
-            bytes += len;
-            end += 1;
-        }
-        let chunk = pending.get(start..end).unwrap_or(&[]);
-        start = end;
-        let lines: Vec<Vec<u8>> = match run_tool(chunk) {
-            Some(out) => {
-                let mut lines: Vec<Vec<u8>> =
-                    out.split(|&c| c == b'\n').map(<[u8]>::to_vec).collect();
-                if lines.last().is_some_and(Vec::is_empty) {
-                    lines.pop();
-                }
-                lines
-            }
-            None => Vec::new(),
-        };
-        if lines.len() == chunk.len() {
-            for (name, line) in chunk.iter().zip(&lines) {
-                cache_put(name, parse_tool_output(line));
-            }
-        } else if lines.is_empty() {
-            // Tool unavailable: every name resolves to nothing.
-            for name in chunk {
-                cache_put(name, String::new());
-            }
-        } else {
-            // Unexpected shape (a name the tool rejected): ask one by one.
-            for name in chunk {
-                cache_put(name, ask_tool_one(name));
-            }
-        }
+
+    /// Demangles every `Some` entry. Nothing is demangled when the thread
+    /// is not available.
+    pub(super) fn run(names: Names) -> Names {
+        let count = names.len();
+        let (reply, result) = channel();
+        queue()
+            .and_then(|queue| queue.send((names, reply)).ok())
+            .and_then(|()| result.recv().ok())
+            .unwrap_or_else(|| vec![None; count])
     }
 }
 
@@ -541,14 +482,26 @@ mod tests {
 
     #[test]
     fn reflection_string_scan() {
-        let got = reflection_strings(b"RawValue\0r\0\0w\0");
+        let strings = |data: &'static [u8]| -> Vec<(usize, &'static [u8], u64)> {
+            reflection_strings(data)
+                .iter()
+                .map(|s| (s.offset, s.text, s.size()))
+                .collect()
+        };
         assert_eq!(
-            got,
-            [(0, &b"RawValue"[..]), (9, &b"r"[..]), (12, &b"w"[..])]
+            strings(b"RawValue\0r\0\0w\0"),
+            [
+                (0, &b"RawValue"[..], 9),
+                (9, &b"r"[..], 2),
+                (12, &b"w"[..], 2)
+            ]
         );
-        // A bad byte hides everything before it in the same run.
-        let got = reflection_strings(b"ab\x01cd\0\x7f\0ef");
-        assert_eq!(got, [(3, &b"cd"[..]), (8, &b"ef"[..])]);
+        // A bad byte hides everything before it in the same run; a last
+        // string without terminator ends with the data.
+        assert_eq!(
+            strings(b"ab\x01cd\0\x7f\0ef"),
+            [(3, &b"cd"[..], 3), (8, &b"ef"[..], 2)]
+        );
         // A bad byte right before the terminator leaves nothing.
         assert!(reflection_strings(b"ab\xff\0").is_empty());
         assert!(reflection_strings(b"").is_empty());
@@ -587,52 +540,110 @@ mod tests {
     }
 
     #[test]
-    fn tool_output_parsing() {
-        assert_eq!(parse_tool_output(b"_$s1a ---> a.b\n"), "a.b");
-        assert_eq!(parse_tool_output(b"x ---> y ---> z\r\n\n"), "y ---> z");
-        assert_eq!(parse_tool_output(b"plain\n"), "plain");
-        // Nothing after the marker: the whole line is kept.
-        assert_eq!(parse_tool_output(b"x ---> \n"), "x ---> ");
-        assert_eq!(parse_tool_output(b""), "");
-        assert_eq!(parse_tool_output(b"a ---> \xff"), "?");
+    fn demangles_symbols() {
+        assert_eq!(
+            demangle(b"_$s7sw_main6CircleV4areaSdvg").as_deref(),
+            Some("sw_main.Circle.area.getter : Swift.Double")
+        );
+        assert_eq!(demangle(b"$s4main5ShapeV").as_deref(), Some("main.Shape"));
+        assert_eq!(demangle(b"$S4main3FooC").as_deref(), Some("main.Foo"));
+        assert_eq!(demangle(b"_T0SS").as_deref(), Some("Swift.String"));
+        // No type sugar.
+        assert_eq!(
+            demangle(b"$sSaySSSgG").as_deref(),
+            Some("Swift.Array<Swift.Optional<Swift.String>>")
+        );
+        // Not Swift names, or not valid ones.
+        for name in [
+            &b"_main"[..],
+            b"",
+            b"$s",
+            b"_$s",
+            b"plain text",
+            b"_ZN3fooE",
+            b"-help",
+            b"@/etc/passwd",
+            b"$s4main\0",
+            b"$s4main\xff",
+            b"$s9999999999",
+        ] {
+            assert_eq!(demangle(name), None, "{name:?}");
+        }
+        assert_eq!(
+            demangle_all(&[&b"_main"[..], b"$sSi", b"", b"$sSS"]),
+            [
+                None,
+                Some("Swift.Int".to_string()),
+                None,
+                Some("Swift.String".to_string())
+            ]
+        );
+        assert!(demangle_all::<&[u8]>(&[]).is_empty());
     }
 
     #[test]
-    fn shell_quoting() {
-        assert_eq!(
-            shell_single_quoted_word(b"plain text").as_deref(),
-            Some(&b"plain text"[..])
-        );
-        assert_eq!(
-            shell_single_quoted_word(b"XPC error '%@'").as_deref(),
-            Some(&b"XPC error %@"[..])
-        );
-        assert_eq!(
-            shell_single_quoted_word(b"a''b").as_deref(),
-            Some(&b"ab"[..])
-        );
-        // Unbalanced quote.
-        assert_eq!(shell_single_quoted_word(b"it's"), None);
-        // Unquoted text the shell would split or interpret.
-        assert_eq!(shell_single_quoted_word(b"a'b c'd"), None);
-        assert_eq!(shell_single_quoted_word(b"a';id;'"), None);
-        assert_eq!(shell_single_quoted_word(b"a'$(id)'"), None);
-        assert_eq!(shell_single_quoted_word(b"a'`id`'b"), None);
-        assert_eq!(shell_single_quoted_word(b"a'>x'"), None);
-        assert_eq!(demangle_external_shell_quoted(b"x';id;'"), "");
-    }
-
-    #[test]
-    fn tool_argument_rules() {
-        assert!(may_ask_tool(b"_$s1a"));
-        assert!(!may_ask_tool(b""));
-        assert!(!may_ask_tool(b"-help"));
-        assert!(!may_ask_tool(b"@/etc/passwd"));
-        assert!(can_batch(b"Swift.Int <A>"));
-        assert!(!can_batch(b"a\nb"));
-        assert!(!can_batch(b"a ---> b"));
-        assert!(!can_batch(b"caf\xc3\xa9"));
-        assert_eq!(demangle_external(b"-x"), "");
+    fn symbol_and_text_fallbacks() {
+        assert_eq!(demangle_symbol(b"_$s4main5ShapeV"), "main.Shape");
+        assert_eq!(demangle_symbol(b"_main"), "");
+        // Undecodable tail: the leading components are still shown.
+        assert_eq!(demangle_symbol(b"$s4Demo5Shape!!"), "Demo.Shape");
         assert_eq!(decode_swift_like_text(""), "-");
+        assert_eq!(decode_swift_like_text("$sSi"), "Swift.Int");
+        assert_eq!(decode_swift_like_text("$s4Demo5Shape!!"), "Demo.Shape");
+        assert_eq!(decode_swift_like_text("$s!!"), "(mangled) $s!!");
+        assert_eq!(decode_swift_like_text("XPC error '%@'"), "XPC error '%@'");
+    }
+
+    #[test]
+    fn bare_types_in_metadata() {
+        assert_eq!(
+            demangle_type_or_symbol("SS").as_deref(),
+            Some("Swift.String")
+        );
+        assert_eq!(
+            demangle_type_or_symbol("4main5ShapeV").as_deref(),
+            Some("main.Shape")
+        );
+        assert_eq!(
+            demangle_type_or_symbol("SaySiG").as_deref(),
+            Some("Swift.Array<Swift.Int>")
+        );
+        assert_eq!(
+            demangle_type_or_symbol("$s4main5ShapeV").as_deref(),
+            Some("main.Shape")
+        );
+        // Ordinary words and text are not types.
+        for text in ["", "name", "value", "hello world", "x", "RawValue", "a.b"] {
+            assert_eq!(demangle_type_or_symbol(text), None, "{text}");
+        }
+    }
+
+    #[test]
+    fn hostile_names_do_not_overflow_the_stack() {
+        // Nesting far beyond anything real, in several shapes; whatever
+        // comes back, the process must survive. Run from a thread with a
+        // small stack to show the caller's stack is not what is used.
+        let names: Vec<String> = vec![
+            format!("$sSi{}", "Sg".repeat(5000)),
+            format!("$s{}Si{}", "Say".repeat(4000), "G".repeat(4000)),
+            format!("$sSi{}", "_t".repeat(5000)),
+            format!("$sSi{}", "m".repeat(16000)),
+            format!("$s4main{}", "1aV".repeat(5000)),
+            format!("_T0{}", "GSq".repeat(5000)),
+            format!("_Tt{}", "GSa".repeat(5000)),
+            format!("$s{}", "9".repeat(4000)),
+            format!("$sSi{}", "Sg".repeat(20000)),
+        ];
+        std::thread::Builder::new()
+            .stack_size(128 * 1024)
+            .spawn(move || {
+                let out = demangle_all(&names);
+                assert_eq!(out.len(), names.len());
+                // Longer than the limit: not even tried.
+                assert_eq!(out.last(), Some(&None));
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 }

@@ -1,13 +1,13 @@
-//! "Swift Metadata": the contents of a `__swift5_*` section followed by the
-//! Swift symbols of the image.
+//! "Swift Metadata": the contents of a `__swift5_*` section. (The Swift
+//! symbols of the image are listed once, in the "Swift Semantic Graph".)
 
 use crate::hex::{as_address, as_short_hex_string, as_string, utf8_safe};
+use crate::macho::ptr::{relative_target, Segments, SliceReader};
 use crate::macho::swift::{
     self, context_kind_name, field_descriptor_kind_name, read_identifier_text,
     read_printable_cstring, relative_cstring, ContextDescriptorHeader, FieldDescriptorHeader,
     FieldRecord,
 };
-use crate::macho::vmaddr::{relative_target, SegmentSet, VmReader};
 use crate::macho::{MachHeader, Section};
 use crate::view::Table;
 
@@ -18,56 +18,13 @@ pub(super) fn metadata(mh: &MachHeader, section: &Section) -> Table {
     let mut t = Table::new();
     t.set_headers(&["Index", "Offset", "Kind", "Value", "Decoded"]);
     t.set_widths(&[80, 140, 220, 260, 420]);
-    let reader = VmReader::new(mh, SegmentSet::Only64(section.is64));
-
-    // Resolve every name this table will show in one go.
-    let mut names: Vec<Vec<u8>> = swift_symbols(mh).map(|(_, name)| name.to_vec()).collect();
-    if section.sectname == "__swift5_typeref" {
-        names.extend(relative_entries(mh, section).filter_map(|e| {
-            e.target_offset
-                .map(|_| typeref_text(&reader, e.target_vmaddr).into_bytes())
-        }));
-    }
-    swift::prefetch_demangled(&names);
-
+    let reader = SliceReader::new(mh, Segments::Only64(section.is64));
     match section.sectname.as_str() {
         "__swift5_reflstr" => reflection_strings(&mut t, mh, section),
         "__swift5_fieldmd" => field_metadata(&mut t, mh, section, &reader),
         _ => relative_section(&mut t, mh, section, &reader),
     }
-
-    if mh.symtab().is_none() {
-        return t;
-    }
-    t.separator();
-    t.add(["-", "-", "Swift Symbols", "-", "-"]);
-    for (index, (value, name)) in swift_symbols(mh).enumerate() {
-        let mut decoded = swift::demangle_symbol(name);
-        if decoded.is_empty() {
-            decoded = "(raw mangled)".to_string();
-        }
-        t.add([
-            as_string(index),
-            as_address(value),
-            "symbol".to_string(),
-            utf8_safe(name),
-            decoded,
-        ]);
-    }
     t
-}
-
-/// `(n_value, name)` of every symbol whose name has a Swift mangling prefix.
-fn swift_symbols(mh: &MachHeader) -> impl Iterator<Item = (u64, &[u8])> {
-    mh.symtab().into_iter().flat_map(|symtab| {
-        symtab.symbols().filter_map(move |sym| {
-            if sym.n_strx == 0 {
-                return None;
-            }
-            let name = symtab.string_bytes(sym.n_strx);
-            swift::has_swift_prefix(name).then_some((sym.n_value, name))
-        })
-    })
 }
 
 /// One 32-bit relative pointer of a section.
@@ -75,7 +32,9 @@ struct RelativeEntry {
     index: u32,
     /// File offset of the pointer itself.
     offset: u64,
-    /// 0 when the stored value is 0 (no target).
+    /// The stored value is 0: the pointer refers to nothing.
+    none: bool,
+    /// 0 when there is no target.
     target_vmaddr: u64,
     /// File offset of the target, when it is mapped.
     target_offset: Option<u64>,
@@ -85,7 +44,7 @@ fn relative_entries<'a>(
     mh: &'a MachHeader,
     section: &'a Section,
 ) -> impl Iterator<Item = RelativeEntry> + 'a {
-    let reader = VmReader::new(mh, SegmentSet::Only64(section.is64));
+    let reader = SliceReader::new(mh, Segments::Only64(section.is64));
     (0..section.data_size / REL32).filter_map(move |index| {
         let delta = (index * REL32) as u64;
         let offset = section.data_offset.checked_add(delta)?;
@@ -99,6 +58,7 @@ fn relative_entries<'a>(
         Some(RelativeEntry {
             index,
             offset,
+            none: rel == 0,
             target_vmaddr,
             target_offset,
         })
@@ -107,7 +67,7 @@ fn relative_entries<'a>(
 
 /// The text a `__swift5_typeref` entry points at: an identifier-like prefix
 /// if there is one, else a whole printable C string.
-fn typeref_text(reader: &VmReader<'_>, vmaddr: u64) -> String {
+fn typeref_text(reader: &SliceReader<'_>, vmaddr: u64) -> String {
     let text = read_identifier_text(reader, vmaddr, 256);
     if text.is_empty() {
         read_printable_cstring(reader, vmaddr, 512)
@@ -117,7 +77,7 @@ fn typeref_text(reader: &VmReader<'_>, vmaddr: u64) -> String {
 }
 
 /// `(kind, decoded)` cells for the context descriptor at `vmaddr`.
-fn decode_context_descriptor(reader: &VmReader<'_>, vmaddr: u64) -> (String, String) {
+fn decode_context_descriptor(reader: &SliceReader<'_>, vmaddr: u64) -> (String, String) {
     let Some(offset) = reader.file_offset(vmaddr) else {
         return ("swift-context".to_string(), "unmapped".to_string());
     };
@@ -140,7 +100,7 @@ fn decode_context_descriptor(reader: &VmReader<'_>, vmaddr: u64) -> (String, Str
 }
 
 /// Sections that are arrays of 32-bit relative pointers.
-fn relative_section(t: &mut Table, mh: &MachHeader, section: &Section, reader: &VmReader<'_>) {
+fn relative_section(t: &mut Table, mh: &MachHeader, section: &Section, reader: &SliceReader<'_>) {
     let unmapped = || "unmapped".to_string();
     for e in relative_entries(mh, section) {
         let target = e.target_vmaddr;
@@ -188,6 +148,8 @@ fn relative_section(t: &mut Table, mh: &MachHeader, section: &Section, reader: &
                 )
             }
         };
+        // A null relative pointer is not an unmapped one.
+        let decoded = if e.none { "none".to_string() } else { decoded };
         let cells = [
             as_string(e.index),
             as_address(e.offset),
@@ -206,17 +168,17 @@ fn relative_section(t: &mut Table, mh: &MachHeader, section: &Section, reader: &
 /// `__swift5_reflstr`: the printable NUL-terminated strings.
 fn reflection_strings(t: &mut Table, mh: &MachHeader, section: &Section) {
     let strings = swift::reflection_strings(section.data(&mh.image));
-    for (index, (at, s)) in strings.iter().enumerate() {
-        let offset = section.data_offset + *at as u64;
+    for (index, s) in strings.iter().enumerate() {
+        let offset = section.data_offset + s.offset as u64;
         t.add_data(
             offset,
-            s.len() as u64 + 1,
+            s.size(),
             [
                 as_string(index),
                 as_address(offset),
                 "reflstr".to_string(),
-                as_string(s.len()),
-                utf8_safe(s),
+                as_string(s.text.len()),
+                utf8_safe(s.text),
             ],
         );
     }
@@ -226,10 +188,8 @@ fn reflection_strings(t: &mut Table, mh: &MachHeader, section: &Section) {
 }
 
 /// `__swift5_fieldmd`: field descriptors, each followed by its records.
-fn field_metadata(t: &mut Table, mh: &MachHeader, section: &Section, reader: &VmReader<'_>) {
+fn field_metadata(t: &mut Table, mh: &MachHeader, section: &Section, reader: &SliceReader<'_>) {
     let image = &mh.image;
-    let size = section.data_size;
-    let header = FieldDescriptorHeader::SIZE as u32;
     let name_or_dash = |field_vmaddr: u64, rel: i32| {
         relative_cstring(reader, field_vmaddr, rel)
             .map(|(_, s)| s)
@@ -237,19 +197,20 @@ fn field_metadata(t: &mut Table, mh: &MachHeader, section: &Section, reader: &Vm
             .unwrap_or_else(|| "-".to_string())
     };
 
-    // Offsets within the section are 32-bit, as in the original.
-    let mut cursor: u32 = 0;
+    let size = u64::from(section.data_size);
+    let header = FieldDescriptorHeader::SIZE;
+    let mut cursor: u64 = 0;
     let mut descriptor_index: u32 = 0;
-    while cursor as u64 + header as u64 <= size as u64 {
-        let desc_offset = section.data_offset + cursor as u64;
+    while cursor + header <= size {
+        let desc_offset = section.data_offset + cursor;
         let Some(desc) = FieldDescriptorHeader::read(image, desc_offset) else {
             break;
         };
-        let desc_vmaddr = section.addr.wrapping_add(cursor as u64);
+        let desc_vmaddr = section.addr.wrapping_add(cursor);
         if !desc.is_plausible() {
             t.add_data(
                 desc_offset,
-                header as u64,
+                header,
                 [
                     as_string(descriptor_index),
                     as_address(desc_offset),
@@ -265,7 +226,7 @@ fn field_metadata(t: &mut Table, mh: &MachHeader, section: &Section, reader: &Vm
         let super_name = name_or_dash(desc_vmaddr.wrapping_add(4), desc.superclass);
         t.add_data(
             desc_offset,
-            header as u64,
+            header,
             [
                 as_string(descriptor_index),
                 as_address(desc_offset),
@@ -278,27 +239,29 @@ fn field_metadata(t: &mut Table, mh: &MachHeader, section: &Section, reader: &Vm
             ],
         );
 
-        let record_size = desc.field_record_size as u32;
-        let mut field_cursor = cursor.wrapping_add(header);
+        // `is_plausible` bounds both factors, so nothing here overflows.
+        let record_size = u64::from(desc.field_record_size);
+        let mut field_cursor = cursor + header;
         for i in 0..desc.num_fields {
-            let record_offset = section.data_offset + field_cursor as u64;
-            let record = if field_cursor.wrapping_add(record_size) > size {
+            let record_offset = section.data_offset + field_cursor;
+            let record = if field_cursor + record_size > size {
                 None
             } else {
                 FieldRecord::read(image, record_offset)
             };
             let Some(record) = record else {
+                // The rest of the section cannot be told apart from the
+                // missing records.
                 t.add(["-", "-", "field", "-", "truncated field record table"]);
-                cursor = size;
-                break;
+                return;
             };
-            let record_vmaddr = section.addr.wrapping_add(field_cursor as u64);
+            let record_vmaddr = section.addr.wrapping_add(field_cursor);
             let field_name = name_or_dash(record_vmaddr.wrapping_add(8), record.field_name);
             let mangled_name =
                 name_or_dash(record_vmaddr.wrapping_add(4), record.mangled_type_name);
             t.add_data(
                 record_offset,
-                record_size as u64,
+                record_size,
                 [
                     as_string(i),
                     as_address(record_offset),
@@ -311,10 +274,7 @@ fn field_metadata(t: &mut Table, mh: &MachHeader, section: &Section, reader: &Vm
                     ),
                 ],
             );
-            field_cursor = field_cursor.wrapping_add(record_size);
-        }
-        if cursor >= size || field_cursor <= cursor {
-            break;
+            field_cursor += record_size;
         }
         cursor = field_cursor;
         descriptor_index += 1;

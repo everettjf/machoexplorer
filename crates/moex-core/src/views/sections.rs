@@ -1,6 +1,6 @@
 //! "Sections" node: one child per section, in load-command order.
 
-use super::section::section_node;
+use super::section::{section_node, SectionContext};
 use crate::macho::MachHeader;
 use crate::view::{Content, FnNode, Table, ViewNode};
 use std::sync::Arc;
@@ -20,8 +20,9 @@ pub fn node(mh: Arc<MachHeader>) -> Option<ViewNode> {
             Content::table(t)
         },
         children: move || {
+            let context = SectionContext::new(for_children.clone());
             (0..for_children.sections().count())
-                .filter_map(|i| section_node(for_children.clone(), i))
+                .filter_map(|i| section_node(context.clone(), i))
                 .collect()
         },
     }))

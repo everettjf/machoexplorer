@@ -104,10 +104,10 @@ The app bundle also contains the command-line tool, at
 ### Linux / Windows
 Build from source (see [Build from source](#build-from-source)) and please report what you find.
 
-Some features are macOS only: attaching to a process by memory snapshot, and Swift symbol
-demangling (which runs `xcrun swift-demangle`). C++ symbols are demangled by the system
-`libc++abi` on macOS and by the `cpp_demangle` crate elsewhere, so demangled text can differ
-slightly between platforms.
+Attaching to a process by memory snapshot is macOS only. Swift symbols are demangled by
+Swift's own demangler, built into the tool, on every platform. C++ symbols are demangled by
+the system `libc++abi` on macOS and by the `cpp_demangle` crate elsewhere, so demangled text
+can differ slightly between platforms.
 
 ## Quick start
 1. Launch MachOExplorer, or open a file directly: `MachOExplorer <path>`. You can also drop a

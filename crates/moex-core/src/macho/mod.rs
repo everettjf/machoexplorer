@@ -12,6 +12,7 @@ pub mod header;
 pub mod libcxx_sort;
 pub mod linkedit;
 pub mod objc;
+pub mod ptr;
 pub mod segment;
 pub mod swift;
 pub mod symtab;
