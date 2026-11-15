@@ -170,8 +170,11 @@ mod tests {
     fn archive_bytes() -> Vec<u8> {
         let mut a = b"!<arch>\n".to_vec();
         a.extend_from_slice(
-            format!("{:<16}{:<12}{:<6}{:<6}{:<8}{:<10}`\n", "a.txt/", "0", "0", "0", "100644", "6")
-                .as_bytes(),
+            format!(
+                "{:<16}{:<12}{:<6}{:<6}{:<8}{:<10}`\n",
+                "a.txt/", "0", "0", "0", "100644", "6"
+            )
+            .as_bytes(),
         );
         a.extend_from_slice(b"hello!");
         a

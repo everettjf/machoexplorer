@@ -5,8 +5,8 @@
 
 use crate::error::{Error, Result};
 use crate::hex::as_short_hex_string;
-use crate::view::{Table, ViewNode};
-use serde_json::{json, Map, Value};
+use crate::view::{Row, Table, ViewNode};
+use serde::ser::{Serialize, SerializeMap, SerializeSeq, Serializer};
 use std::io::Write;
 
 /// Guard against pathologically deep trees.
@@ -154,87 +154,218 @@ fn dump_node_text(
     Ok(())
 }
 
-fn table_to_json(table: &Table, o: &DumpOptions) -> Value {
-    let mut j = Map::new();
-    if o.include_headers() {
-        j.insert("headers".into(), json!(table.headers));
+// The JSON dump is streamed: each wrapper below serialises one level
+// straight from the view tree, so nothing but the tree itself is held in
+// memory. Entries are written in sorted key order, which is the order the
+// format has always had.
+
+struct TableJson<'a>(&'a Table, &'a DumpOptions);
+
+impl Serialize for TableJson<'_> {
+    fn serialize<S: Serializer>(&self, ser: S) -> std::result::Result<S::Ok, S::Error> {
+        let (table, o) = (self.0, self.1);
+        let total = table.rows.len();
+        let limit = row_limit(o, total);
+        let mut m = ser.serialize_map(None)?;
+        if o.include_headers() {
+            m.serialize_entry("headers", &table.headers)?;
+        }
+        if o.include_rows() {
+            m.serialize_entry("rows", &RowsJson(table, limit))?;
+            m.serialize_entry("shownRows", &limit)?;
+        } else {
+            m.serialize_entry("shownRows", &0)?;
+        }
+        m.serialize_entry("tableMode", &o.table_mode)?;
+        m.serialize_entry("totalRows", &total)?;
+        if o.include_rows() && limit < total {
+            m.serialize_entry("truncated", &true)?;
+        }
+        m.end()
     }
-    let total = table.rows.len();
-    let limit = row_limit(o, total);
-    j.insert("totalRows".into(), json!(total));
-    j.insert("tableMode".into(), json!(o.table_mode));
-    if !o.include_rows() {
-        j.insert("shownRows".into(), json!(0));
-        return Value::Object(j);
-    }
-    j.insert("shownRows".into(), json!(limit));
-    let rows: Vec<Value> = table
-        .rows
-        .iter()
-        .take(limit)
-        .enumerate()
-        .map(|(i, row)| {
-            let mut r = Map::new();
-            r.insert("rowIndex".into(), json!(i));
-            r.insert("values".into(), json!(row.cells));
-            let mut cells = Map::new();
-            for (col, cell) in row.cells.iter().enumerate() {
-                let key = table
+}
+
+struct RowsJson<'a>(&'a Table, usize);
+
+impl Serialize for RowsJson<'_> {
+    fn serialize<S: Serializer>(&self, ser: S) -> std::result::Result<S::Ok, S::Error> {
+        let (table, limit) = (self.0, self.1);
+        // Key of every column a row of this table can have.
+        let columns = table.rows.iter().take(limit).map(|r| r.cells.len()).max();
+        let keys: Vec<String> = (0..columns.unwrap_or(0))
+            .map(|col| {
+                table
                     .headers
                     .get(col)
                     .cloned()
-                    .unwrap_or_else(|| format!("column{col}"));
-                cells.insert(key, json!(cell));
-            }
-            r.insert("cells".into(), Value::Object(cells));
-            if row.size > 0 {
-                r.insert("byteLength".into(), json!(row.size));
-            }
-            Value::Object(r)
-        })
-        .collect();
-    j.insert("rows".into(), Value::Array(rows));
-    if limit < total {
-        j.insert("truncated".into(), json!(true));
+                    .unwrap_or_else(|| format!("column{col}"))
+            })
+            .collect();
+        let mut seq = ser.serialize_seq(Some(limit))?;
+        for (i, row) in table.rows.iter().take(limit).enumerate() {
+            seq.serialize_element(&RowJson {
+                index: i,
+                row,
+                keys: &keys,
+            })?;
+        }
+        seq.end()
     }
-    Value::Object(j)
 }
 
-fn node_to_json(
-    node: &ViewNode,
-    o: &DumpOptions,
-    depth: usize,
-    path: &[String],
-    child_index: usize,
-) -> Value {
-    let mut j = Map::new();
-    j.insert("name".into(), json!(node.name()));
-    j.insert("depth".into(), json!(depth));
-    j.insert("path".into(), json!(path.join("/")));
-    j.insert("kind".into(), json!(kind(node)));
-    j.insert("childIndex".into(), json!(child_index));
-    if let Some(table) = rows_of(node) {
-        j.insert("table".into(), table_to_json(table, o));
+struct RowJson<'a> {
+    index: usize,
+    row: &'a Row,
+    keys: &'a [String],
+}
+
+impl Serialize for RowJson<'_> {
+    fn serialize<S: Serializer>(&self, ser: S) -> std::result::Result<S::Ok, S::Error> {
+        let mut m = ser.serialize_map(None)?;
+        if self.row.size > 0 {
+            m.serialize_entry("byteLength", &self.row.size)?;
+        }
+        m.serialize_entry("cells", &CellsJson(self.row, self.keys))?;
+        m.serialize_entry("rowIndex", &self.index)?;
+        m.serialize_entry("values", &self.row.cells)?;
+        m.end()
     }
-    if let Some(b) = node.binary() {
-        j.insert(
-            "binary".into(),
-            json!({ "size": b.size, "startValue": b.start_value }),
-        );
-    }
-    let mut children = Vec::new();
-    if o.depth_allows_children(depth) {
-        for (i, child) in node.children().iter().enumerate() {
-            if !should_appear(child, o, depth + 1) {
+}
+
+/// The cells of a row keyed by column header. Columns sharing a header
+/// collapse to the last one, as in any JSON object.
+struct CellsJson<'a>(&'a Row, &'a [String]);
+
+impl Serialize for CellsJson<'_> {
+    fn serialize<S: Serializer>(&self, ser: S) -> std::result::Result<S::Ok, S::Error> {
+        let mut entries: Vec<(&str, &String)> = self
+            .1
+            .iter()
+            .map(String::as_str)
+            .zip(self.0.cells.iter())
+            .collect();
+        // Stable, so the last of several equal keys stays last.
+        entries.sort_by(|a, b| a.0.cmp(b.0));
+        let mut m = ser.serialize_map(None)?;
+        for (i, (key, cell)) in entries.iter().enumerate() {
+            if entries.get(i + 1).is_some_and(|next| next.0 == *key) {
                 continue;
             }
-            let mut child_path = path.to_vec();
-            child_path.push(child.name().to_string());
-            children.push(node_to_json(child, o, depth + 1, &child_path, i));
+            m.serialize_entry(key, cell)?;
         }
+        m.end()
     }
-    j.insert("children".into(), Value::Array(children));
-    Value::Object(j)
+}
+
+struct BinaryJson(u64, u64);
+
+impl Serialize for BinaryJson {
+    fn serialize<S: Serializer>(&self, ser: S) -> std::result::Result<S::Ok, S::Error> {
+        let mut m = ser.serialize_map(Some(2))?;
+        m.serialize_entry("size", &self.0)?;
+        m.serialize_entry("startValue", &self.1)?;
+        m.end()
+    }
+}
+
+struct NodeJson<'a> {
+    node: &'a ViewNode,
+    o: &'a DumpOptions,
+    depth: usize,
+    path: String,
+    child_index: usize,
+}
+
+impl Serialize for NodeJson<'_> {
+    fn serialize<S: Serializer>(&self, ser: S) -> std::result::Result<S::Ok, S::Error> {
+        let (node, o) = (self.node, self.o);
+        let mut m = ser.serialize_map(None)?;
+        if let Some(b) = node.binary() {
+            m.serialize_entry("binary", &BinaryJson(b.size, b.start_value))?;
+        }
+        m.serialize_entry("childIndex", &self.child_index)?;
+        m.serialize_entry("children", &ChildrenJson(self))?;
+        m.serialize_entry("depth", &self.depth)?;
+        m.serialize_entry("kind", kind(node))?;
+        m.serialize_entry("name", node.name())?;
+        m.serialize_entry("path", &self.path)?;
+        if let Some(table) = rows_of(node) {
+            m.serialize_entry("table", &TableJson(table, o))?;
+        }
+        m.end()
+    }
+}
+
+struct ChildrenJson<'a>(&'a NodeJson<'a>);
+
+impl Serialize for ChildrenJson<'_> {
+    fn serialize<S: Serializer>(&self, ser: S) -> std::result::Result<S::Ok, S::Error> {
+        let parent = self.0;
+        let o = parent.o;
+        let mut seq = ser.serialize_seq(None)?;
+        if o.depth_allows_children(parent.depth) {
+            for (i, child) in parent.node.children().iter().enumerate() {
+                if !should_appear(child, o, parent.depth + 1) {
+                    continue;
+                }
+                seq.serialize_element(&NodeJson {
+                    node: child,
+                    o,
+                    depth: parent.depth + 1,
+                    path: format!("{}/{}", parent.path, child.name()),
+                    child_index: i,
+                })?;
+            }
+        }
+        seq.end()
+    }
+}
+
+struct OptionsJson<'a>(&'a DumpOptions);
+
+impl Serialize for OptionsJson<'_> {
+    fn serialize<S: Serializer>(&self, ser: S) -> std::result::Result<S::Ok, S::Error> {
+        let o = self.0;
+        let mut m = ser.serialize_map(Some(6))?;
+        m.serialize_entry("includeEmptyNodes", &o.include_empty_nodes)?;
+        m.serialize_entry("maxDepth", &o.max_depth)?;
+        m.serialize_entry("maxRowsPerTable", &o.max_rows_per_table)?;
+        m.serialize_entry("nameFilter", &o.name_filter)?;
+        m.serialize_entry("rootPath", &o.root_path)?;
+        m.serialize_entry("tableMode", &o.table_mode)?;
+        m.end()
+    }
+}
+
+struct PayloadJson<'a> {
+    root: NodeJson<'a>,
+    file: &'a str,
+    summary: Summary,
+}
+
+impl Serialize for PayloadJson<'_> {
+    fn serialize<S: Serializer>(&self, ser: S) -> std::result::Result<S::Ok, S::Error> {
+        let mut m = ser.serialize_map(Some(7))?;
+        m.serialize_entry("analysis", &self.root)?;
+        m.serialize_entry("file", self.file)?;
+        m.serialize_entry("format", "viewnode-json")?;
+        m.serialize_entry("generator", "MachOExplorer CLI")?;
+        m.serialize_entry("options", &OptionsJson(self.root.o))?;
+        m.serialize_entry("schemaVersion", &self.root.o.format_version)?;
+        m.serialize_entry("summary", &self.summary)?;
+        m.end()
+    }
+}
+
+impl Serialize for Summary {
+    fn serialize<S: Serializer>(&self, ser: S) -> std::result::Result<S::Ok, S::Error> {
+        let mut m = ser.serialize_map(Some(4))?;
+        m.serialize_entry("binaryNodes", &self.binary_nodes)?;
+        m.serialize_entry("nodes", &self.nodes)?;
+        m.serialize_entry("tableNodes", &self.table_nodes)?;
+        m.serialize_entry("totalRows", &self.total_rows)?;
+        m.end()
+    }
 }
 
 #[derive(Default)]
@@ -310,27 +441,17 @@ pub fn dump_tree(
     if options.json_output {
         let mut summary = Summary::default();
         accumulate(&root, options, 0, &mut summary);
-        let payload = json!({
-            "schemaVersion": options.format_version,
-            "generator": "MachOExplorer CLI",
-            "format": "viewnode-json",
-            "file": file_label,
-            "options": {
-                "includeEmptyNodes": options.include_empty_nodes,
-                "maxRowsPerTable": options.max_rows_per_table,
-                "maxDepth": options.max_depth,
-                "rootPath": options.root_path,
-                "nameFilter": options.name_filter,
-                "tableMode": options.table_mode,
+        let payload = PayloadJson {
+            root: NodeJson {
+                node: &root,
+                o: options,
+                depth: 0,
+                path: root_path_segments.join("/"),
+                child_index: 0,
             },
-            "summary": {
-                "nodes": summary.nodes,
-                "tableNodes": summary.table_nodes,
-                "binaryNodes": summary.binary_nodes,
-                "totalRows": summary.total_rows,
-            },
-            "analysis": node_to_json(&root, options, 0, &root_path_segments, 0),
-        });
+            file: file_label,
+            summary,
+        };
         serde_json::to_writer_pretty(&mut *out, &payload)
             .map_err(|e| Error(format!("write failed: {e}")))?;
         writeln!(out).map_err(io)?;

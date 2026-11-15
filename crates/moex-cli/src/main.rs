@@ -6,7 +6,7 @@ mod diff;
 mod legacy_args;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use moex_core::dump::{dump_file, DumpOptions};
+use moex_core::dump::{dump_tree, DumpOptions};
 use std::io::Write;
 use std::process::ExitCode;
 
@@ -135,18 +135,28 @@ fn run_dump(a: &DumpArgs) -> ExitCode {
         .into(),
         ..Default::default()
     };
-    // Buffer so a failed analysis leaves no partial output behind.
-    let mut buf = Vec::new();
-    if let Err(e) = dump_file(&a.file, &options, &mut buf) {
-        eprintln!("analysis failed: {e}");
-        return ExitCode::from(1);
-    }
-    let result = match &a.output {
-        Some(path) => {
-            std::fs::write(path, &buf).map_err(|_| format!("cannot open output file: {path}"))
+    // Analyse first, so a file that cannot be read leaves no output behind;
+    // the dump itself is then streamed.
+    let root = match moex_core::open(&a.file) {
+        Ok(root) => root,
+        Err(e) => {
+            eprintln!("analysis failed: {e}");
+            return ExitCode::from(1);
         }
-        None => std::io::stdout().write_all(&buf).map_err(|e| e.to_string()),
     };
+    let mut out: Box<dyn Write> = match &a.output {
+        Some(path) => match std::fs::File::create(path) {
+            Ok(file) => Box::new(std::io::BufWriter::new(file)),
+            Err(_) => {
+                eprintln!("error: cannot open output file: {path}");
+                return ExitCode::from(1);
+            }
+        },
+        None => Box::new(std::io::BufWriter::new(std::io::stdout().lock())),
+    };
+    let result = dump_tree(&root, &a.file, &options, &mut out)
+        .and_then(|()| out.flush().map_err(|e| moex_core::Error(format!("write failed: {e}"))))
+        .map_err(|e| e.to_string());
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {

@@ -4380,6 +4380,7 @@ dependencies = [
  "cpp_demangle",
  "flate2",
  "memmap2",
+ "serde",
  "serde_json",
  "sha1",
  "sha2 0.10.9",

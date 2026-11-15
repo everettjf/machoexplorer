@@ -72,10 +72,7 @@ impl NodeSource for FatNode {
                 SliceContent::MachO(mh) => mach_header_node(mh.clone()),
                 SliceContent::Archive(archive) => super::archive::node_named(
                     archive.clone(),
-                    format!(
-                        "Archive ({})",
-                        names::arch(a.cputype, a.cpusubtype)
-                    ),
+                    format!("Archive ({})", names::arch(a.cputype, a.cpusubtype)),
                 ),
                 SliceContent::Unknown(reason) => ViewNode::new(UnknownSlice {
                     name: format!("Slice ({})", names::arch(a.cputype, a.cpusubtype)),
