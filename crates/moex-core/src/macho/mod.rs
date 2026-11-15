@@ -9,7 +9,6 @@ pub mod dysymtab;
 pub mod export_trie;
 pub mod fat;
 pub mod header;
-pub mod libcxx_sort;
 pub mod linkedit;
 pub mod objc;
 pub mod ptr;

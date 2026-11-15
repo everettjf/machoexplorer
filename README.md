@@ -53,7 +53,7 @@ C++/Qt implementation of the 2.x releases. If you used the 2.x command-line tool
 
 ### Code & cross-references
 - [Capstone](https://www.capstone-engine.org/) disassembly of `__TEXT,__text` (arm64, x86_64, arm, i386). Capstone is built in; nothing extra to install.
-- Xref report that resolves call / jump targets and ties them back to symbols.
+- Xref report: call / jump targets, computed addresses and memory references found in the code, plus stored pointers, tied back to symbols.
 
 ### dyld shared cache
 - List images, extract a single image or all of them, and drill straight into an extracted image.

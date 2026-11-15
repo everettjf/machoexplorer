@@ -1,6 +1,7 @@
 //! "Xref Report" node: who refers to which address, from pointer sections
-//! and from the jumps and calls in `__TEXT,__text`, followed by a call
-//! graph summary per instruction and per function.
+//! and from the code of `__TEXT,__text` (calls, jumps, address computations
+//! and memory accesses), followed by a call graph summary per instruction
+//! and per function.
 
 use crate::hex::{as_address, as_short_hex_string, as_string};
 use crate::macho::xref::{self, Xrefs};
@@ -125,7 +126,7 @@ fn fill(t: &mut Table, symbols: &Symbols, refs: &Xrefs) {
     let mut caller_to_targets: BTreeMap<u64, BTreeSet<u64>> = BTreeMap::new();
     for (target, items) in &refs.targets {
         for item in items {
-            if item.ref_vm != 0 && item.kind.is_code() {
+            if item.ref_vm != 0 && item.kind.is_branch() {
                 caller_to_targets
                     .entry(item.ref_vm)
                     .or_default()

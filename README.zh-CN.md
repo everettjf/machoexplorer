@@ -50,7 +50,7 @@ load command、section、符号、反汇编，以及 Apple 特有的元数据（
 
 ### 代码与交叉引用
 - [Capstone](https://www.capstone-engine.org/) 反汇编 `__TEXT,__text`（arm64、x86_64、arm、i386）。Capstone 已内置，无需另外安装。
-- Xref 报告：解析 call / jump 目标并关联回符号。
+- Xref 报告：解析代码中的 call / jump 目标、地址计算与内存访问，以及指针节中的指针，并关联回符号。
 
 ### dyld shared cache
 - 列出镜像、提取单个或全部镜像，并直接钻入已提取的镜像分析。
