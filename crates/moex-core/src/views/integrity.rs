@@ -1,5 +1,6 @@
 //! "Integrity Report" node: range checks of segments, sections and the
-//! linkedit tables against the file size.
+//! linkedit tables against the bounds of the Mach-O (the fat slice or
+//! archive member it lives in, or the whole file).
 
 use crate::consts::*;
 use crate::macho::MachHeader;
@@ -63,12 +64,11 @@ fn content(mh: &MachHeader) -> Content {
     r.table
         .set_headers(&["Severity", "Category", "Check", "Details"]);
     r.table.set_widths(&[100, 160, 220, 560]);
-    let file_size = mh.image.len();
+    // Offsets in load commands are relative to the Mach-O header, so they
+    // are bounded by the size of the slice, not of the whole file.
+    let file_size = mh.size;
 
     // 32-bit segments first, then 64-bit ones.
-    // QUIRK(parity): every offset in this report is compared as stored
-    // (relative to the Mach-O header) against the size of the whole file, so
-    // slices of a fat file are checked against the wrong bound.
     for want64 in [false, true] {
         for seg in mh.segments.iter().filter(|s| s.is64 == want64) {
             if !in_range(file_size, seg.fileoff, seg.filesize) {
@@ -104,7 +104,7 @@ fn content(mh: &MachHeader) -> Content {
             r.check_range(
                 file_size,
                 st.symoff as u64,
-                st.symbol_table_total_bytes() as u64,
+                st.symbol_table_total_bytes(),
                 "symtab",
                 "symbol table",
             );

@@ -30,17 +30,6 @@ fn demangle_cxx(name: &[u8]) -> Option<String> {
     crate::demangle::demangle_itanium(&name[1..])
 }
 
-/// `{:X}` of a signed 16-bit value the way the original formats it.
-// QUIRK(parity): the 32-bit `n_desc` is a signed short, so a value with the
-// top bit set prints as a minus sign followed by the magnitude.
-fn short_hex_i16(v: i16) -> String {
-    if v < 0 {
-        format!("-{:X}", (v as i32).unsigned_abs())
-    } else {
-        format!("{:X}", v)
-    }
-}
-
 fn content(mh: &MachHeader) -> Content {
     let mut t = Table::new();
     let Some(symtab) = mh.symtab() else {
@@ -61,12 +50,12 @@ fn content(mh: &MachHeader) -> Content {
             "Section Index",
             as_short_hex_string(sym.n_sect as u64),
         );
-        let desc = if sym.is64 {
-            as_short_hex_string(sym.n_desc as u64)
-        } else {
-            short_hex_i16(sym.n_desc as i16)
-        };
-        t.field(o + 6, 2, "Description", desc);
+        t.field(
+            o + 6,
+            2,
+            "Description",
+            as_short_hex_string(sym.n_desc as u64),
+        );
         t.field(
             o + 8,
             sym.value_size(),
@@ -78,7 +67,7 @@ fn content(mh: &MachHeader) -> Content {
 
     Content::table(t).with_binary(
         symtab.symbol_table_offset(),
-        symtab.symbol_table_total_bytes() as u64,
+        symtab.symbol_table_total_bytes(),
     )
 }
 
@@ -95,8 +84,5 @@ mod tests {
         assert!(!is_cxx_mangled(b"_main"));
         assert!(!is_cxx_mangled(b"_"));
         assert!(!is_cxx_mangled(b""));
-        assert_eq!(short_hex_i16(0x10), "10");
-        assert_eq!(short_hex_i16(-1), "-1");
-        assert_eq!(short_hex_i16(i16::MIN), "-8000");
     }
 }

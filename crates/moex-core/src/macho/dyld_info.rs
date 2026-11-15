@@ -1,13 +1,13 @@
 //! `LC_DYLD_INFO` / `LC_DYLD_INFO_ONLY`: the rebase, bind, weak-bind and
-//! lazy-bind opcode streams and the classic export trie.
+//! lazy-bind opcode streams (the export trie lives in `export_trie`).
 //!
-//! The walkers mirror `LoadCommand_DYLD_INFO.cpp`, including where it gives
-//! up and what it keeps going on, because the views show every step.
+//! The walkers follow dyld's interpretation of the streams (see
+//! `<mach-o/loader.h>` and dyld's `MachOAnalyzer`), reporting every opcode
+//! with its operands and the location it applies to.
 
 use super::header::{LoadCommand, MachHeader};
 use crate::consts::{LC_DYLD_INFO, LC_DYLD_INFO_ONLY};
 use crate::leb::{read_sleb128, read_uleb128};
-use std::collections::{HashSet, VecDeque};
 
 pub const REBASE_OPCODE_MASK: u8 = 0xF0;
 pub const REBASE_IMMEDIATE_MASK: u8 = 0x0F;
@@ -36,15 +36,19 @@ pub const BIND_OPCODE_DO_BIND: u8 = 0x90;
 pub const BIND_OPCODE_DO_BIND_ADD_ADDR_ULEB: u8 = 0xA0;
 pub const BIND_OPCODE_DO_BIND_ADD_ADDR_IMM_SCALED: u8 = 0xB0;
 pub const BIND_OPCODE_DO_BIND_ULEB_TIMES_SKIPPING_ULEB: u8 = 0xC0;
+pub const BIND_OPCODE_THREADED: u8 = 0xD0;
+pub const BIND_SUBOPCODE_THREADED_SET_BIND_ORDINAL_TABLE_SIZE_ULEB: u8 = 0x00;
+pub const BIND_SUBOPCODE_THREADED_APPLY: u8 = 0x01;
 
 pub const EXPORT_SYMBOL_FLAGS_KIND_MASK: u64 = 0x03;
 pub const EXPORT_SYMBOL_FLAGS_KIND_REGULAR: u64 = 0x00;
 pub const EXPORT_SYMBOL_FLAGS_KIND_THREAD_LOCAL: u64 = 0x01;
+pub const EXPORT_SYMBOL_FLAGS_KIND_ABSOLUTE: u64 = 0x02;
 pub const EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION: u64 = 0x04;
 pub const EXPORT_SYMBOL_FLAGS_REEXPORT: u64 = 0x08;
 pub const EXPORT_SYMBOL_FLAGS_STUB_AND_RESOLVER: u64 = 0x10;
 
-/// Most trie nodes one walk visits (same limit as the original).
+/// Most trie nodes one walk visits.
 pub const MAX_TRIE_NODES: usize = 200_000;
 /// Most child edges one trie walk reports. A well-formed trie has fewer
 /// edges than nodes; only overlapping, crafted nodes get near this.
@@ -78,8 +82,18 @@ pub enum BindKind {
     LazyBind,
 }
 
-/// A LEB128 operand: its value and the bytes it was read from. A malformed
-/// or truncated operand has `value == 0` and `size == 0`.
+impl DyldInfo {
+    /// `(offset, size)` of a bind stream, as stored.
+    pub fn bind_range(&self, kind: BindKind) -> (u32, u32) {
+        match kind {
+            BindKind::Bind => (self.bind_off, self.bind_size),
+            BindKind::WeakBind => (self.weak_bind_off, self.weak_bind_size),
+            BindKind::LazyBind => (self.lazy_bind_off, self.lazy_bind_size),
+        }
+    }
+}
+
+/// A LEB128 operand: its value and the bytes it was read from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Leb<T> {
     pub value: T,
@@ -91,19 +105,22 @@ pub struct Leb<T> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RebaseOp {
     Done,
-    SetTypeImm,
+    SetTypeImm {
+        rebase_type: u8,
+    },
     SetSegmentAndOffsetUleb {
-        segment_index: u32,
+        segment_index: u8,
         offset: Leb<u64>,
     },
     AddAddrUleb {
         offset: Leb<u64>,
     },
+    /// Advance by `scale` pointers.
     AddAddrImmScaled {
-        scale: u32,
+        scale: u8,
     },
     DoRebaseImmTimes {
-        count: u32,
+        count: u8,
     },
     DoRebaseUlebTimes {
         count: Leb<u64>,
@@ -115,6 +132,10 @@ pub enum RebaseOp {
         count: Leb<u64>,
         skip: Leb<u64>,
     },
+    /// An opcode `<mach-o/loader.h>` does not define. Ends the walk.
+    Unknown,
+    /// A known opcode whose operand is cut off or malformed. Ends the walk.
+    Truncated,
 }
 
 /// One decoded rebase opcode.
@@ -123,12 +144,10 @@ pub struct RebaseOpcode {
     /// File offset of the opcode byte.
     pub offset: u64,
     pub byte: u8,
-    pub opcode: u8,
-    pub immediate: u8,
-    /// The immediate of `SET_TYPE_IMM`; 0 for every other opcode.
-    pub rebase_type: u8,
-    /// The walker's running address when the opcode was reported.
-    pub address: u64,
+    /// The location (virtual address) the stream points at before this
+    /// opcode runs: for a `DO_REBASE_*` opcode, the first pointer it
+    /// rebases. `None` until a valid segment has been set.
+    pub address: Option<u64>,
     pub op: RebaseOp,
 }
 
@@ -136,29 +155,32 @@ pub struct RebaseOpcode {
 pub enum BindOp {
     Done,
     SetDylibOrdinalImm {
-        ordinal: u64,
+        ordinal: u8,
     },
     SetDylibOrdinalUleb {
         ordinal: Leb<u64>,
     },
+    /// 0 (`BIND_SPECIAL_DYLIB_SELF`) or a negative special ordinal.
     SetDylibSpecialImm {
-        ordinal: u64,
+        ordinal: i8,
     },
     SetSymbolTrailingFlagsImm {
-        flags: u64,
+        flags: u8,
         /// Name bytes without the terminator.
         name: Vec<u8>,
         /// File offset of the name.
         name_offset: u64,
         /// Name length including the terminator.
-        name_size: u32,
+        name_size: u64,
     },
-    SetTypeImm,
+    SetTypeImm {
+        bind_type: u8,
+    },
     SetAddendSleb {
         addend: Leb<i64>,
     },
     SetSegmentAndOffsetUleb {
-        segment_index: u32,
+        segment_index: u8,
         offset: Leb<u64>,
     },
     AddAddrUleb {
@@ -168,13 +190,26 @@ pub enum BindOp {
     DoBindAddAddrUleb {
         offset: Leb<u64>,
     },
+    /// Bind, then advance by `scale` further pointers.
     DoBindAddAddrImmScaled {
-        scale: u32,
+        scale: u8,
     },
     DoBindUlebTimesSkippingUleb {
         count: Leb<u64>,
         skip: Leb<u64>,
     },
+    /// `BIND_OPCODE_THREADED` / `SET_BIND_ORDINAL_TABLE_SIZE_ULEB`.
+    ThreadedSetBindOrdinalTableSizeUleb {
+        count: Leb<u64>,
+    },
+    /// `BIND_OPCODE_THREADED` / `THREADED_APPLY`: walk the fixup chain that
+    /// starts at the current location.
+    ThreadedApply,
+    /// An opcode (or threaded sub-opcode) `<mach-o/loader.h>` does not
+    /// define. Ends the walk.
+    Unknown,
+    /// A known opcode whose operand is cut off or malformed. Ends the walk.
+    Truncated,
 }
 
 /// One decoded bind opcode.
@@ -183,66 +218,56 @@ pub struct BindOpcode {
     /// File offset of the opcode byte.
     pub offset: u64,
     pub byte: u8,
-    pub opcode: u8,
-    pub immediate: u8,
-    /// The immediate of `SET_TYPE_IMM`; 0 for every other opcode.
-    pub bind_type: u8,
-    /// The walker's running address when the opcode was reported.
-    pub address: u64,
+    /// The location (virtual address) the stream points at before this
+    /// opcode runs: for a `DO_BIND*` opcode, the (first) pointer it binds.
+    /// `None` until a valid segment has been set.
+    pub address: Option<u64>,
     pub op: BindOp,
 }
 
-/// One child edge of a classic export trie node.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExportChild {
-    /// Edge label without the terminator.
-    pub label: Vec<u8>,
-    pub label_offset: u64,
-    /// Label length including the terminator.
-    pub label_size: u32,
-    /// Offset of the child node from the start of the trie.
-    pub skip: Leb<u64>,
-}
-
-/// One node of the classic export trie as the original walker reads it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExportNode {
-    pub terminal_size: u8,
-    pub terminal_size_offset: u64,
-    /// Present when `terminal_size > 0`.
-    pub flags: Option<Leb<u64>>,
-    /// Present when `terminal_size > 0`.
-    pub symbol_offset: Option<Leb<u64>>,
-    pub child_count: u8,
-    pub child_count_offset: u64,
-    pub children: Vec<ExportChild>,
-}
-
-impl ExportNode {
-    /// `(hex value, name)` of every flag set in `flags`.
-    pub fn flag_names(&self) -> Vec<(&'static str, &'static str)> {
-        export_flag_names(self.flags.map(|f| f.value).unwrap_or(0))
+pub fn rebase_opcode_name(byte: u8) -> &'static str {
+    match byte & REBASE_OPCODE_MASK {
+        REBASE_OPCODE_DONE => "REBASE_OPCODE_DONE",
+        REBASE_OPCODE_SET_TYPE_IMM => "REBASE_OPCODE_SET_TYPE_IMM",
+        REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB => "REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB",
+        REBASE_OPCODE_ADD_ADDR_ULEB => "REBASE_OPCODE_ADD_ADDR_ULEB",
+        REBASE_OPCODE_ADD_ADDR_IMM_SCALED => "REBASE_OPCODE_ADD_ADDR_IMM_SCALED",
+        REBASE_OPCODE_DO_REBASE_IMM_TIMES => "REBASE_OPCODE_DO_REBASE_IMM_TIMES",
+        REBASE_OPCODE_DO_REBASE_ULEB_TIMES => "REBASE_OPCODE_DO_REBASE_ULEB_TIMES",
+        REBASE_OPCODE_DO_REBASE_ADD_ADDR_ULEB => "REBASE_OPCODE_DO_REBASE_ADD_ADDR_ULEB",
+        REBASE_OPCODE_DO_REBASE_ULEB_TIMES_SKIPPING_ULEB => {
+            "REBASE_OPCODE_DO_REBASE_ULEB_TIMES_SKIPPING_ULEB"
+        }
+        _ => "REBASE_OPCODE_UNKNOWN",
     }
 }
 
-pub fn export_flag_names(flags: u64) -> Vec<(&'static str, &'static str)> {
-    let mut res = Vec::new();
-    if flags & EXPORT_SYMBOL_FLAGS_KIND_MASK == EXPORT_SYMBOL_FLAGS_KIND_REGULAR {
-        res.push(("00", "EXPORT_SYMBOL_FLAGS_KIND_REGULAR"));
+pub fn bind_opcode_name(byte: u8) -> &'static str {
+    match byte & BIND_OPCODE_MASK {
+        BIND_OPCODE_DONE => "BIND_OPCODE_DONE",
+        BIND_OPCODE_SET_DYLIB_ORDINAL_IMM => "BIND_OPCODE_SET_DYLIB_ORDINAL_IMM",
+        BIND_OPCODE_SET_DYLIB_ORDINAL_ULEB => "BIND_OPCODE_SET_DYLIB_ORDINAL_ULEB",
+        BIND_OPCODE_SET_DYLIB_SPECIAL_IMM => "BIND_OPCODE_SET_DYLIB_SPECIAL_IMM",
+        BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM => "BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM",
+        BIND_OPCODE_SET_TYPE_IMM => "BIND_OPCODE_SET_TYPE_IMM",
+        BIND_OPCODE_SET_ADDEND_SLEB => "BIND_OPCODE_SET_ADDEND_SLEB",
+        BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB => "BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB",
+        BIND_OPCODE_ADD_ADDR_ULEB => "BIND_OPCODE_ADD_ADDR_ULEB",
+        BIND_OPCODE_DO_BIND => "BIND_OPCODE_DO_BIND",
+        BIND_OPCODE_DO_BIND_ADD_ADDR_ULEB => "BIND_OPCODE_DO_BIND_ADD_ADDR_ULEB",
+        BIND_OPCODE_DO_BIND_ADD_ADDR_IMM_SCALED => "BIND_OPCODE_DO_BIND_ADD_ADDR_IMM_SCALED",
+        BIND_OPCODE_DO_BIND_ULEB_TIMES_SKIPPING_ULEB => {
+            "BIND_OPCODE_DO_BIND_ULEB_TIMES_SKIPPING_ULEB"
+        }
+        BIND_OPCODE_THREADED => match byte & BIND_IMMEDIATE_MASK {
+            BIND_SUBOPCODE_THREADED_SET_BIND_ORDINAL_TABLE_SIZE_ULEB => {
+                "BIND_SUBOPCODE_THREADED_SET_BIND_ORDINAL_TABLE_SIZE_ULEB"
+            }
+            BIND_SUBOPCODE_THREADED_APPLY => "BIND_SUBOPCODE_THREADED_APPLY",
+            _ => "BIND_OPCODE_THREADED",
+        },
+        _ => "BIND_OPCODE_UNKNOWN",
     }
-    if flags & EXPORT_SYMBOL_FLAGS_KIND_MASK == EXPORT_SYMBOL_FLAGS_KIND_THREAD_LOCAL {
-        res.push(("01", "EXPORT_SYMBOL_FLAGS_KIND_THREAD_LOCAL"));
-    }
-    if flags & EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION != 0 {
-        res.push(("04", "EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION"));
-    }
-    if flags & EXPORT_SYMBOL_FLAGS_REEXPORT != 0 {
-        res.push(("08", "EXPORT_SYMBOL_FLAGS_REEXPORT"));
-    }
-    if flags & EXPORT_SYMBOL_FLAGS_STUB_AND_RESOLVER != 0 {
-        res.push(("10", "EXPORT_SYMBOL_FLAGS_STUB_AND_RESOLVER"));
-    }
-    res
 }
 
 pub fn rebase_type_name(t: u8) -> &'static str {
@@ -263,12 +288,24 @@ pub fn bind_type_name(t: u8) -> &'static str {
     }
 }
 
+/// Name of a special (non-positive) dylib ordinal; `None` for the ones
+/// `<mach-o/loader.h>` does not define.
+pub fn special_dylib_name(ordinal: i64) -> Option<&'static str> {
+    Some(match ordinal {
+        0 => "BIND_SPECIAL_DYLIB_SELF",
+        -1 => "BIND_SPECIAL_DYLIB_MAIN_EXECUTABLE",
+        -2 => "BIND_SPECIAL_DYLIB_FLAT_LOOKUP",
+        -3 => "BIND_SPECIAL_DYLIB_WEAK_LOOKUP",
+        _ => return None,
+    })
+}
+
 /// What the opcode walkers need to know about the image.
 #[derive(Debug, Clone, Default)]
 pub struct WalkContext {
     pub is64: bool,
-    pub base_address: u64,
-    /// vmaddr of every segment command of the header's word size, in order.
+    /// vmaddr of every segment command of the header's word size, in
+    /// load-command order (the order segment indexes refer to).
     pub segment_vmaddrs: Vec<u64>,
 }
 
@@ -281,15 +318,19 @@ impl WalkContext {
         }
     }
 
-    /// Address after a `SET_SEGMENT_AND_OFFSET_ULEB`.
-    fn segment_address(&self, current: u64, segment_index: u32, offset: u64) -> u64 {
-        match self.segment_vmaddrs.get(segment_index as usize) {
-            // QUIRK(parity): the 64-bit path drops the segment offset.
-            Some(&vmaddr) if self.is64 => vmaddr,
-            Some(&vmaddr) => vmaddr.wrapping_add(offset),
-            None => current,
-        }
+    /// Location after a `SET_SEGMENT_AND_OFFSET_ULEB`; `None` for a
+    /// segment index the image does not have.
+    fn segment_address(&self, segment_index: u8, offset: u64) -> Option<u64> {
+        self.segment_vmaddrs
+            .get(segment_index as usize)
+            .map(|vmaddr| vmaddr.wrapping_add(offset))
     }
+}
+
+/// `location + delta` in the image's address space (wrapping: the streams
+/// encode backwards moves as large unsigned values).
+fn advance(location: Option<u64>, delta: u64) -> Option<u64> {
+    location.map(|l| l.wrapping_add(delta))
 }
 
 /// Cursor over an opcode stream. `base` is the file offset of `bytes[0]`.
@@ -308,134 +349,110 @@ impl Stream<'_> {
         self.bytes.get(self.pos..).unwrap_or(&[])
     }
 
-    fn advance(&mut self, n: usize) {
-        self.pos = self.pos.saturating_add(n).min(self.bytes.len());
-    }
-
     fn byte(&mut self) -> Option<u8> {
         let b = *self.bytes.get(self.pos)?;
         self.pos += 1;
         Some(b)
     }
 
-    /// A malformed operand reads as value 0 occupying 0 bytes, and the walk
-    /// carries on with the next byte as an opcode.
-    fn uleb(&mut self) -> Leb<u64> {
+    /// `None` for an operand that is cut off by the end of the stream or
+    /// does not fit in 64 bits; the cursor is then left where it was.
+    fn uleb(&mut self) -> Option<Leb<u64>> {
         let offset = self.offset();
-        let (value, size) = read_uleb128(self.rest()).unwrap_or((0, 0));
-        self.advance(size as usize);
-        Leb {
+        let (value, size) = read_uleb128(self.rest())?;
+        self.pos += size as usize;
+        Some(Leb {
             value,
             offset,
             size,
-        }
+        })
     }
 
-    fn sleb(&mut self) -> Leb<i64> {
+    fn sleb(&mut self) -> Option<Leb<i64>> {
         let offset = self.offset();
-        let (value, size) = read_sleb128(self.rest()).unwrap_or((0, 0));
-        self.advance(size as usize);
-        Leb {
+        let (value, size) = read_sleb128(self.rest())?;
+        self.pos += size as usize;
+        Some(Leb {
             value,
             offset,
             size,
-        }
+        })
     }
 }
 
 /// Decode a rebase opcode stream. `base` is the file offset of `bytes[0]`.
-/// Unknown opcodes are skipped without being reported.
+/// The walk ends at `REBASE_OPCODE_DONE`, at the end of the stream, or with
+/// an [`RebaseOp::Unknown`] / [`RebaseOp::Truncated`] entry.
 pub fn walk_rebase_opcodes(bytes: &[u8], base: u64, ctx: &WalkContext) -> Vec<RebaseOpcode> {
     let pointer_size = ctx.pointer_size();
     let mut out = Vec::new();
-    let mut address = ctx.base_address;
+    let mut location: Option<u64> = None;
     let mut s = Stream {
         bytes,
         base,
         pos: 0,
     };
-    loop {
+    while out.len() < MAX_OPCODES {
         let offset = s.offset();
         let Some(byte) = s.byte() else { break };
-        let opcode = byte & REBASE_OPCODE_MASK;
         let immediate = byte & REBASE_IMMEDIATE_MASK;
-        let mut rebase_type = 0;
-        // `address_after` is applied once the opcode has been reported.
-        let (op, address_after) = match opcode {
-            REBASE_OPCODE_DONE => (RebaseOp::Done, address),
-            REBASE_OPCODE_SET_TYPE_IMM => {
-                rebase_type = immediate;
-                (RebaseOp::SetTypeImm, address)
-            }
-            REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB => {
-                let segment_index = immediate as u32;
-                let off = s.uleb();
-                address = ctx.segment_address(address, segment_index, off.value);
-                (
+        let address = location;
+        // `None`: an operand could not be read.
+        let op = (|| {
+            Some(match byte & REBASE_OPCODE_MASK {
+                REBASE_OPCODE_DONE => RebaseOp::Done,
+                REBASE_OPCODE_SET_TYPE_IMM => RebaseOp::SetTypeImm {
+                    rebase_type: immediate,
+                },
+                REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB => {
+                    let off = s.uleb()?;
+                    location = ctx.segment_address(immediate, off.value);
                     RebaseOp::SetSegmentAndOffsetUleb {
-                        segment_index,
+                        segment_index: immediate,
                         offset: off,
-                    },
-                    address,
-                )
-            }
-            REBASE_OPCODE_ADD_ADDR_ULEB => {
-                let off = s.uleb();
-                (
-                    RebaseOp::AddAddrUleb { offset: off },
-                    address.wrapping_add(off.value),
-                )
-            }
-            REBASE_OPCODE_ADD_ADDR_IMM_SCALED => {
-                let scale = immediate as u32;
-                (
-                    RebaseOp::AddAddrImmScaled { scale },
-                    address.wrapping_add((scale as u64).wrapping_mul(pointer_size)),
-                )
-            }
-            REBASE_OPCODE_DO_REBASE_IMM_TIMES => {
-                let count = immediate as u32;
-                (
-                    RebaseOp::DoRebaseImmTimes { count },
-                    address.wrapping_add((count as u64).wrapping_mul(pointer_size)),
-                )
-            }
-            REBASE_OPCODE_DO_REBASE_ULEB_TIMES => {
-                let count = s.uleb();
-                (
-                    RebaseOp::DoRebaseUlebTimes { count },
-                    address.wrapping_add(count.value.wrapping_mul(pointer_size)),
-                )
-            }
-            REBASE_OPCODE_DO_REBASE_ADD_ADDR_ULEB => {
-                let off = s.uleb();
-                (
-                    RebaseOp::DoRebaseAddAddrUleb { offset: off },
-                    address.wrapping_add(pointer_size).wrapping_add(off.value),
-                )
-            }
-            REBASE_OPCODE_DO_REBASE_ULEB_TIMES_SKIPPING_ULEB => {
-                let count = s.uleb();
-                let skip = s.uleb();
-                let step = pointer_size.wrapping_add(skip.value);
-                (
-                    RebaseOp::DoRebaseUlebTimesSkippingUleb { count, skip },
-                    address.wrapping_add(count.value.wrapping_mul(step)),
-                )
-            }
-            _ => continue,
-        };
+                    }
+                }
+                REBASE_OPCODE_ADD_ADDR_ULEB => {
+                    let off = s.uleb()?;
+                    location = advance(location, off.value);
+                    RebaseOp::AddAddrUleb { offset: off }
+                }
+                REBASE_OPCODE_ADD_ADDR_IMM_SCALED => {
+                    location = advance(location, immediate as u64 * pointer_size);
+                    RebaseOp::AddAddrImmScaled { scale: immediate }
+                }
+                REBASE_OPCODE_DO_REBASE_IMM_TIMES => {
+                    location = advance(location, immediate as u64 * pointer_size);
+                    RebaseOp::DoRebaseImmTimes { count: immediate }
+                }
+                REBASE_OPCODE_DO_REBASE_ULEB_TIMES => {
+                    let count = s.uleb()?;
+                    location = advance(location, count.value.wrapping_mul(pointer_size));
+                    RebaseOp::DoRebaseUlebTimes { count }
+                }
+                REBASE_OPCODE_DO_REBASE_ADD_ADDR_ULEB => {
+                    let off = s.uleb()?;
+                    location = advance(location, pointer_size.wrapping_add(off.value));
+                    RebaseOp::DoRebaseAddAddrUleb { offset: off }
+                }
+                REBASE_OPCODE_DO_REBASE_ULEB_TIMES_SKIPPING_ULEB => {
+                    let count = s.uleb()?;
+                    let skip = s.uleb()?;
+                    let step = pointer_size.wrapping_add(skip.value);
+                    location = advance(location, count.value.wrapping_mul(step));
+                    RebaseOp::DoRebaseUlebTimesSkippingUleb { count, skip }
+                }
+                _ => RebaseOp::Unknown,
+            })
+        })()
+        .unwrap_or(RebaseOp::Truncated);
         out.push(RebaseOpcode {
             offset,
             byte,
-            opcode,
-            immediate,
-            rebase_type,
             address,
             op,
         });
-        address = address_after;
-        if opcode == REBASE_OPCODE_DONE || out.len() >= MAX_OPCODES {
+        if matches!(op, RebaseOp::Done | RebaseOp::Unknown | RebaseOp::Truncated) {
             break;
         }
     }
@@ -444,7 +461,8 @@ pub fn walk_rebase_opcodes(bytes: &[u8], base: u64, ctx: &WalkContext) -> Vec<Re
 
 /// Decode a bind opcode stream. `base` is the file offset of `bytes[0]`.
 /// `BIND_OPCODE_DONE` ends the walk except in a lazy-bind stream, where it
-/// separates entries. Unknown opcodes are skipped without being reported.
+/// separates entries. The walk also ends at the end of the stream or with
+/// a [`BindOp::Unknown`] / [`BindOp::Truncated`] entry.
 pub fn walk_bind_opcodes(
     bytes: &[u8],
     base: u64,
@@ -453,226 +471,108 @@ pub fn walk_bind_opcodes(
 ) -> Vec<BindOpcode> {
     let pointer_size = ctx.pointer_size();
     let mut out = Vec::new();
-    let mut address = ctx.base_address;
+    let mut location: Option<u64> = None;
     let mut s = Stream {
         bytes,
         base,
         pos: 0,
     };
-    loop {
+    while out.len() < MAX_OPCODES {
         let offset = s.offset();
         let Some(byte) = s.byte() else { break };
-        let opcode = byte & BIND_OPCODE_MASK;
         let immediate = byte & BIND_IMMEDIATE_MASK;
-        let mut bind_type = 0;
-        let mut done = false;
-        // `address_after` is applied once the opcode has been reported.
-        let (op, address_after) = match opcode {
-            BIND_OPCODE_DONE => {
-                done = kind != BindKind::LazyBind;
-                (BindOp::Done, address)
-            }
-            BIND_OPCODE_SET_DYLIB_ORDINAL_IMM => (
-                BindOp::SetDylibOrdinalImm {
-                    ordinal: immediate as u64,
+        let address = location;
+        // `None`: an operand could not be read.
+        let op = (|| {
+            Some(match byte & BIND_OPCODE_MASK {
+                BIND_OPCODE_DONE => BindOp::Done,
+                BIND_OPCODE_SET_DYLIB_ORDINAL_IMM => {
+                    BindOp::SetDylibOrdinalImm { ordinal: immediate }
+                }
+                BIND_OPCODE_SET_DYLIB_ORDINAL_ULEB => {
+                    BindOp::SetDylibOrdinalUleb { ordinal: s.uleb()? }
+                }
+                BIND_OPCODE_SET_DYLIB_SPECIAL_IMM => BindOp::SetDylibSpecialImm {
+                    // The immediate is the low nibble of a negative number.
+                    ordinal: if immediate == 0 {
+                        0
+                    } else {
+                        (immediate | BIND_OPCODE_MASK) as i8
+                    },
                 },
-                address,
-            ),
-            BIND_OPCODE_SET_DYLIB_ORDINAL_ULEB => {
-                (BindOp::SetDylibOrdinalUleb { ordinal: s.uleb() }, address)
-            }
-            BIND_OPCODE_SET_DYLIB_SPECIAL_IMM => {
-                // QUIRK(parity): the sign-extended special ordinal (-1, -2,
-                // ...) is stored in an unsigned 64-bit field.
-                let ordinal = if immediate == 0 {
-                    0
-                } else {
-                    (immediate | BIND_OPCODE_MASK) as i8 as i64 as u64
-                };
-                (BindOp::SetDylibSpecialImm { ordinal }, address)
-            }
-            BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM => {
-                let name_offset = s.offset();
-                let rest = s.rest();
-                // An unterminated name ends the walk without a report.
-                let Some(len) = rest.iter().position(|&c| c == 0) else {
-                    break;
-                };
-                let name = rest.get(..len).unwrap_or(&[]).to_vec();
-                s.advance(len.saturating_add(1));
-                let name_size = (len as u64).wrapping_add(1) as u32;
-                (
+                BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM => {
+                    let name_offset = s.offset();
+                    let rest = s.rest();
+                    let len = rest.iter().position(|&c| c == 0)?;
+                    let name = rest.get(..len)?.to_vec();
+                    s.pos += len + 1;
                     BindOp::SetSymbolTrailingFlagsImm {
-                        flags: immediate as u64,
+                        flags: immediate,
                         name,
                         name_offset,
-                        name_size,
-                    },
-                    address,
-                )
-            }
-            BIND_OPCODE_SET_TYPE_IMM => {
-                bind_type = immediate;
-                (BindOp::SetTypeImm, address)
-            }
-            BIND_OPCODE_SET_ADDEND_SLEB => (BindOp::SetAddendSleb { addend: s.sleb() }, address),
-            BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB => {
-                let segment_index = immediate as u32;
-                let off = s.uleb();
-                address = ctx.segment_address(address, segment_index, off.value);
-                (
+                        name_size: len as u64 + 1,
+                    }
+                }
+                BIND_OPCODE_SET_TYPE_IMM => BindOp::SetTypeImm {
+                    bind_type: immediate,
+                },
+                BIND_OPCODE_SET_ADDEND_SLEB => BindOp::SetAddendSleb { addend: s.sleb()? },
+                BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB => {
+                    let off = s.uleb()?;
+                    location = ctx.segment_address(immediate, off.value);
                     BindOp::SetSegmentAndOffsetUleb {
-                        segment_index,
+                        segment_index: immediate,
                         offset: off,
-                    },
-                    address,
-                )
-            }
-            BIND_OPCODE_ADD_ADDR_ULEB => {
-                let off = s.uleb();
-                address = address.wrapping_add(off.value);
-                (BindOp::AddAddrUleb { offset: off }, address)
-            }
-            BIND_OPCODE_DO_BIND => {
-                address = address.wrapping_add(pointer_size);
-                (BindOp::DoBind, address)
-            }
-            BIND_OPCODE_DO_BIND_ADD_ADDR_ULEB => {
-                let off = s.uleb();
-                (
-                    BindOp::DoBindAddAddrUleb { offset: off },
-                    address.wrapping_add(pointer_size).wrapping_add(off.value),
-                )
-            }
-            BIND_OPCODE_DO_BIND_ADD_ADDR_IMM_SCALED => {
-                let scale = immediate as u32;
-                (
-                    BindOp::DoBindAddAddrImmScaled { scale },
-                    address.wrapping_add((scale as u64).wrapping_mul(pointer_size)),
-                )
-            }
-            BIND_OPCODE_DO_BIND_ULEB_TIMES_SKIPPING_ULEB => {
-                let count = s.uleb();
-                let skip = s.uleb();
-                let step = pointer_size.wrapping_add(skip.value);
-                (
-                    BindOp::DoBindUlebTimesSkippingUleb { count, skip },
-                    address.wrapping_add(count.value.wrapping_mul(step)),
-                )
-            }
-            _ => continue,
+                    }
+                }
+                BIND_OPCODE_ADD_ADDR_ULEB => {
+                    let off = s.uleb()?;
+                    location = advance(location, off.value);
+                    BindOp::AddAddrUleb { offset: off }
+                }
+                BIND_OPCODE_DO_BIND => {
+                    location = advance(location, pointer_size);
+                    BindOp::DoBind
+                }
+                BIND_OPCODE_DO_BIND_ADD_ADDR_ULEB => {
+                    let off = s.uleb()?;
+                    location = advance(location, pointer_size.wrapping_add(off.value));
+                    BindOp::DoBindAddAddrUleb { offset: off }
+                }
+                BIND_OPCODE_DO_BIND_ADD_ADDR_IMM_SCALED => {
+                    location = advance(location, (immediate as u64 + 1) * pointer_size);
+                    BindOp::DoBindAddAddrImmScaled { scale: immediate }
+                }
+                BIND_OPCODE_DO_BIND_ULEB_TIMES_SKIPPING_ULEB => {
+                    let count = s.uleb()?;
+                    let skip = s.uleb()?;
+                    let step = pointer_size.wrapping_add(skip.value);
+                    location = advance(location, count.value.wrapping_mul(step));
+                    BindOp::DoBindUlebTimesSkippingUleb { count, skip }
+                }
+                BIND_OPCODE_THREADED => match immediate {
+                    BIND_SUBOPCODE_THREADED_SET_BIND_ORDINAL_TABLE_SIZE_ULEB => {
+                        BindOp::ThreadedSetBindOrdinalTableSizeUleb { count: s.uleb()? }
+                    }
+                    BIND_SUBOPCODE_THREADED_APPLY => BindOp::ThreadedApply,
+                    _ => BindOp::Unknown,
+                },
+                _ => BindOp::Unknown,
+            })
+        })()
+        .unwrap_or(BindOp::Truncated);
+        let stop = match &op {
+            BindOp::Done => kind != BindKind::LazyBind,
+            BindOp::Unknown | BindOp::Truncated => true,
+            _ => false,
         };
         out.push(BindOpcode {
             offset,
             byte,
-            opcode,
-            immediate,
-            bind_type,
             address,
             op,
         });
-        address = address_after;
-        if done || out.len() >= MAX_OPCODES {
-            break;
-        }
-    }
-    out
-}
-
-/// Walk a classic export trie breadth-first. `base` is the file offset of
-/// `blob[0]`.
-///
-/// QUIRK(parity): this is not a faithful trie decoder. The terminal size is
-/// read as a single byte rather than a ULEB128, and the child count is read
-/// right after the first two terminal values instead of at
-/// `terminal start + terminal size`, so nodes with a longer payload
-/// (re-exports, stub-and-resolver) are misread.
-pub fn walk_classic_export_trie(blob: &[u8], base: u64) -> Vec<ExportNode> {
-    let mut out = Vec::new();
-    let mut queue: VecDeque<u64> = VecDeque::new();
-    let mut visited: HashSet<u64> = HashSet::new();
-    let mut children_total = 0usize;
-    let size = blob.len() as u64;
-    let at = |pos: usize| base.wrapping_add(pos as u64);
-    queue.push_back(0);
-    let mut guard = 0usize;
-    'nodes: while guard < MAX_TRIE_NODES {
-        let Some(node_off) = queue.pop_front() else {
-            break;
-        };
-        guard += 1;
-        if node_off >= size || !visited.insert(node_off) {
-            continue;
-        }
-        let Ok(mut cur) = usize::try_from(node_off) else {
-            continue;
-        };
-        let Some(&terminal_size) = blob.get(cur) else {
-            continue;
-        };
-        let terminal_size_offset = at(cur);
-        cur += 1;
-
-        let (mut flags, mut symbol_offset) = (None, None);
-        if terminal_size > 0 {
-            for slot in [&mut flags, &mut symbol_offset] {
-                let Some((value, used)) = read_uleb128(blob.get(cur..).unwrap_or(&[])) else {
-                    continue 'nodes;
-                };
-                *slot = Some(Leb {
-                    value,
-                    offset: at(cur),
-                    size: used,
-                });
-                cur = cur.saturating_add(used as usize);
-            }
-        }
-
-        let Some(&child_count) = blob.get(cur) else {
-            continue;
-        };
-        let child_count_offset = at(cur);
-        cur += 1;
-
-        let mut children = Vec::new();
-        for _ in 0..child_count {
-            let rest = blob.get(cur..).unwrap_or(&[]);
-            let Some(len) = rest.iter().position(|&c| c == 0) else {
-                break;
-            };
-            let label = rest.get(..len).unwrap_or(&[]).to_vec();
-            let label_offset = at(cur);
-            cur = cur.saturating_add(len).saturating_add(1);
-            let Some((skip, used)) = read_uleb128(blob.get(cur..).unwrap_or(&[])) else {
-                break;
-            };
-            let skip = Leb {
-                value: skip,
-                offset: at(cur),
-                size: used,
-            };
-            cur = cur.saturating_add(used as usize);
-            children.push(ExportChild {
-                label,
-                label_offset,
-                label_size: (len as u64).wrapping_add(1) as u32,
-                skip,
-            });
-            if skip.value < size {
-                queue.push_back(skip.value);
-            }
-        }
-        children_total = children_total.saturating_add(children.len());
-        out.push(ExportNode {
-            terminal_size,
-            terminal_size_offset,
-            flags,
-            symbol_offset,
-            child_count,
-            child_count_offset,
-            children,
-        });
-        if children_total > MAX_TRIE_EDGES {
+        if stop {
             break;
         }
     }
@@ -723,7 +623,6 @@ impl MachHeader {
     pub fn dyld_walk_context(&self) -> WalkContext {
         WalkContext {
             is64: self.is64,
-            base_address: self.base_address(),
             segment_vmaddrs: self
                 .segments
                 .iter()
@@ -741,32 +640,9 @@ impl MachHeader {
 
     /// The decoded opcodes of one of the three bind streams of `info`.
     pub fn bind_opcodes(&self, info: &DyldInfo, kind: BindKind) -> Vec<BindOpcode> {
-        let (off, size) = match kind {
-            BindKind::Bind => (info.bind_off, info.bind_size),
-            BindKind::WeakBind => (info.weak_bind_off, info.weak_bind_size),
-            BindKind::LazyBind => (info.lazy_bind_off, info.lazy_bind_size),
-        };
+        let (off, size) = info.bind_range(kind);
         let (bytes, base) = self.opcode_stream(off, size);
         walk_bind_opcodes(bytes, base, kind, &self.dyld_walk_context())
-    }
-
-    /// The classic export trie of `info`. Empty when the trie does not lie
-    /// entirely inside the file.
-    pub fn export_trie_nodes(&self, info: &DyldInfo) -> Vec<ExportNode> {
-        if info.export_size == 0 {
-            return Vec::new();
-        }
-        // QUIRK(parity): the range check uses the header-relative offset, so
-        // it is too lax inside a fat file. Out-of-file reads were undefined
-        // there; here such a trie is simply not walked.
-        if info.export_off as u64 + info.export_size as u64 > self.image.len() {
-            return Vec::new();
-        }
-        let begin = self.dyld_info_file_offset(info.export_off);
-        match self.image.slice(begin, info.export_size as u64) {
-            Some(blob) => walk_classic_export_trie(blob, begin),
-            None => Vec::new(),
-        }
     }
 }
 
@@ -777,8 +653,15 @@ mod tests {
     fn ctx64() -> WalkContext {
         WalkContext {
             is64: true,
-            base_address: 0x1_0000_0000,
             segment_vmaddrs: vec![0, 0x1_0000_0000, 0x1_0000_4000],
+        }
+    }
+
+    fn leb<T>(value: T, offset: u64, size: u32) -> Leb<T> {
+        Leb {
+            value,
+            offset,
+            size,
         }
     }
 
@@ -793,95 +676,58 @@ mod tests {
         let ops = walk_rebase_opcodes(&bytes, 0x3000, &ctx64());
         assert_eq!(ops.len(), 6);
         assert_eq!(
-            (ops[0].offset, ops[0].byte, ops[0].rebase_type),
-            (0x3000, 0x11, 1)
+            (ops[0].offset, ops[0].byte, ops[0].address),
+            (0x3000, 0x11, None)
         );
+        assert_eq!(ops[0].op, RebaseOp::SetTypeImm { rebase_type: 1 });
         assert_eq!(
             ops[1].op,
             RebaseOp::SetSegmentAndOffsetUleb {
                 segment_index: 2,
-                offset: Leb {
-                    value: 0x10,
-                    offset: 0x3002,
-                    size: 1
-                }
+                offset: leb(0x10, 0x3002, 1)
             }
         );
-        // 64-bit: segment offset is dropped.
-        assert_eq!(ops[1].address, 0x1_0000_4000);
+        // The segment offset counts in 64-bit images too.
+        assert_eq!(ops[2].address, Some(0x1_0000_4010));
         assert_eq!(ops[2].op, RebaseOp::DoRebaseImmTimes { count: 3 });
-        assert_eq!(ops[3].address, 0x1_0000_4018);
+        assert_eq!(ops[3].address, Some(0x1_0000_4028));
         assert_eq!(
             ops[3].op,
             RebaseOp::AddAddrUleb {
-                offset: Leb {
-                    value: 0x80,
-                    offset: 0x3005,
-                    size: 2
-                }
+                offset: leb(0x80, 0x3005, 2)
             }
         );
-        assert_eq!(ops[4].address, 0x1_0000_4098);
+        // The operands have their own offsets.
+        assert_eq!(ops[4].address, Some(0x1_0000_40a8));
         assert_eq!(
             ops[4].op,
             RebaseOp::DoRebaseUlebTimesSkippingUleb {
-                count: Leb {
-                    value: 2,
-                    offset: 0x3008,
-                    size: 1
-                },
-                skip: Leb {
-                    value: 8,
-                    offset: 0x3009,
-                    size: 1
-                },
+                count: leb(2, 0x3008, 1),
+                skip: leb(8, 0x3009, 1),
             }
         );
         assert_eq!(ops[5].op, RebaseOp::Done);
-        assert_eq!(ops[5].address, 0x1_0000_40b8);
-        assert_eq!(ops[5].rebase_type, 0);
+        assert_eq!(ops[5].address, Some(0x1_0000_40c8));
     }
 
     #[test]
     fn rebase_truncated_operand_and_unknown_opcode() {
-        // ADD_ADDR_ULEB with an unterminated operand: reported with size 0,
-        // then the operand byte is decoded as an opcode (0x80 = ULEB_TIMES_
-        // SKIPPING with two empty operands). 0xF0 is unknown and skipped.
-        let ops = walk_rebase_opcodes(&[0xF0, 0x30, 0x80], 10, &ctx64());
+        // ADD_ADDR_ULEB with an unterminated operand ends the walk.
+        let ops = walk_rebase_opcodes(&[0x11, 0x30, 0x80], 10, &ctx64());
         assert_eq!(ops.len(), 2);
-        assert_eq!(
-            ops[0].op,
-            RebaseOp::AddAddrUleb {
-                offset: Leb {
-                    value: 0,
-                    offset: 12,
-                    size: 0
-                }
-            }
-        );
-        assert_eq!(
-            ops[1].op,
-            RebaseOp::DoRebaseUlebTimesSkippingUleb {
-                count: Leb {
-                    value: 0,
-                    offset: 13,
-                    size: 0
-                },
-                skip: Leb {
-                    value: 0,
-                    offset: 13,
-                    size: 0
-                },
-            }
-        );
+        assert_eq!((ops[1].offset, ops[1].op), (11, RebaseOp::Truncated));
+        // So does an undefined opcode; nothing after it is decoded.
+        let ops = walk_rebase_opcodes(&[0xF3, 0x11, 0x00], 0, &ctx64());
+        assert_eq!(ops.len(), 1);
+        assert_eq!((ops[0].byte, ops[0].op), (0xF3, RebaseOp::Unknown));
+        assert_eq!(rebase_opcode_name(0xF3), "REBASE_OPCODE_UNKNOWN");
         assert!(walk_rebase_opcodes(&[], 0, &ctx64()).is_empty());
     }
 
     #[test]
-    fn rebase_32bit_keeps_segment_offset_and_huge_counts_wrap() {
+    fn rebase_32bit_and_huge_counts_wrap() {
         let ctx = WalkContext {
             is64: false,
-            base_address: 0x1000,
             segment_vmaddrs: vec![0x1000, 0x2000],
         };
         // SET_SEGMENT(1) + 0x20, DO_REBASE_ULEB_TIMES u64::MAX, DONE.
@@ -889,15 +735,22 @@ mod tests {
         bytes.extend([0xff; 9]);
         bytes.extend([0x01, 0x00]);
         let ops = walk_rebase_opcodes(&bytes, 0, &ctx);
-        assert_eq!(ops[0].address, 0x2020);
+        assert_eq!(ops[1].address, Some(0x2020));
+        assert_eq!(
+            ops[1].op,
+            RebaseOp::DoRebaseUlebTimes {
+                count: leb(u64::MAX, 3, 10)
+            }
+        );
         assert_eq!(ops[2].op, RebaseOp::Done);
         assert_eq!(
             ops[2].address,
-            0x2020u64.wrapping_add(u64::MAX.wrapping_mul(4))
+            Some(0x2020u64.wrapping_add(u64::MAX.wrapping_mul(4)))
         );
-        // Segment index out of range leaves the address alone.
-        let ops = walk_rebase_opcodes(&[0x2f, 0x08, 0x00], 0, &ctx);
-        assert_eq!(ops[0].address, 0x1000);
+        // A segment index the image does not have: no location.
+        let ops = walk_rebase_opcodes(&[0x2f, 0x08, 0x51, 0x00], 0, &ctx);
+        assert_eq!(ops[1].address, None);
+        assert_eq!(ops[2].address, None);
     }
 
     #[test]
@@ -906,14 +759,14 @@ mod tests {
         bytes.extend(b"_puts\0");
         bytes.extend([
             0x51, 0x72, 0x08, 0x60, 0x7e, 0x90, 0x3f, 0x20, 0x85, 0x01, 0xB2, 0xC0, 0x03, 0x10,
-            0xD0, 0x00, 0x90,
+            0xD0, 0x04, 0xD1, 0x00, 0x90,
         ]);
         let ops = walk_bind_opcodes(&bytes, 0x100, BindKind::Bind, &ctx64());
-        let kinds: Vec<u8> = ops.iter().map(|o| o.opcode).collect();
-        // 0xD0 (unknown) is not reported; the walk ends at DONE.
+        let bytes_seen: Vec<u8> = ops.iter().map(|o| o.byte).collect();
+        // The walk ends at DONE.
         assert_eq!(
-            kinds,
-            [0x10, 0x40, 0x50, 0x70, 0x60, 0x90, 0x30, 0x20, 0xB0, 0xC0, 0x00]
+            bytes_seen,
+            [0x12, 0x41, 0x51, 0x72, 0x60, 0x90, 0x3f, 0x20, 0xB2, 0xC0, 0xD0, 0xD1, 0x00]
         );
         assert_eq!(ops[0].op, BindOp::SetDylibOrdinalImm { ordinal: 2 });
         assert_eq!(
@@ -925,46 +778,62 @@ mod tests {
                 name_size: 6
             }
         );
-        assert_eq!((ops[2].bind_type, ops[3].bind_type), (1, 0));
+        assert_eq!(ops[2].op, BindOp::SetTypeImm { bind_type: 1 });
         assert_eq!(
             ops[4].op,
             BindOp::SetAddendSleb {
-                addend: Leb {
-                    value: -2,
-                    offset: 0x10c,
-                    size: 1
-                }
+                addend: leb(-2, 0x10c, 1)
             }
         );
-        // DO_BIND reports the address after the bind.
-        assert_eq!(ops[5].address, 0x1_0000_4008);
-        assert_eq!(ops[6].op, BindOp::SetDylibSpecialImm { ordinal: u64::MAX });
+        // DO_BIND reports the location it binds.
+        assert_eq!(ops[5].op, BindOp::DoBind);
+        assert_eq!(ops[5].address, Some(0x1_0000_4008));
+        assert_eq!(ops[6].op, BindOp::SetDylibSpecialImm { ordinal: -1 });
+        assert_eq!(ops[6].address, Some(0x1_0000_4010));
         assert_eq!(
             ops[7].op,
             BindOp::SetDylibOrdinalUleb {
-                ordinal: Leb {
-                    value: 0x85,
-                    offset: 0x110,
-                    size: 2
-                }
+                ordinal: leb(0x85, 0x110, 2)
             }
         );
+        // DO_BIND_ADD_ADDR_IMM_SCALED(2): the bind plus two more pointers.
         assert_eq!(ops[8].op, BindOp::DoBindAddAddrImmScaled { scale: 2 });
-        assert_eq!(ops[9].address, 0x1_0000_4018);
-        assert_eq!(ops[10].address, 0x1_0000_4018 + 3 * (8 + 0x10));
+        assert_eq!(ops[9].address, Some(0x1_0000_4028));
+        assert_eq!(
+            ops[9].op,
+            BindOp::DoBindUlebTimesSkippingUleb {
+                count: leb(3, 0x114, 1),
+                skip: leb(0x10, 0x115, 1),
+            }
+        );
+        assert_eq!(ops[10].address, Some(0x1_0000_4028 + 3 * (8 + 0x10)));
+        assert_eq!(
+            ops[10].op,
+            BindOp::ThreadedSetBindOrdinalTableSizeUleb {
+                count: leb(4, 0x117, 1)
+            }
+        );
+        assert_eq!(ops[11].op, BindOp::ThreadedApply);
+        assert_eq!(ops[12].op, BindOp::Done);
     }
 
     #[test]
     fn bind_special_ordinals() {
-        let ops = walk_bind_opcodes(&[0x30, 0x3e, 0x3d], 0, BindKind::Bind, &ctx64());
-        let ordinals: Vec<u64> = ops
+        let ops = walk_bind_opcodes(&[0x30, 0x3f, 0x3e, 0x3d], 0, BindKind::Bind, &ctx64());
+        let ordinals: Vec<i8> = ops
             .iter()
             .map(|o| match o.op {
                 BindOp::SetDylibSpecialImm { ordinal } => ordinal,
                 _ => panic!("unexpected op"),
             })
             .collect();
-        assert_eq!(ordinals, [0, (-2i64) as u64, (-3i64) as u64]);
+        assert_eq!(ordinals, [0, -1, -2, -3]);
+        assert_eq!(special_dylib_name(0), Some("BIND_SPECIAL_DYLIB_SELF"));
+        assert_eq!(
+            special_dylib_name(-2),
+            Some("BIND_SPECIAL_DYLIB_FLAT_LOOKUP")
+        );
+        assert_eq!(special_dylib_name(-9), None);
     }
 
     #[test]
@@ -981,134 +850,31 @@ mod tests {
     }
 
     #[test]
-    fn bind_unterminated_name_ends_walk() {
+    fn bind_malformed_streams_end_the_walk() {
+        // Unterminated symbol name.
         let ops = walk_bind_opcodes(&[0x11, 0x40, b'a', b'b'], 0, BindKind::Bind, &ctx64());
-        assert_eq!(ops.len(), 1);
+        assert_eq!(ops.len(), 2);
+        assert_eq!((ops[1].offset, &ops[1].op), (1, &BindOp::Truncated));
         // Name opcode as the very last byte.
-        assert_eq!(
-            walk_bind_opcodes(&[0x40], 0, BindKind::LazyBind, &ctx64()).len(),
-            0
-        );
-    }
-
-    /// root -> "_a" (terminal, flags 0, offset 0x10) and "_b" (no terminal).
-    fn small_trie() -> Vec<u8> {
-        let mut t = vec![0x00, 0x02];
-        t.extend(b"_a\0");
-        t.push(10);
-        t.extend(b"_b\0");
-        t.push(14);
-        assert_eq!(t.len(), 10);
-        t.extend([0x02, 0x00, 0x10, 0x00]); // node @10
-        t.extend([0x00, 0x00]); // node @14
-        t
-    }
-
-    #[test]
-    fn export_trie_walk() {
-        let nodes = walk_classic_export_trie(&small_trie(), 0x4000);
-        assert_eq!(nodes.len(), 3);
-        assert_eq!(
-            (
-                nodes[0].terminal_size,
-                nodes[0].child_count,
-                nodes[0].child_count_offset
-            ),
-            (0, 2, 0x4001)
-        );
-        assert_eq!(nodes[0].children[0].label, b"_a");
-        assert_eq!(
-            (
-                nodes[0].children[0].label_offset,
-                nodes[0].children[0].label_size
-            ),
-            (0x4002, 3)
-        );
-        assert_eq!(
-            nodes[0].children[1].skip,
-            Leb {
-                value: 14,
-                offset: 0x4009,
-                size: 1
-            }
-        );
-        assert_eq!(nodes[1].terminal_size_offset, 0x400a);
-        assert_eq!(
-            nodes[1].flags,
-            Some(Leb {
-                value: 0,
-                offset: 0x400b,
-                size: 1
-            })
-        );
-        assert_eq!(
-            nodes[1].symbol_offset,
-            Some(Leb {
-                value: 0x10,
-                offset: 0x400c,
-                size: 1
-            })
-        );
-        assert_eq!(
-            nodes[1].flag_names(),
-            [("00", "EXPORT_SYMBOL_FLAGS_KIND_REGULAR")]
-        );
-        assert_eq!(
-            (nodes[2].terminal_size, nodes[2].flags, nodes[2].child_count),
-            (0, None, 0)
-        );
-    }
-
-    #[test]
-    fn export_trie_cycles_terminate() {
-        // Root with one child pointing back at the root, and one at itself.
-        let mut t = vec![0x00, 0x02, b'a', 0x00, 0x00, b'b', 0x00, 0x08];
-        t.extend([0x00, 0x01, b'c', 0x00, 0x08]);
-        let nodes = walk_classic_export_trie(&t, 0);
-        assert_eq!(nodes.len(), 2);
-        assert_eq!(nodes[1].children.len(), 1);
-    }
-
-    #[test]
-    fn export_trie_truncated() {
-        assert!(walk_classic_export_trie(&[], 0).is_empty());
-        // Terminal payload cut short: the node is dropped.
-        assert!(walk_classic_export_trie(&[0x02, 0x80], 0).is_empty());
-        assert!(walk_classic_export_trie(&[0x02, 0x00, 0x10], 0).is_empty());
-        // Child label without terminator / without skip: children stop.
-        let nodes = walk_classic_export_trie(&[0x00, 0x03, b'a', 0x00, 0x09, b'b'], 0);
-        assert_eq!(nodes.len(), 1);
-        assert_eq!((nodes[0].child_count, nodes[0].children.len()), (3, 1));
-        let nodes = walk_classic_export_trie(&[0x00, 0x01, b'a', 0x00], 0);
-        assert_eq!(nodes[0].children.len(), 0);
-    }
-
-    #[test]
-    fn export_trie_overlapping_nodes_are_capped() {
-        // Every byte is a node with 0x41 children labelled "A..."; the walk
-        // must stay bounded.
-        let mut t = vec![0x00];
-        for i in 0..4000u32 {
-            t.extend([0x00, 0x41, 0x00, (i % 100) as u8]);
+        let ops = walk_bind_opcodes(&[0x40], 0, BindKind::LazyBind, &ctx64());
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].op, BindOp::Truncated);
+        // Undefined opcode and undefined threaded sub-opcode.
+        for byte in [0xE0u8, 0xD2] {
+            let ops = walk_bind_opcodes(&[byte, 0x90], 0, BindKind::LazyBind, &ctx64());
+            assert_eq!(ops.len(), 1);
+            assert_eq!(ops[0].op, BindOp::Unknown);
         }
-        let nodes = walk_classic_export_trie(&t, 0);
-        assert!(nodes.len() <= MAX_TRIE_NODES);
-        let edges: usize = nodes.iter().map(|n| n.children.len()).sum();
-        assert!(edges <= MAX_TRIE_EDGES + 255);
+        assert_eq!(bind_opcode_name(0xE0), "BIND_OPCODE_UNKNOWN");
+        assert_eq!(bind_opcode_name(0xD1), "BIND_SUBOPCODE_THREADED_APPLY");
+        assert_eq!(
+            bind_opcode_name(0xC0),
+            "BIND_OPCODE_DO_BIND_ULEB_TIMES_SKIPPING_ULEB"
+        );
     }
 
     #[test]
-    fn flag_names() {
-        assert_eq!(
-            export_flag_names(0x1d),
-            [
-                ("01", "EXPORT_SYMBOL_FLAGS_KIND_THREAD_LOCAL"),
-                ("04", "EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION"),
-                ("08", "EXPORT_SYMBOL_FLAGS_REEXPORT"),
-                ("10", "EXPORT_SYMBOL_FLAGS_STUB_AND_RESOLVER"),
-            ]
-        );
-        assert!(export_flag_names(0x02).is_empty());
+    fn type_names() {
         assert_eq!(rebase_type_name(2), "REBASE_TYPE_TEXT_ABSOLUTE32");
         assert_eq!(bind_type_name(0), "Unknown");
     }

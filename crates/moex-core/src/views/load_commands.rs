@@ -24,8 +24,7 @@ impl NodeSource for LoadCommandsNode {
         t.set_headers(&["Information"]);
         t.set_widths(&[300]);
         t.add([format!("Number of commands : {}", mh.loadcmds.len())]);
-        // The address label of this range has always been 0.
-        Content::table(t).with_binary_at(mh.offset + mh.header_size(), mh.sizeofcmds as u64, 0)
+        Content::table(t).with_binary(mh.offset + mh.header_size(), mh.sizeofcmds as u64)
     }
 
     fn children(&self) -> Vec<ViewNode> {
@@ -70,6 +69,24 @@ fn tool_name(tool: u32) -> &'static str {
         3 => "ld",
         _ => "unknown",
     }
+}
+
+/// Last path component (the whole string when it has no `/`).
+fn file_name(path: &str) -> &str {
+    path.rfind('/').map_or(path, |pos| &path[pos + 1..])
+}
+
+/// `A.B.C.D.E` of an `LC_SOURCE_VERSION` value, packed as
+/// `a24.b10.c10.d10.e10`.
+pub fn source_version(v: u64) -> String {
+    format!(
+        "{}.{}.{}.{}.{}",
+        v >> 40,
+        (v >> 30) & 0x3ff,
+        (v >> 20) & 0x3ff,
+        (v >> 10) & 0x3ff,
+        v & 0x3ff
+    )
 }
 
 const DYLIB_CMDS: &[u32] = &[
@@ -167,12 +184,10 @@ impl LoadCommandNode {
                 .find(|s| s.lc.offset == self.lc.offset)
                 .map(|s| s.name.clone())
                 .unwrap_or_default(),
-            _ if DYLIB_CMDS.contains(&cmd) => {
-                // File name component; empty when the path has no '/'.
-                self.str_at(8)
-                    .and_then(|(_, path)| path.rfind('/').map(|pos| path[pos + 1..].to_string()))
-                    .unwrap_or_default()
-            }
+            _ if DYLIB_CMDS.contains(&cmd) => self
+                .str_at(8)
+                .map(|(_, path)| file_name(&path).to_string())
+                .unwrap_or_default(),
             LC_RPATH => self.str_at(8).map(|(_, s)| s).unwrap_or_default(),
             LC_ENCRYPTION_INFO | LC_ENCRYPTION_INFO_64 => format!("cryptid={}", self.u32(16)),
             LC_LINKER_OPTION => self.linker_options().into_iter().next().unwrap_or_default(),
@@ -246,10 +261,7 @@ impl LoadCommandNode {
                 );
                 t.separator();
                 let (at, path) = self.str_at(8).unwrap_or((0, String::new()));
-                let name = path
-                    .rfind('/')
-                    .map(|pos| path[pos + 1..].to_string())
-                    .unwrap_or_default();
+                let name = file_name(&path).to_string();
                 t.field(at, path.len() as u64, "Path", path);
                 t.add(["", "Name", name.as_str()]);
             }
@@ -314,16 +326,20 @@ impl LoadCommandNode {
                 let (at, name) = self.str_at(8).unwrap_or((0, String::new()));
                 t.field(at, name.len() as u64, "Name", name);
             }
-            // QUIRK(parity): the C++ view never emitted the UUID row (its call
-            // resolved to an empty overload). Kept identical until the C++
-            // oracle is retired; see docs/rust-port-quirks.md.
-            LC_UUID => {}
+            LC_UUID => {
+                let uuid = self
+                    .mh
+                    .image
+                    .slice(o + 8, 16)
+                    .filter(|_| self.lc.cmdsize >= 24)
+                    .and_then(|b| <[u8; 16]>::try_from(b).ok())?;
+                t.field(o + 8, 16, "UUID", format_uuid(&uuid).to_uppercase());
+            }
             _ if VERSION_MIN_CMDS.contains(&cmd) => {
                 t.field(o + 8, 4, "Version", format_version(self.u32(8)));
                 t.field(o + 12, 4, "SDK", format_version(self.u32(12)));
             }
-            // The 64-bit A.B.C.D.E version is shown through its low 32 bits.
-            LC_SOURCE_VERSION => t.field(o + 8, 8, "Version", format_version(self.u64(8) as u32)),
+            LC_SOURCE_VERSION => t.field(o + 8, 8, "Version", source_version(self.u64(8))),
             LC_MAIN => {
                 t.field(o + 8, 8, "Entry Offset", as_short_hex_string(self.u64(8)));
                 t.field(o + 16, 8, "Stack Size", as_short_hex_string(self.u64(16)));

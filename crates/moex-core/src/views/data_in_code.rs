@@ -23,7 +23,5 @@ fn content(mh: &MachHeader) -> Content {
         t.field(o + 6, 2, "Kind", dice.kind_name());
         t.separator();
     }
-    // QUIRK(parity): the address label is relative to the Mach-O header
-    // (i.e. `dataoff`), not to the start of the file.
-    Content::table(t).with_binary_at(data.file_offset, data.datasize as u64, data.dataoff as u64)
+    Content::table(t).with_binary(data.file_offset, data.datasize as u64)
 }

@@ -242,9 +242,14 @@ as `<image file name>.macho`. Exit codes: `0` success, `1` no image matched
 or an extraction failed (in `--all` mode the remaining images are still
 processed), `2` usage error.
 
-Images of a split cache live in sub-cache files that the extractor does not
-follow, so extraction from the main file of a modern system cache can fail
-with exit code `1`.
+Images of a split cache live in sub-cache files (`<cache>.01`,
+`<cache>.25.dylddata`, ...). Pass the main cache file: the sub-cache files
+named in its header are read from the same directory, and each segment is
+copied from the file that holds it. A sub-cache file that is missing or
+belongs to another cache (different UUID) is skipped; images that need it
+fail with exit code `1`. Use `--compact` for split caches: without it each
+segment keeps the file offset it has in its own sub-cache file, and segments
+from different files can overlap in the output.
 
 ## Automation examples
 

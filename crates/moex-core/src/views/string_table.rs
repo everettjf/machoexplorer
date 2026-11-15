@@ -36,8 +36,7 @@ fn content(mh: &MachHeader) -> Content {
 
     let offset = symtab.string_table_offset();
     let size = symtab.string_table_size_in_file();
-    // The scanned length is truncated to 32 bits like the original.
-    let data = mh.image.slice(offset, size as u32 as u64).unwrap_or(&[]);
+    let data = mh.image.slice(offset, size).unwrap_or(&[]);
     for (index, (at, s)) in string_literals(data).into_iter().enumerate() {
         t.add([
             as_string(index),
@@ -47,9 +46,7 @@ fn content(mh: &MachHeader) -> Content {
         ]);
     }
 
-    // QUIRK(parity): the address label is relative to the Mach-O header
-    // (i.e. `stroff`), not to the start of the file.
-    Content::table(t).with_binary_at(offset, size, symtab.stroff as u64)
+    Content::table(t).with_binary(offset, size)
 }
 
 #[cfg(test)]

@@ -4,10 +4,10 @@ use super::header::{LoadCommand, MachHeader};
 use crate::consts::LC_DYSYMTAB;
 
 pub const RELOCATION_INFO_SIZE: u64 = 8;
-const DYLIB_TABLE_OF_CONTENTS_SIZE: u32 = 8;
-const DYLIB_MODULE_SIZE: u32 = 52;
-const DYLIB_MODULE_64_SIZE: u32 = 56;
-const DYLIB_REFERENCE_SIZE: u32 = 4;
+const DYLIB_TABLE_OF_CONTENTS_SIZE: u64 = 8;
+const DYLIB_MODULE_SIZE: u64 = 52;
+const DYLIB_MODULE_64_SIZE: u64 = 56;
+const DYLIB_REFERENCE_SIZE: u64 = 4;
 
 /// One entry of the indirect symbol table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,48 +95,38 @@ impl MachHeader {
 }
 
 impl<'a> Dysymtab<'a> {
-    /// `(offset relative to the Mach-O header, size)` of the first table
-    /// that is present, in the order toc, modtab, extrefsym, indirectsym,
-    /// extrel, locrel.
-    // QUIRK(parity): only the first table present is reported, and its size
-    // wraps at 32 bits.
-    pub fn data_range(&self) -> Option<(u32, u32)> {
-        if self.tocoff > 0 {
-            return Some((
-                self.tocoff,
-                self.ntoc.wrapping_mul(DYLIB_TABLE_OF_CONTENTS_SIZE),
-            ));
-        }
-        if self.modtaboff > 0 {
-            let unit = if self.mh.is64 {
-                DYLIB_MODULE_64_SIZE
-            } else {
-                DYLIB_MODULE_SIZE
-            };
-            return Some((self.modtaboff, self.nmodtab.wrapping_mul(unit)));
-        }
-        if self.extrefsymoff > 0 {
-            return Some((
-                self.extrefsymoff,
-                self.nextrefsyms.wrapping_mul(DYLIB_REFERENCE_SIZE),
-            ));
-        }
-        if self.indirectsymoff > 0 {
-            return Some((self.indirectsymoff, self.nindirectsyms.wrapping_mul(4)));
-        }
-        if self.extreloff > 0 {
-            return Some((
-                self.extreloff,
-                self.nextrel.wrapping_mul(RELOCATION_INFO_SIZE as u32),
-            ));
-        }
-        if self.locreloff > 0 {
-            return Some((
-                self.locreloff,
-                self.nlocrel.wrapping_mul(RELOCATION_INFO_SIZE as u32),
-            ));
-        }
-        None
+    /// `(offset relative to the Mach-O header, byte size)` of each table
+    /// that is present (non-zero offset and count), in the order toc,
+    /// modtab, extrefsym, indirectsym, extrel, locrel.
+    pub fn tables(&self) -> Vec<(u64, u64)> {
+        let module = if self.mh.is64 {
+            DYLIB_MODULE_64_SIZE
+        } else {
+            DYLIB_MODULE_SIZE
+        };
+        [
+            (self.tocoff, self.ntoc, DYLIB_TABLE_OF_CONTENTS_SIZE),
+            (self.modtaboff, self.nmodtab, module),
+            (self.extrefsymoff, self.nextrefsyms, DYLIB_REFERENCE_SIZE),
+            (self.indirectsymoff, self.nindirectsyms, 4),
+            (self.extreloff, self.nextrel, RELOCATION_INFO_SIZE),
+            (self.locreloff, self.nlocrel, RELOCATION_INFO_SIZE),
+        ]
+        .into_iter()
+        .filter(|&(off, count, _)| off > 0 && count > 0)
+        .map(|(off, count, unit)| (off as u64, count as u64 * unit))
+        .collect()
+    }
+
+    /// `(offset relative to the Mach-O header, size)` of the smallest range
+    /// that covers every table present. The tables need not be adjacent
+    /// (the symbol table often sits between the relocations and the
+    /// indirect symbols), so the range can include unrelated bytes.
+    pub fn data_range(&self) -> Option<(u64, u64)> {
+        let tables = self.tables();
+        let start = tables.iter().map(|&(off, _)| off).min()?;
+        let end = tables.iter().map(|&(off, size)| off + size).max()?;
+        Some((start, end - start))
     }
 
     pub fn has_indirect_symbols(&self) -> bool {
@@ -162,8 +152,7 @@ impl<'a> Dysymtab<'a> {
             self.indirect_symbols_offset(),
             self.nindirectsyms as u64 * 4,
         );
-        // The byte size is truncated to 32 bits before it is divided.
-        (size as u32) / 4
+        (size / 4) as u32
     }
 
     /// Entry `index` of the indirect symbol table.

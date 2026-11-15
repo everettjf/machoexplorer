@@ -19,6 +19,10 @@ pub struct MachHeader {
     pub image: Arc<Image>,
     /// File offset of the header (non-zero inside fat files and archives).
     pub offset: u64,
+    /// Bytes available to this Mach-O from `offset`: the fat slice or
+    /// archive member size, or the rest of the file. Offsets stored in the
+    /// load commands are relative to `offset` and bounded by this.
+    pub size: u64,
     pub is64: bool,
     pub magic: u32,
     pub cputype: u32,
@@ -29,17 +33,29 @@ pub struct MachHeader {
     pub flags: u32,
     /// Only meaningful when `is64`.
     pub reserved: u32,
+    /// The file is in the opposite (big-endian) byte order. Only the header
+    /// is decoded for such files: `loadcmds` and `segments` stay empty.
+    pub big_endian: bool,
     pub loadcmds: Vec<LoadCommand>,
     /// `LC_SEGMENT` / `LC_SEGMENT_64` commands in load-command order.
     pub segments: Vec<Segment>,
 }
 
 impl MachHeader {
+    /// Parse the Mach-O that starts at `offset` and runs to the end of the
+    /// file.
     pub fn parse(image: &Arc<Image>, offset: u64) -> Result<Self> {
+        Self::parse_slice(image, offset, image.len().saturating_sub(offset))
+    }
+
+    /// Parse the Mach-O occupying `[offset, offset + slice_size)` (a fat
+    /// slice or an archive member); the range is clipped to the file.
+    pub fn parse_slice(image: &Arc<Image>, offset: u64, slice_size: u64) -> Result<Self> {
         const OOB: &str = "Malformed file: struct read out of bounds";
         let Some(raw_magic) = image.u32(offset) else {
             return err(OOB);
         };
+        let slice_size = slice_size.min(image.len() - offset);
         let is64 = super::is_64_magic(raw_magic);
         let size = if is64 {
             MACH_HEADER_64_SIZE
@@ -49,8 +65,9 @@ impl MachHeader {
         if !image.in_file(offset, size) {
             return err(OOB);
         }
-        // Byte-swapped headers have their fields swapped; the load commands
-        // that follow are read as-is.
+        // Every reader in this crate is little-endian. A byte-swapped
+        // (big-endian: PowerPC, m68k, ...) file gets its header decoded and
+        // is otherwise reported as unsupported instead of being misread.
         let swap = raw_magic == MH_CIGAM || raw_magic == MH_CIGAM_64;
         let rd = |o: u64| {
             let v = image.u32(offset + o).unwrap_or(0);
@@ -63,6 +80,7 @@ impl MachHeader {
         let mut mh = MachHeader {
             image: image.clone(),
             offset,
+            size: slice_size,
             is64,
             magic: rd(0),
             cputype: rd(4),
@@ -72,17 +90,20 @@ impl MachHeader {
             sizeofcmds: rd(20),
             flags: rd(24),
             reserved: if is64 { rd(28) } else { 0 },
+            big_endian: swap,
             loadcmds: Vec::new(),
             segments: Vec::new(),
         };
 
-        let file_size = image.len();
         let sizeofcmds = mh.sizeofcmds as u64;
-        if offset + size > file_size {
+        if size > slice_size {
             return err("Malformed Mach-O: header exceeds file size");
         }
-        if offset + size + sizeofcmds > file_size {
+        if size + sizeofcmds > slice_size {
             return err("Malformed Mach-O: load commands exceed file size");
+        }
+        if swap {
+            return Ok(mh);
         }
         let align: u32 = if is64 { 8 } else { 4 };
         let mut cur = offset + size;
@@ -127,7 +148,7 @@ impl MachHeader {
     }
 
     pub fn arch(&self) -> &'static str {
-        names::arch(self.cputype)
+        names::arch(self.cputype, self.cpusubtype)
     }
 
     pub fn has_load_command(&self, cmds: &[u32]) -> bool {
@@ -179,6 +200,11 @@ impl MachHeader {
         self.segments.iter().flat_map(|s| s.sections.iter())
     }
 
+    /// End of this Mach-O in the file (`offset + size`).
+    pub fn end_offset(&self) -> u64 {
+        self.offset + self.size
+    }
+
     /// File offset backing virtual address `vmaddr`: the first segment of
     /// this header's word size whose VM range contains it. `None` when no
     /// segment does, or the address lies past the segment's file contents or
@@ -193,7 +219,78 @@ impl MachHeader {
         if delta >= seg.filesize {
             return None;
         }
-        let fileoff = seg.fileoff.wrapping_add(delta);
+        let fileoff = self.offset.checked_add(seg.fileoff)?.checked_add(delta)?;
         (fileoff < self.image.len()).then_some(fileoff)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn image(words: &[u32], big_endian: bool) -> Arc<Image> {
+        let mut f = Vec::new();
+        for w in words {
+            f.extend_from_slice(&if big_endian {
+                w.to_be_bytes()
+            } else {
+                w.to_le_bytes()
+            });
+        }
+        Arc::new(Image::from_vec(f).unwrap())
+    }
+
+    #[test]
+    fn big_endian_header_is_decoded_but_not_its_commands() {
+        // 32-bit PowerPC executable with one LC_UUID command.
+        let words = [MH_MAGIC, 18, 0, 2, 1, 24, 0x85, LC_UUID, 24, 1, 2, 3, 4];
+        let mh = MachHeader::parse(&image(&words, true), 0).unwrap();
+        assert!(mh.big_endian);
+        assert_eq!(
+            (
+                mh.magic,
+                mh.cputype,
+                mh.filetype,
+                mh.ncmds,
+                mh.sizeofcmds,
+                mh.flags
+            ),
+            (MH_MAGIC, 18, 2, 1, 24, 0x85)
+        );
+        assert!(mh.loadcmds.is_empty() && mh.segments.is_empty());
+        assert_eq!(mh.arch(), "ppc");
+        // The same bytes in little-endian order are fully parsed.
+        let mh = MachHeader::parse(&image(&words, false), 0).unwrap();
+        assert!(!mh.big_endian);
+        assert_eq!(mh.loadcmds.len(), 1);
+    }
+
+    #[test]
+    fn slice_bounds_limit_the_load_commands() {
+        let words = [
+            MH_MAGIC_64,
+            0x0100_000c,
+            0,
+            2,
+            1,
+            16,
+            0,
+            0,
+            LC_UUID,
+            16,
+            0,
+            0,
+        ];
+        let image = image(&words, false);
+        let mh = MachHeader::parse(&image, 0).unwrap();
+        assert_eq!((mh.size, mh.end_offset()), (48, 48));
+        // A slice that ends inside the load commands.
+        assert!(MachHeader::parse_slice(&image, 0, 40).is_err());
+        assert!(MachHeader::parse_slice(&image, 0, 16).is_err());
+        // The slice size is clipped to the file.
+        assert_eq!(
+            MachHeader::parse_slice(&image, 0, 1 << 40).unwrap().size,
+            48
+        );
     }
 }

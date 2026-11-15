@@ -1,8 +1,7 @@
-//! `ar` archive (`.a`) parser.
-//!
-//! This mirrors the original parser closely, including the way it derives
-//! member names (see the `QUIRK(parity)` notes): the resulting member list is
-//! part of the golden output.
+//! `ar` archive (`.a`) parser: the common format with both the BSD
+//! (`#1/NN` inline long names, `__.SYMDEF` symbol table; what Apple's tools
+//! write) and the GNU/System V conventions (`/` symbol table, `//` long-name
+//! string table, `/NN` references into it, names terminated by `/`).
 
 use super::header::MachHeader;
 use crate::error::{err, Result};
@@ -19,21 +18,44 @@ const AR_SIZE_OFFSET: usize = 48;
 const AR_SIZE_LEN: usize = 10;
 const AR_FMAG_OFFSET: usize = 58;
 
+/// What a member is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemberKind {
+    /// The archive symbol table: GNU `/` or `/SYM64/`, BSD `__.SYMDEF*`.
+    SymbolTable,
+    /// The GNU long-name string table `//`.
+    StringTable,
+    /// An ordinary member (Mach-O when `ArchiveMember::mh` is set).
+    File,
+}
+
 pub struct ArchiveMember {
-    /// Raw member name bytes (may contain NULs or non-UTF-8 bytes).
+    /// Member name with long names resolved (raw bytes: may be non-UTF-8).
+    /// The special GNU members keep their on-disk names `/`, `/SYM64/`, `//`.
     pub name: Vec<u8>,
+    pub kind: MemberKind,
     /// File offset of the 60-byte member header.
     pub header_offset: u64,
-    /// File offset of the member payload.
+    /// File offset of the member contents (after a BSD inline long name).
     pub data_offset: u64,
     pub data_size: u64,
-    /// Present when the payload starts with a thin Mach-O magic.
+    /// Present when the contents start with a thin Mach-O magic.
     pub mh: Option<Arc<MachHeader>>,
 }
 
 impl ArchiveMember {
     pub fn is_macho(&self) -> bool {
         self.mh.is_some()
+    }
+
+    /// Text for the "Type" column.
+    pub fn type_name(&self) -> &'static str {
+        match self.kind {
+            MemberKind::SymbolTable => "symbol table",
+            MemberKind::StringTable => "string table",
+            MemberKind::File if self.is_macho() => "Mach-O",
+            MemberKind::File => "data",
+        }
     }
 }
 
@@ -46,12 +68,18 @@ pub fn is_archive_magic(data: &[u8]) -> bool {
     data.len() >= 8 && &data[..8] == ARCHIVE_MAGIC
 }
 
-/// Drops trailing spaces, tabs, newlines and slashes.
+/// Drops trailing padding of a header field (spaces, tabs, newlines).
 fn trim_right(s: &[u8]) -> &[u8] {
     let mut end = s.len();
-    while end > 0 && matches!(s[end - 1], b' ' | b'\t' | b'\n' | b'/') {
+    while end > 0 && matches!(s[end - 1], b' ' | b'\t' | b'\n') {
         end -= 1;
     }
+    &s[..end]
+}
+
+/// A BSD inline long name is padded with NULs to a multiple of 4 or 8.
+fn trim_nuls(s: &[u8]) -> &[u8] {
+    let end = s.iter().rposition(|&c| c != 0).map_or(0, |p| p + 1);
     &s[..end]
 }
 
@@ -100,24 +128,55 @@ fn parse_size(field: &[u8]) -> Option<u64> {
     Some(strtoull(s))
 }
 
-fn parse_name(field: &[u8], strtab: &[u8]) -> Vec<u8> {
+/// The 16-byte name field of a member header, classified.
+#[derive(Debug, PartialEq, Eq)]
+enum NameField<'a> {
+    /// `/` or `/SYM64/`: GNU symbol table.
+    GnuSymbolTable(&'a [u8]),
+    /// `//`: GNU long-name string table.
+    GnuStringTable,
+    /// `/NN`: name at offset NN of the GNU string table.
+    GnuLong(u64),
+    /// `#1/NN`: the name is the first NN bytes of the member data.
+    BsdLong(u64),
+    /// A name stored in the field itself (GNU `/` terminator removed).
+    Short(&'a [u8]),
+}
+
+fn all_digits(s: &[u8]) -> bool {
+    !s.is_empty() && s.iter().all(u8::is_ascii_digit)
+}
+
+fn classify_name(field: &[u8]) -> NameField<'_> {
     let raw = trim_right(field);
-    if raw.starts_with(b"/#1/") {
-        return raw.to_vec();
+    match raw {
+        b"/" | b"/SYM64/" => return NameField::GnuSymbolTable(raw),
+        b"//" => return NameField::GnuStringTable,
+        _ => {}
     }
-    // GNU long name: "/<decimal offset into the // string table>".
-    if raw.len() > 1 && raw[0] == b'/' && raw[1].is_ascii_digit() && !strtab.is_empty() {
-        let off = strtoull(&raw[1..]);
-        if off < strtab.len() as u64 {
-            let rest = &strtab[off as usize..];
-            let end = rest
-                .iter()
-                .position(|&c| c == b'\n' || c == 0)
-                .unwrap_or(rest.len());
-            return trim_right(&rest[..end]).to_vec();
-        }
+    if let Some(digits) = raw.strip_prefix(b"#1/").filter(|d| all_digits(d)) {
+        return NameField::BsdLong(strtoull(digits));
     }
-    raw.to_vec()
+    if let Some(digits) = raw.strip_prefix(b"/").filter(|d| all_digits(d)) {
+        return NameField::GnuLong(strtoull(digits));
+    }
+    // GNU ar terminates a short name with '/', which lets it contain spaces.
+    NameField::Short(raw.strip_suffix(b"/").unwrap_or(raw))
+}
+
+/// Name at `off` in the GNU string table: entries end with `/\n` (or a bare
+/// newline / NUL in older variants). `None` when `off` is outside the table.
+fn gnu_long_name(strtab: &[u8], off: u64) -> Option<&[u8]> {
+    let rest = strtab.get(usize::try_from(off).ok()?..)?;
+    if rest.is_empty() {
+        return None;
+    }
+    let end = rest
+        .iter()
+        .position(|&c| c == b'\n' || c == 0)
+        .unwrap_or(rest.len());
+    let name = &rest[..end];
+    Some(name.strip_suffix(b"/").unwrap_or(name))
 }
 
 impl Archive {
@@ -151,53 +210,65 @@ impl Archive {
                 return err("Malformed archive file: member payload out of range");
             }
 
-            // QUIRK(parity): the name is trimmed of trailing '/' before any
-            // comparison, so the "//" (GNU string table) and "/" (symbol
-            // table) checks below never match, and BSD long names are tested
-            // as "/#1/NN" rather than "#1/NN". In practice: the GNU string
-            // table is never loaded ("/NN" names stay unresolved), the symbol
-            // table shows up as a member with an empty name, and BSD
-            // long-name members keep the name "#1/NN" with the inline name
-            // left in the payload (so they are never detected as Mach-O).
-            let mut name = parse_name(&hdr[..AR_NAME_SIZE], strtab);
+            let field = &hdr[..AR_NAME_SIZE];
             let mut payload_size = member_size;
-
-            if name == b"//" {
-                strtab = image.slice(data_offset, member_size).unwrap_or(&[]);
-            } else {
-                if name.starts_with(b"/#1/") {
-                    let ext_name_size = strtoull(&name[3..]);
-                    if ext_name_size <= payload_size {
-                        let ext = image.slice(data_offset, ext_name_size).unwrap_or(&[]);
-                        name = trim_right(ext).to_vec();
-                        data_offset += ext_name_size;
-                        payload_size -= ext_name_size;
-                    }
+            let (name, kind) = match classify_name(field) {
+                NameField::GnuSymbolTable(raw) => (raw.to_vec(), MemberKind::SymbolTable),
+                NameField::GnuStringTable => {
+                    strtab = image.slice(data_offset, member_size).unwrap_or(&[]);
+                    (b"//".to_vec(), MemberKind::StringTable)
                 }
-                if name != b"/" {
-                    let mut mh = None;
-                    if payload_size >= 4 {
-                        let magic = image.u32(data_offset).unwrap_or(0);
-                        if super::is_valid_magic(magic) && !super::is_fat_magic(magic) {
-                            mh = Some(Arc::new(MachHeader::parse(image, data_offset)?));
-                        }
+                // An unresolvable reference keeps the raw `/NN` text.
+                NameField::GnuLong(off) => (
+                    gnu_long_name(strtab, off)
+                        .unwrap_or_else(|| trim_right(field))
+                        .to_vec(),
+                    MemberKind::File,
+                ),
+                NameField::BsdLong(len) => {
+                    if len > payload_size {
+                        return err("Malformed archive file: long member name out of range");
                     }
-                    members.push(ArchiveMember {
-                        name,
-                        header_offset: cur,
+                    let ext = image.slice(data_offset, len).unwrap_or(&[]);
+                    data_offset += len;
+                    payload_size -= len;
+                    (trim_nuls(ext).to_vec(), MemberKind::File)
+                }
+                NameField::Short(name) => (name.to_vec(), MemberKind::File),
+            };
+            // BSD symbol tables are ordinary members with a reserved name.
+            let kind = if kind == MemberKind::File && name.starts_with(b"__.SYMDEF") {
+                MemberKind::SymbolTable
+            } else {
+                kind
+            };
+
+            let mut mh = None;
+            if kind == MemberKind::File && payload_size >= 4 {
+                let magic = image.u32(data_offset).unwrap_or(0);
+                if super::is_valid_magic(magic) && !super::is_fat_magic(magic) {
+                    mh = Some(Arc::new(MachHeader::parse_slice(
+                        image,
                         data_offset,
-                        data_size: payload_size,
-                        mh,
-                    });
+                        payload_size,
+                    )?));
                 }
             }
+            members.push(ArchiveMember {
+                name,
+                kind,
+                header_offset: cur,
+                data_offset,
+                data_size: payload_size,
+                mh,
+            });
 
             cur = data_offset + payload_size;
             if cur & 1 != 0 {
                 cur += 1;
             }
         }
-        if members.is_empty() {
+        if members.iter().all(|m| m.kind != MemberKind::File) {
             return err("Malformed archive file: no valid members");
         }
         Ok(Archive {
@@ -267,17 +338,31 @@ mod tests {
     }
 
     #[test]
-    fn names() {
-        assert_eq!(parse_name(b"foo.o/          ", b""), b"foo.o");
-        assert_eq!(parse_name(b"/               ", b""), b"");
-        assert_eq!(parse_name(b"//              ", b""), b"");
-        assert_eq!(parse_name(b"#1/20           ", b""), b"#1/20");
-        assert_eq!(parse_name(b"/4              ", b""), b"/4");
+    fn name_fields() {
+        use NameField::*;
+        assert_eq!(classify_name(b"foo.o/          "), Short(b"foo.o"));
+        assert_eq!(classify_name(b"foo.o           "), Short(b"foo.o"));
+        assert_eq!(classify_name(b"two words.o/    "), Short(b"two words.o"));
+        assert_eq!(classify_name(b"/               "), GnuSymbolTable(b"/"));
         assert_eq!(
-            parse_name(b"/4              ", b"abc\nlong_name.o/\n"),
-            b"long_name.o"
+            classify_name(b"/SYM64/         "),
+            GnuSymbolTable(b"/SYM64/")
         );
-        assert_eq!(parse_name(b"/99             ", b"abc\n"), b"/99");
+        assert_eq!(classify_name(b"//              "), GnuStringTable);
+        assert_eq!(classify_name(b"#1/20           "), BsdLong(20));
+        assert_eq!(classify_name(b"/4              "), GnuLong(4));
+        // Not references: kept as plain names.
+        assert_eq!(classify_name(b"#1/x            "), Short(b"#1/x"));
+        assert_eq!(classify_name(b"/4x             "), Short(b"/4x"));
+        assert_eq!(classify_name(b"                "), Short(b""));
+
+        let strtab = b"abc.o/\nlong_name.o/\nlast";
+        assert_eq!(gnu_long_name(strtab, 0), Some(&b"abc.o"[..]));
+        assert_eq!(gnu_long_name(strtab, 7), Some(&b"long_name.o"[..]));
+        assert_eq!(gnu_long_name(strtab, 20), Some(&b"last"[..]));
+        assert_eq!(gnu_long_name(strtab, 24), None);
+        assert_eq!(gnu_long_name(strtab, u64::MAX), None);
+        assert_eq!(gnu_long_name(b"", 0), None);
     }
 
     #[test]
@@ -303,20 +388,73 @@ mod tests {
     }
 
     #[test]
-    fn bsd_long_name_stays_data() {
+    fn bsd_long_name_member_is_macho() {
         let mut payload = b"long_member_name.o\0\0".to_vec();
         payload.extend_from_slice(&macho64());
-        let a = archive(&[&header("#1/20", "52"), &payload]).unwrap();
-        assert_eq!(a.members[0].name, b"#1/20");
-        assert_eq!(a.members[0].data_size, 52);
-        assert!(!a.members[0].is_macho());
+        let a = archive(&[
+            &header("#1/20", "24"),
+            b"__.SYMDEF SORTED\0\0\0\0\0\0\0\0",
+            &header("#1/20", "52"),
+            &payload,
+        ])
+        .unwrap();
+        assert_eq!(a.members.len(), 2);
+        assert_eq!(a.members[0].name, b"__.SYMDEF SORTED");
+        assert_eq!(a.members[0].kind, MemberKind::SymbolTable);
+        assert_eq!(a.members[0].type_name(), "symbol table");
+        let m = &a.members[1];
+        assert_eq!(m.name, b"long_member_name.o");
+        assert_eq!((m.data_offset, m.data_size), (8 + 60 + 24 + 60 + 20, 32));
+        assert!(m.is_macho());
+        assert_eq!(m.type_name(), "Mach-O");
+        let mh = &a.headers()[0];
+        assert_eq!((mh.offset, mh.size), (m.data_offset, 32));
     }
 
     #[test]
-    fn slash_hash_name_consumes_nothing() {
-        let a = archive(&[&header("/#1/4", "4"), b"abcd"]).unwrap();
-        assert_eq!(a.members[0].name, b"");
-        assert_eq!(a.members[0].data_size, 4);
+    fn gnu_tables_and_long_names() {
+        let obj = macho64();
+        let a = archive(&[
+            &header("/", "4"),
+            &[0, 0, 0, 0],
+            &header("//", "22"),
+            b"a_rather_long_name.o/\n",
+            &header("/0", "32"),
+            &obj,
+            &header("/99", "2"),
+            b"hi",
+            &header("short.o/", "2"),
+            b"yo",
+        ])
+        .unwrap();
+        let got: Vec<_> = a
+            .members
+            .iter()
+            .map(|m| (String::from_utf8_lossy(&m.name).into_owned(), m.type_name()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("/".to_string(), "symbol table"),
+                ("//".to_string(), "string table"),
+                ("a_rather_long_name.o".to_string(), "Mach-O"),
+                // Reference outside the string table: raw text kept.
+                ("/99".to_string(), "data"),
+                ("short.o".to_string(), "data"),
+            ]
+        );
+    }
+
+    #[test]
+    fn only_tables_is_error() {
+        assert_eq!(
+            error(&[&header("/", "0"), &header("//", "0")]),
+            "Malformed archive file: no valid members"
+        );
+        assert_eq!(
+            error(&[&header("#1/8", "4"), b"abcd"]),
+            "Malformed archive file: long member name out of range"
+        );
     }
 
     #[test]

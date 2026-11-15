@@ -6,8 +6,10 @@ use super::segment::Segment;
 
 /// Looks `vmaddr` up in `segments`. `None`: no segment contains it.
 /// `Some(None)`: the first containing segment has no file bytes there.
+/// A segment's `fileoff` is relative to the Mach-O header at `mh_offset`.
 fn lookup<'a>(
     segments: impl Iterator<Item = &'a Segment>,
+    mh_offset: u64,
     file_len: u64,
     vmaddr: u64,
 ) -> Option<Option<u64>> {
@@ -19,8 +21,10 @@ fn lookup<'a>(
         if delta >= seg.filesize {
             return Some(None);
         }
-        let fileoff = seg.fileoff.wrapping_add(delta);
-        return Some((fileoff < file_len).then_some(fileoff));
+        let fileoff = mh_offset
+            .checked_add(seg.fileoff)
+            .and_then(|o| o.checked_add(delta));
+        return Some(fileoff.filter(|&o| o < file_len));
     }
     None
 }
@@ -29,13 +33,13 @@ impl MachHeader {
     /// File offset backing `vmaddr`, searching only `LC_SEGMENT_64`
     /// (`seg64`) or only `LC_SEGMENT` commands. The first segment whose VM
     /// range contains the address decides; `None` when it has no file bytes
-    /// there or the offset is past the end of the file.
-    // QUIRK(parity): the segment's `fileoff` is used as an offset from the
-    // start of the *file*, not of the Mach-O header, so inside a fat file
-    // the result is off by the slice offset.
+    /// there or the offset is past the end of the file. The result is an
+    /// offset into the whole file (the fat slice / archive member offset is
+    /// included).
     pub fn vm_to_file_offset_in(&self, seg64: bool, vmaddr: u64) -> Option<u64> {
         lookup(
             self.segments.iter().filter(|s| s.is64 == seg64),
+            self.offset,
             self.image.len(),
             vmaddr,
         )
@@ -47,9 +51,10 @@ impl MachHeader {
     /// 64-bit segment contains the address.
     pub fn vm_to_file_offset_any(&self, vmaddr: u64) -> Option<u64> {
         let len = self.image.len();
-        match lookup(self.segments.iter().filter(|s| s.is64), len, vmaddr) {
+        let off = self.offset;
+        match lookup(self.segments.iter().filter(|s| s.is64), off, len, vmaddr) {
             Some(found) => found,
-            None => lookup(self.segments.iter().filter(|s| !s.is64), len, vmaddr).flatten(),
+            None => lookup(self.segments.iter().filter(|s| !s.is64), off, len, vmaddr).flatten(),
         }
     }
 }
@@ -133,7 +138,12 @@ mod tests {
     /// 64-bit Mach-O with one `LC_SEGMENT_64` (vm 0x1000..0x3000, file
     /// 0xc0..0x100) and one `LC_SEGMENT` (vm 0x1000..0x2000, file 0..0x100) in a 0x200-byte file.
     fn sample() -> MachHeader {
-        let mut f = Vec::new();
+        sample_at(0)
+    }
+
+    /// The same Mach-O placed `at` bytes into the file, like a fat slice.
+    fn sample_at(at: usize) -> MachHeader {
+        let mut f = vec![0u8; at];
         let put32 = |f: &mut Vec<u8>, v: u32| f.extend_from_slice(&v.to_le_bytes());
         let put64 = |f: &mut Vec<u8>, v: u64| f.extend_from_slice(&v.to_le_bytes());
         for v in [0xfeedfacfu32, 0x0100_000c, 0, 2, 2, 72 + 56, 0, 0] {
@@ -154,10 +164,21 @@ mod tests {
         for v in [0x1000u32, 0x1000, 0, 0x100, 7, 5, 0, 0] {
             put32(&mut f, v);
         }
-        f.resize(0x200, 0xAA);
-        f[0xc8..0xcc].copy_from_slice(b"hi\0\x01");
+        f.resize(at + 0x200, 0xAA);
+        f[at + 0xc8..at + 0xcc].copy_from_slice(b"hi\0\x01");
         let image = Arc::new(Image::from_vec(f).unwrap());
-        MachHeader::parse(&image, 0).unwrap()
+        MachHeader::parse(&image, at as u64).unwrap()
+    }
+
+    #[test]
+    fn translation_includes_slice_offset() {
+        let mh = sample_at(0x4000);
+        assert_eq!(mh.vm_to_file_offset_in(true, 0x1008), Some(0x40c8));
+        assert_eq!(mh.vm_to_file_offset_in(false, 0x1008), Some(0x4008));
+        assert_eq!(mh.vm_to_file_offset_any(0x1008), Some(0x40c8));
+        assert_eq!(mh.vm_to_file_offset(0x1008), Some(0x40c8));
+        let r = VmReader::new(&mh, SegmentSet::Only64(true));
+        assert_eq!(r.bytes(0x1008, 3), Some(&b"hi\0"[..]));
     }
 
     #[test]

@@ -87,7 +87,7 @@ impl FatHeader {
             if obj_off % 8 != 0 {
                 return err("Malformed Fat Mach-O: arch offset is misaligned");
             }
-            let mh = Arc::new(MachHeader::parse(image, obj_off)?);
+            let mh = Arc::new(MachHeader::parse_slice(image, obj_off, obj_size)?);
             archs.push(FatArch {
                 entry_offset: e,
                 is_fat64: fat64,

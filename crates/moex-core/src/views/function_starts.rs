@@ -19,8 +19,6 @@ fn content(mh: &MachHeader) -> Content {
     let mut address = mh.base_address();
     for f in mh.function_starts() {
         // Every value is a delta from the previous one.
-        // QUIRK(parity): the list is not cut at its zero terminator, so the
-        // padding bytes after it show up as rows repeating the last address.
         address = address.wrapping_add(f.data);
         t.add_data(
             f.offset,

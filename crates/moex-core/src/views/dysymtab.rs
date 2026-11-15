@@ -20,9 +20,7 @@ pub fn node(mh: Arc<MachHeader>) -> Option<ViewNode> {
 
 fn content(mh: &MachHeader) -> Content {
     match mh.dysymtab().and_then(|d| d.data_range()) {
-        Some((off, size)) => {
-            Content::default().with_binary(mh.offset.saturating_add(off as u64), size as u64)
-        }
+        Some((off, size)) => Content::default().with_binary(mh.offset.saturating_add(off), size),
         None => Content::default(),
     }
 }
@@ -51,14 +49,21 @@ fn indirect_symbols(mh: &MachHeader) -> Content {
     t.set_headers(&["Offset", "Data", "Description", "Value"]);
     t.set_widths(&[100, 100, 100, 400]);
     for s in dysym.indirect_symbols() {
-        t.add([
-            as_address(s.offset),
-            as_hex_string(s.symbol_index as u64),
-            "Indirect Index".to_string(),
-            as_short_hex_string(s.symbol_index as u64),
-        ]);
+        t.add_data(
+            s.offset,
+            4,
+            [
+                as_address(s.offset),
+                as_hex_string(s.symbol_index as u64),
+                "Indirect Index".to_string(),
+                as_short_hex_string(s.symbol_index as u64),
+            ],
+        );
     }
-    Content::table(t)
+    Content::table(t).with_binary(
+        dysym.indirect_symbols_offset(),
+        dysym.nindirectsyms as u64 * 4,
+    )
 }
 
 fn reloc_type_name(cputype: u32, r_type: u32) -> String {

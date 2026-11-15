@@ -103,8 +103,9 @@ impl MachHeader {
         )
     }
 
-    /// The ULEB128 sequence of `LC_FUNCTION_STARTS`, read until the blob
-    /// ends or a value is malformed. Padding zeros are returned as entries.
+    /// The ULEB128 address deltas of `LC_FUNCTION_STARTS`, read until the
+    /// zero terminator, the end of the blob or a malformed value. The
+    /// terminator and the alignment padding after it are not returned.
     pub fn function_starts(&self) -> Vec<Uleb128Data> {
         let Some(data) = self.linkedit_data(LC_FUNCTION_STARTS) else {
             return Vec::new();
@@ -115,6 +116,10 @@ impl MachHeader {
         let mut out = Vec::new();
         let mut pos = 0usize;
         while let Some(rest) = bytes.get(pos..).filter(|r| !r.is_empty()) {
+            // dyld stops at the first zero byte.
+            if rest[0] == 0 {
+                break;
+            }
             let Some((value, used)) = read_uleb128(rest) else {
                 break;
             };
@@ -183,13 +188,21 @@ mod tests {
 
     #[test]
     fn function_starts_stop_at_bad_value() {
-        let mh = with_linkedit(LC_FUNCTION_STARTS, 100, &[0x90, 0x1f, 0x34, 0x00, 0x80]);
+        let mh = with_linkedit(LC_FUNCTION_STARTS, 100, &[0x90, 0x1f, 0x34, 0x80]);
+        let f = mh.function_starts();
+        assert_eq!(f.len(), 2);
+        // Cut at the zero terminator; the padding after it is not listed.
+        let mh = with_linkedit(
+            LC_FUNCTION_STARTS,
+            100,
+            &[0x90, 0x1f, 0x34, 0x00, 0x00, 0x00, 0x05],
+        );
         let f = mh.function_starts();
         let got: Vec<_> = f
             .iter()
             .map(|u| (u.offset, u.occupy_size, u.data))
             .collect();
-        assert_eq!(got, [(48, 2, 0xf90), (50, 1, 0x34), (51, 1, 0)]);
+        assert_eq!(got, [(48, 2, 0xf90), (50, 1, 0x34)]);
         assert!(mh.linkedit_data(LC_DATA_IN_CODE).is_none());
         assert!(mh.data_in_code().is_empty());
     }

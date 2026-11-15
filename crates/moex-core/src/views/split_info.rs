@@ -6,9 +6,7 @@ use crate::view::{leaf, Content, Table, ViewNode};
 use std::sync::Arc;
 
 pub fn node(mh: Arc<MachHeader>) -> Option<ViewNode> {
-    // QUIRK(parity): this node is titled "Two Level Hints Table", the same
-    // as the real two-level hints node.
-    Some(leaf("Two Level Hints Table", move || {
+    Some(leaf("Segment Split Info", move || {
         // The table is created but never filled.
         let content = Content::table(Table::new());
         match mh.linkedit_data(LC_SEGMENT_SPLIT_INFO) {

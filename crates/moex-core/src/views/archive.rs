@@ -29,7 +29,7 @@ impl NodeSource for ArchiveNode {
                 [
                     as_short_hex_string(m.data_offset),
                     utf8_safe(&m.name),
-                    (if m.is_macho() { "Mach-O" } else { "data" }).to_string(),
+                    m.type_name().to_string(),
                     as_string(m.data_size),
                 ],
             );

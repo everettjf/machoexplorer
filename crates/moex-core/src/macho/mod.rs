@@ -25,7 +25,7 @@ use crate::image::Image;
 use std::path::Path;
 use std::sync::Arc;
 
-pub use archive::{Archive, ArchiveMember};
+pub use archive::{Archive, ArchiveMember, MemberKind};
 pub use dyld_cache::DyldSharedCache;
 pub use dysymtab::{Dysymtab, IndirectSymbol, Relocation};
 pub use fat::{FatArch, FatHeader};

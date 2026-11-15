@@ -23,11 +23,7 @@ impl NodeSource for MachHeaderNode {
         t.field(o + 4, 4, "CPU Type", names::cpu_type(d.cputype));
         t.field(o + 8, 4, "CPU SubType", "");
         for (value, name) in names::cpu_subtype_array(d.cputype, d.cpusubtype) {
-            t.add([
-                "".to_string(),
-                as_hex_string(value as u64),
-                name.to_string(),
-            ]);
+            t.add(["".to_string(), as_hex_string(value as u64), name]);
         }
         t.field(o + 12, 4, "File Type", names::file_type(d.filetype));
         t.field(o + 16, 4, "Number of Load Commands", as_string(d.ncmds));
@@ -50,6 +46,16 @@ impl NodeSource for MachHeaderNode {
         use super::*;
         use crate::consts::*;
         let mh = &self.0;
+        if mh.big_endian {
+            return vec![crate::view::leaf("Unsupported Byte Order", || {
+                let mut t = Table::new();
+                t.set_headers(&["Information"]);
+                t.set_widths(&[600]);
+                t.add(["This Mach-O is big-endian (byte-swapped)."]);
+                t.add(["Only its header is decoded; load commands and their data are not."]);
+                Content::table(t)
+            })];
+        }
         // Order is part of the output format.
         let mut nodes = vec![Some(load_commands::load_commands_node(mh.clone()))];
         nodes.push(integrity::node(mh.clone()));

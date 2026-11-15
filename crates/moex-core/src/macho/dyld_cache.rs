@@ -1,10 +1,16 @@
-//! Minimal dyld shared cache parser: the legacy header fields, the mapping
-//! table and the image list.
+//! Minimal dyld shared cache parser: the header fields needed to find the
+//! mapping table, the image list and the sub-cache files.
 //!
-//! Only the file handed to [`DyldSharedCache::parse`] is read (sub-cache
-//! files `.01`, `.02`, ... are not followed). Modern caches keep their image
-//! list out of the legacy header fields; for those the list is recovered
-//! from the sibling `<cache>.map` text file when present.
+//! Field offsets follow `dyld_cache_header` in dyld's `dyld_cache_format.h`.
+//! The header grew over the years; `mappingOffset` doubles as its size, so a
+//! field is only read when it lies below `mappingOffset`.
+//!
+//! Split caches (macOS 12 / iOS 15 and later) keep most of their contents in
+//! sub-cache files (`<cache>.01`, `<cache>.02`, `<cache>.25.dylddata`, ...)
+//! named by the header's `subCacheArray`. When the cache was opened from a
+//! path they are mapped too, so that an address can be resolved to the file
+//! that holds it. If a cache lists no images in its header, the list is
+//! recovered from the sibling `<cache>.map` text file when present.
 
 use crate::error::{err, Result};
 use crate::image::Image;
@@ -19,7 +25,14 @@ pub const MAPPING_INFO_SIZE: u64 = 32;
 /// `sizeof(dyld_cache_image_info)`.
 pub const IMAGE_INFO_SIZE: u64 = 32;
 
+/// `sizeof(dyld_subcache_entry_v1)`: uuid, cacheVMOffset.
+pub const SUBCACHE_ENTRY_V1_SIZE: u64 = 24;
+/// `sizeof(dyld_subcache_entry)`: uuid, cacheVMOffset, fileSuffix[32].
+pub const SUBCACHE_ENTRY_SIZE: u64 = 56;
+
 const MAX_MAPPING_COUNT: u32 = 1_000_000;
+/// Sub-cache files followed at most (real caches have under a hundred).
+const MAX_SUBCACHE_COUNT: u32 = 1024;
 const MAX_IMAGE_COUNT: u32 = 10_000_000;
 /// Longest image path accepted by [`DyldSharedCache::read_path_by_offset`].
 const MAX_PATH_SCAN: u64 = 4096;
@@ -27,21 +40,40 @@ const MAX_PATH_SCAN: u64 = 4096;
 // Field offsets inside the header.
 pub const OFF_MAPPING_OFFSET: u64 = 16;
 pub const OFF_MAPPING_COUNT: u64 = 20;
-pub const OFF_IMAGES_OFFSET: u64 = 24;
-pub const OFF_IMAGES_COUNT: u64 = 28;
+/// `imagesOffsetOld` / `imagesCountOld`: the image list of caches whose
+/// header ends before `imagesOffset`.
+pub const OFF_IMAGES_OFFSET_OLD: u64 = 24;
+pub const OFF_IMAGES_COUNT_OLD: u64 = 28;
 pub const OFF_DYLD_BASE_ADDRESS: u64 = 32;
 pub const OFF_CODE_SIGNATURE_OFFSET: u64 = 40;
 pub const OFF_CODE_SIGNATURE_SIZE: u64 = 48;
 pub const OFF_LOCAL_SYMBOLS_OFFSET: u64 = 72;
 pub const OFF_LOCAL_SYMBOLS_SIZE: u64 = 80;
+pub const OFF_UUID: u64 = 88;
+pub const OFF_CACHE_TYPE: u64 = 104;
+pub const OFF_SUBCACHE_ARRAY_OFFSET: u64 = 0x188;
+pub const OFF_SUBCACHE_ARRAY_COUNT: u64 = 0x18c;
+pub const OFF_IMAGES_OFFSET: u64 = 0x1c0;
+pub const OFF_IMAGES_COUNT: u64 = 0x1c4;
+/// `cacheSubType`: headers that end at or before it use v1 sub-cache
+/// entries.
+pub const OFF_CACHE_SUB_TYPE: u64 = 0x1c8;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CacheHeader {
     pub magic: [u8; 16],
     pub mapping_offset: u32,
     pub mapping_count: u32,
+    /// The image list in effect: `imagesOffset` / `imagesCount` when the
+    /// header has them, else the `...Old` fields.
     pub images_offset: u32,
     pub images_count: u32,
+    /// File offset of the header field `images_offset` was read from
+    /// (`images_count` is the next 4 bytes).
+    pub images_field_offset: u64,
+    /// 0 when the header predates sub-caches.
+    pub sub_cache_array_offset: u32,
+    pub sub_cache_array_count: u32,
     pub dyld_base_address: u64,
     pub code_signature_offset: u64,
     pub code_signature_size: u64,
@@ -77,6 +109,35 @@ pub struct CacheImage {
     pub path: Vec<u8>,
 }
 
+impl CacheHeader {
+    /// The magic as text: the bytes before the NUL padding, e.g.
+    /// `dyld_v1  arm64e`.
+    pub fn magic_str(&self) -> String {
+        let end = self.magic.iter().position(|&c| c == 0).unwrap_or(16);
+        crate::hex::utf8_safe(&self.magic[..end])
+    }
+}
+
+/// One entry of the header's `subCacheArray` and, when it could be opened,
+/// the file it names.
+pub struct SubCache {
+    /// File offset of the entry in the main cache file.
+    pub entry_offset: u64,
+    pub entry_size: u64,
+    pub uuid: [u8; 16],
+    /// Offset of the sub-cache's first mapping from the main cache's.
+    pub vm_offset: u64,
+    /// Appended to the main cache's path: `.01`, `.25.dylddata`, ...
+    pub suffix: String,
+    /// `None` when the file is missing, is not a cache or has another UUID.
+    pub file: Option<SubCacheFile>,
+}
+
+pub struct SubCacheFile {
+    pub image: Arc<Image>,
+    pub mappings: Vec<CacheMapping>,
+}
+
 impl CacheImage {
     /// The path as displayable text (malformed UTF-8 bytes become `?`).
     pub fn path_str(&self) -> String {
@@ -88,9 +149,93 @@ pub struct DyldSharedCache {
     pub image: Arc<Image>,
     pub header: CacheHeader,
     pub mappings: Vec<CacheMapping>,
+    /// The header's `subCacheArray`, in file order.
+    pub subcaches: Vec<SubCache>,
     /// Images listed in the sibling `.map` file; only filled when the header
     /// lists no images.
     pub map_images: Vec<CacheImage>,
+}
+
+/// The mapping table of a cache file, each entry checked against the file.
+fn read_mappings(image: &Image, offset: u32, count: u32) -> Result<Vec<CacheMapping>> {
+    // Counts are capped by the callers, so this product cannot overflow.
+    let map_bytes = count as u64 * MAPPING_INFO_SIZE;
+    if !image.in_file(offset as u64, map_bytes) {
+        return err("Malformed dyld shared cache: mapping array out of range");
+    }
+    let u32_ = |o: u64| image.u32(o).unwrap_or(0);
+    let u64_ = |o: u64| image.u64(o).unwrap_or(0);
+    // The table lies inside the file, which bounds this allocation.
+    let mut mappings = Vec::with_capacity(count as usize);
+    for i in 0..count as u64 {
+        let at = offset as u64 + i * MAPPING_INFO_SIZE;
+        let m = CacheMapping {
+            address: u64_(at),
+            size: u64_(at + 8),
+            file_offset: u64_(at + 16),
+            max_prot: u32_(at + 24),
+            init_prot: u32_(at + 28),
+        };
+        if !image.in_file(m.file_offset, m.size) {
+            return err("Malformed dyld shared cache: mapping entry file range out of bounds");
+        }
+        mappings.push(m);
+    }
+    Ok(mappings)
+}
+
+fn bytes16(image: &Image, off: u64) -> [u8; 16] {
+    let mut b = [0u8; 16];
+    if let Some(s) = image.slice(off, 16) {
+        b.copy_from_slice(s);
+    }
+    b
+}
+
+/// A sub-cache file suffix is appended to the cache path, so it must be a
+/// plain `.name`: no path separators or other surprises.
+fn is_safe_suffix(suffix: &str) -> bool {
+    suffix.len() > 1
+        && suffix.starts_with('.')
+        && suffix != ".."
+        && suffix
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b'-'))
+}
+
+/// Maps the sub-cache file `<main><suffix>` and reads its mapping table.
+/// `None` when it cannot be opened, is not a well-formed cache file or does
+/// not carry the UUID the main cache expects.
+fn open_subcache(main: &Path, suffix: &str, uuid: &[u8; 16]) -> Option<SubCacheFile> {
+    if !is_safe_suffix(suffix) {
+        return None;
+    }
+    let mut path = main.as_os_str().to_os_string();
+    path.push(suffix);
+    let image = Arc::new(Image::open(Path::new(&path)).ok()?);
+    if image.len() < CACHE_HEADER_SIZE || !is_shared_cache_magic(image.bytes()) {
+        return None;
+    }
+    if &bytes16(&image, OFF_UUID) != uuid {
+        return None;
+    }
+    let offset = image.u32(OFF_MAPPING_OFFSET)?;
+    let count = image.u32(OFF_MAPPING_COUNT)?;
+    if count > MAX_MAPPING_COUNT {
+        return None;
+    }
+    let mappings = read_mappings(&image, offset, count).ok()?;
+    Some(SubCacheFile { image, mappings })
+}
+
+/// File offset backing `vmaddr` per the first of `mappings` that contains it.
+fn lookup_mapping(mappings: &[CacheMapping], vmaddr: u64) -> Option<u64> {
+    mappings
+        .iter()
+        // A mapping whose end wraps around the address space maps nothing.
+        .filter(|m| m.address.checked_add(m.size).is_some())
+        .find(|m| vmaddr >= m.address && vmaddr - m.address < m.size)
+        .and_then(|m| m.file_offset.checked_add(vmaddr - m.address))
 }
 
 pub fn is_shared_cache_magic(data: &[u8]) -> bool {
@@ -107,26 +252,40 @@ impl DyldSharedCache {
         }
         let u32_ = |o: u64| image.u32(o).unwrap_or(0);
         let u64_ = |o: u64| image.u64(o).unwrap_or(0);
-        let bytes16 = |o: u64| {
-            let mut b = [0u8; 16];
-            if let Some(s) = image.slice(o, 16) {
-                b.copy_from_slice(s);
-            }
-            b
+        let mapping_offset = u32_(OFF_MAPPING_OFFSET);
+        // `mappingOffset` is where the header ends: a field exists only when
+        // it lies wholly below it.
+        let has_field = |off: u64, size: u64| off + size <= mapping_offset as u64;
+        let images_field_offset = if has_field(OFF_IMAGES_OFFSET, 8) {
+            OFF_IMAGES_OFFSET
+        } else {
+            OFF_IMAGES_OFFSET_OLD
         };
+        let (sub_cache_array_offset, sub_cache_array_count) =
+            if has_field(OFF_SUBCACHE_ARRAY_OFFSET, 8) {
+                (
+                    u32_(OFF_SUBCACHE_ARRAY_OFFSET),
+                    u32_(OFF_SUBCACHE_ARRAY_COUNT),
+                )
+            } else {
+                (0, 0)
+            };
         let header = CacheHeader {
-            magic: bytes16(0),
-            mapping_offset: u32_(OFF_MAPPING_OFFSET),
-            mapping_count: u32_(OFF_MAPPING_COUNT),
-            images_offset: u32_(OFF_IMAGES_OFFSET),
-            images_count: u32_(OFF_IMAGES_COUNT),
+            magic: bytes16(image, 0),
+            mapping_offset,
+            mapping_count: u32_(OFF_MAPPING_OFFSET + 4),
+            images_offset: u32_(images_field_offset),
+            images_count: u32_(images_field_offset + 4),
+            images_field_offset,
+            sub_cache_array_offset,
+            sub_cache_array_count,
             dyld_base_address: u64_(OFF_DYLD_BASE_ADDRESS),
             code_signature_offset: u64_(OFF_CODE_SIGNATURE_OFFSET),
             code_signature_size: u64_(OFF_CODE_SIGNATURE_SIZE),
             local_symbols_offset: u64_(OFF_LOCAL_SYMBOLS_OFFSET),
             local_symbols_size: u64_(OFF_LOCAL_SYMBOLS_SIZE),
-            uuid: bytes16(88),
-            cache_type: u64_(104),
+            uuid: bytes16(image, OFF_UUID),
+            cache_type: u64_(OFF_CACHE_TYPE),
         };
 
         if header.mapping_count > MAX_MAPPING_COUNT || header.images_count > MAX_IMAGE_COUNT {
@@ -142,28 +301,9 @@ impl DyldSharedCache {
             return err("Malformed dyld shared cache: images offset overlaps header");
         }
 
-        // Counts are capped above, so these products cannot overflow.
-        let map_bytes = header.mapping_count as u64 * MAPPING_INFO_SIZE;
-        if !image.in_file(header.mapping_offset as u64, map_bytes) {
-            return err("Malformed dyld shared cache: mapping array out of range");
-        }
-        // The table lies inside the file, which bounds this allocation.
-        let mut mappings = Vec::with_capacity(header.mapping_count as usize);
-        for i in 0..header.mapping_count as u64 {
-            let at = header.mapping_offset as u64 + i * MAPPING_INFO_SIZE;
-            let m = CacheMapping {
-                address: u64_(at),
-                size: u64_(at + 8),
-                file_offset: u64_(at + 16),
-                max_prot: u32_(at + 24),
-                init_prot: u32_(at + 28),
-            };
-            if !image.in_file(m.file_offset, m.size) {
-                return err("Malformed dyld shared cache: mapping entry file range out of bounds");
-            }
-            mappings.push(m);
-        }
+        let mappings = read_mappings(image, header.mapping_offset, header.mapping_count)?;
 
+        // Counts are capped above, so this product cannot overflow.
         let image_bytes = header.images_count as u64 * IMAGE_INFO_SIZE;
         if !image.in_file(header.images_offset as u64, image_bytes) {
             return err("Malformed dyld shared cache: image array out of range");
@@ -180,11 +320,41 @@ impl DyldSharedCache {
             }
         }
 
+        let subcaches = read_subcaches(image, &header, filepath);
+
         Ok(DyldSharedCache {
             image: image.clone(),
             header,
             mappings,
+            subcaches,
             map_images,
+        })
+    }
+
+    /// Number of files that make up the cache: the main file plus every
+    /// sub-cache entry (opened or not).
+    pub fn file_count(&self) -> usize {
+        1 + self.subcaches.len()
+    }
+
+    /// The mapped file with index `file`: 0 is the main cache file, `i + 1`
+    /// is `subcaches[i]`. `None` when that sub-cache file is not available.
+    pub fn file_image(&self, file: usize) -> Option<&Arc<Image>> {
+        match file.checked_sub(1) {
+            None => Some(&self.image),
+            Some(i) => self.subcaches.get(i)?.file.as_ref().map(|f| &f.image),
+        }
+    }
+
+    /// `(file index, file offset)` backing `vmaddr`: the main file's
+    /// mappings are searched first, then each available sub-cache's.
+    pub fn resolve(&self, vmaddr: u64) -> Option<(usize, u64)> {
+        if let Some(off) = lookup_mapping(&self.mappings, vmaddr) {
+            return Some((0, off));
+        }
+        self.subcaches.iter().enumerate().find_map(|(i, sub)| {
+            let off = lookup_mapping(&sub.file.as_ref()?.mappings, vmaddr)?;
+            Some((i + 1, off))
         })
     }
 
@@ -242,16 +412,47 @@ impl DyldSharedCache {
         }
     }
 
-    /// File offset backing `vmaddr`, per the first mapping that contains it.
+    /// Offset in the main cache file backing `vmaddr`, per the first of its
+    /// mappings that contains it. See [`resolve`](Self::resolve) for
+    /// addresses that live in sub-cache files.
     pub fn vm_to_file_offset(&self, vmaddr: u64) -> Option<u64> {
-        for m in &self.mappings {
-            // Wrapping like the original's unsigned arithmetic.
-            if vmaddr >= m.address && vmaddr < m.address.wrapping_add(m.size) {
-                return Some(m.file_offset.wrapping_add(vmaddr - m.address));
-            }
-        }
-        None
+        lookup_mapping(&self.mappings, vmaddr)
     }
+}
+
+/// The header's `subCacheArray`. The files are only opened when the cache
+/// came from a path. A table that does not fit in the file is ignored.
+fn read_subcaches(image: &Image, header: &CacheHeader, filepath: Option<&Path>) -> Vec<SubCache> {
+    let count = header.sub_cache_array_count.min(MAX_SUBCACHE_COUNT) as u64;
+    let v1 = header.mapping_offset as u64 <= OFF_CACHE_SUB_TYPE;
+    let entry_size = if v1 {
+        SUBCACHE_ENTRY_V1_SIZE
+    } else {
+        SUBCACHE_ENTRY_SIZE
+    };
+    let start = header.sub_cache_array_offset as u64;
+    if count == 0 || start == 0 || !image.in_file(start, count * entry_size) {
+        return Vec::new();
+    }
+    (0..count)
+        .map(|i| {
+            let at = start + i * entry_size;
+            let uuid = bytes16(image, at);
+            let suffix = if v1 {
+                format!(".{}", i + 1)
+            } else {
+                crate::hex::utf8_safe(image.cstr(at + 24, 32).unwrap_or(&[]))
+            };
+            SubCache {
+                entry_offset: at,
+                entry_size,
+                uuid,
+                vm_offset: image.u64(at + 16).unwrap_or(0),
+                file: filepath.and_then(|p| open_subcache(p, &suffix, &uuid)),
+                suffix,
+            }
+        })
+        .collect()
 }
 
 fn is_regex_space(c: u8) -> bool {
@@ -393,6 +594,44 @@ pub(crate) mod testutil {
         d
     }
 
+    /// A cache with a modern (0x1d0-byte) header: `imagesOffset` /
+    /// `imagesCount` and a v2 sub-cache array, one mapping, one image.
+    pub fn modern_cache(vmaddr: u64, uuid: u8, subs: &[(u8, u64, &str)]) -> Vec<u8> {
+        let mut d = vec![0u8; 0x1d0];
+        d[..16].copy_from_slice(b"dyld_v1  arm64e\0");
+        d[88..104].fill(uuid);
+        let put32 =
+            |d: &mut Vec<u8>, at: usize, v: u32| d[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        put32(&mut d, 16, 0x1d0);
+        put32(&mut d, 20, 1);
+        for v in [vmaddr, 0x1000, 0] {
+            d.extend_from_slice(&v.to_le_bytes());
+        }
+        d.extend_from_slice(&[5, 0, 0, 0, 5, 0, 0, 0]);
+        let images = d.len() as u32;
+        put32(&mut d, 0x1c0, images);
+        put32(&mut d, 0x1c4, 1);
+        d.extend_from_slice(&(vmaddr + 0x800).to_le_bytes());
+        d.extend_from_slice(&[0u8; 16]);
+        d.extend_from_slice(&(images + 32).to_le_bytes());
+        d.extend_from_slice(&[0u8; 4]);
+        d.extend_from_slice(b"/usr/lib/libmodern.dylib\0");
+        if !subs.is_empty() {
+            let at = d.len() as u32;
+            put32(&mut d, 0x188, at);
+            put32(&mut d, 0x18c, subs.len() as u32);
+            for (uuid, vm_offset, suffix) in subs {
+                d.extend_from_slice(&[*uuid; 16]);
+                d.extend_from_slice(&vm_offset.to_le_bytes());
+                let mut name = [0u8; 32];
+                name[..suffix.len()].copy_from_slice(suffix.as_bytes());
+                d.extend_from_slice(&name);
+            }
+        }
+        d.resize(0x1000, 0);
+        d
+    }
+
     pub fn parse(data: Vec<u8>) -> Result<DyldSharedCache> {
         DyldSharedCache::parse(&Arc::new(Image::from_vec(data).unwrap()), None)
     }
@@ -427,6 +666,11 @@ mod tests {
         );
         let c = parse(data).unwrap();
         assert_eq!(&c.header.magic, b"dyld_v1  arm64e\0");
+        assert_eq!(c.header.magic_str(), "dyld_v1  arm64e");
+        assert_eq!(c.header.images_field_offset, OFF_IMAGES_OFFSET_OLD);
+        assert!(c.subcaches.is_empty());
+        assert_eq!(c.resolve(0x1_8000_0400), Some((0, 0x400)));
+        assert_eq!(c.resolve(0x1_8000_1000), None);
         assert_eq!(
             (
                 c.header.mapping_offset,
@@ -556,6 +800,85 @@ mod tests {
         };
         let c = parse(build_cache(&[m], &[], 0x1000)).unwrap();
         assert_eq!(c.vm_to_file_offset(u64::MAX), None);
+    }
+
+    #[test]
+    fn modern_header_images() {
+        let c = parse(modern_cache(0x1_8000_0000, 1, &[(2, 0x4000, ".01")])).unwrap();
+        assert_eq!(c.header.images_field_offset, OFF_IMAGES_OFFSET);
+        assert_eq!(c.header.images_count, 1);
+        let images: Vec<_> = c.images().collect();
+        assert_eq!(images[0].path, b"/usr/lib/libmodern.dylib");
+        assert_eq!(images[0].address, 0x1_8000_0800);
+        // Parsed from memory: the entry is listed, the file is not opened.
+        assert_eq!(c.subcaches.len(), 1);
+        assert_eq!(c.subcaches[0].suffix, ".01");
+        assert_eq!(c.subcaches[0].vm_offset, 0x4000);
+        assert_eq!(c.subcaches[0].uuid, [2; 16]);
+        assert!(c.subcaches[0].file.is_none());
+        assert_eq!(c.file_count(), 2);
+        assert!(c.file_image(1).is_none());
+        assert!(c.file_image(2).is_none());
+        // A sub-cache table outside the file is ignored.
+        let mut bad = modern_cache(0x1_8000_0000, 1, &[(2, 0x4000, ".01")]);
+        bad[0x188..0x18c].copy_from_slice(&0xffff_fff0u32.to_le_bytes());
+        assert!(parse(bad).unwrap().subcaches.is_empty());
+    }
+
+    #[test]
+    fn subcache_files_are_followed() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/tmp")
+            .join(format!("moex-core-subcache-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let main = dir.join("dyld_shared_cache_test");
+        let subs = [
+            (2u8, 0x4000u64, ".01"),
+            (3, 0x8000, ".02.dylddata"),
+            (4, 0xc000, ".03"),
+            (5, 0, "/../evil"),
+        ];
+        std::fs::write(&main, modern_cache(0x1_8000_0000, 1, &subs)).unwrap();
+        std::fs::write(
+            dir.join("dyld_shared_cache_test.01"),
+            modern_cache(0x1_8000_4000, 2, &[]),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("dyld_shared_cache_test.02.dylddata"),
+            modern_cache(0x1_8000_8000, 3, &[]),
+        )
+        .unwrap();
+        // Wrong UUID: not used.
+        std::fs::write(
+            dir.join("dyld_shared_cache_test.03"),
+            modern_cache(0x1_8000_c000, 9, &[]),
+        )
+        .unwrap();
+        let image = Arc::new(Image::open(&main).unwrap());
+        let c = DyldSharedCache::parse(&image, Some(&main)).unwrap();
+        let open: Vec<bool> = c.subcaches.iter().map(|s| s.file.is_some()).collect();
+        assert_eq!(open, [true, true, false, false]);
+        assert_eq!(c.resolve(0x1_8000_0010), Some((0, 0x10)));
+        assert_eq!(c.resolve(0x1_8000_4010), Some((1, 0x10)));
+        assert_eq!(c.resolve(0x1_8000_8ff0), Some((2, 0xff0)));
+        assert_eq!(c.resolve(0x1_8000_c010), None);
+        assert_eq!(c.vm_to_file_offset(0x1_8000_4010), None);
+        assert!(c.file_image(2).is_some());
+        assert!(c.file_image(3).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn suffixes() {
+        assert!(is_safe_suffix(".01"));
+        assert!(is_safe_suffix(".25.dylddata"));
+        assert!(!is_safe_suffix(""));
+        assert!(!is_safe_suffix("."));
+        assert!(!is_safe_suffix(".."));
+        assert!(!is_safe_suffix("01"));
+        assert!(!is_safe_suffix("./x"));
+        assert!(!is_safe_suffix(".a b"));
     }
 
     #[test]

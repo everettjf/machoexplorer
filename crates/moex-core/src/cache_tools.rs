@@ -172,7 +172,10 @@ pub struct SegmentCopyPlan {
     pub vmaddr: u64,
     /// The segment's `fileoff` as recorded in the image's load command.
     pub image_fileoff: u64,
-    /// Where the segment's bytes are in the cache file.
+    /// Which cache file holds the segment's bytes: 0 is the main file, `n`
+    /// the n-th sub-cache (see [`DyldSharedCache::file_image`]).
+    pub source_file: usize,
+    /// Where the segment's bytes are in that file.
     pub source_fileoff: u64,
     /// Where they go in the output file.
     pub target_fileoff: u64,
@@ -182,6 +185,9 @@ pub struct SegmentCopyPlan {
 /// Everything needed to write one image.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExtractPlan {
+    /// Cache file (see [`SegmentCopyPlan::source_file`]) and offset of the
+    /// image's Mach-O header.
+    pub header_file: usize,
     pub header_fileoff: u64,
     pub is64: bool,
     pub mh_size: u64,
@@ -279,9 +285,11 @@ pub struct ExtractProgress<'a> {
     pub bytes_total: u64,
 }
 
-fn align_up(value: u64, alignment: u64) -> u64 {
+/// `value` rounded up to a multiple of `alignment` (a power of two);
+/// `None` on overflow.
+fn align_up(value: u64, alignment: u64) -> Option<u64> {
     let mask = alignment - 1;
-    value.wrapping_add(mask) & !mask
+    Some(value.checked_add(mask)? & !mask)
 }
 
 /// Work out which byte ranges of the cache make up `image`.
@@ -290,10 +298,14 @@ pub fn plan_extraction(
     image: &CacheImage,
     options: &ExtractOptions,
 ) -> Result<ExtractPlan, ExtractError> {
-    let data = &cache.image;
     let fail = |prefix: &str| Err(ExtractError::new(prefix, &image.path));
 
-    let Some(header_fileoff) = cache.vm_to_file_offset(image.address) else {
+    // The header and each segment may live in different files of a split
+    // cache.
+    let located = cache
+        .resolve(image.address)
+        .and_then(|(file, off)| Some((file, off, cache.file_image(file)?)));
+    let Some((header_file, header_fileoff, data)) = located else {
         return fail("cannot map image vmaddr to cache file offset: ");
     };
     if !data.in_file(header_fileoff, MACH_HEADER_64_SIZE) {
@@ -352,11 +364,12 @@ pub fn plan_extraction(
         };
         if let Some((vmaddr, fileoff, filesize)) = seg {
             if filesize > 0 {
-                if let Some(source_fileoff) = cache.vm_to_file_offset(vmaddr) {
+                if let Some((source_file, source_fileoff)) = cache.resolve(vmaddr) {
                     segments.push(SegmentCopyPlan {
                         name: data.cstr(lc + 8, 16).unwrap_or(&[]).to_vec(),
                         vmaddr,
                         image_fileoff: fileoff,
+                        source_file,
                         source_fileoff,
                         target_fileoff: fileoff,
                         size: filesize,
@@ -370,34 +383,49 @@ pub fn plan_extraction(
         return fail("no loadable segments found: ");
     }
 
+    let segment_error = |prefix: &str, p: &SegmentCopyPlan| {
+        let mut detail = p.name.clone();
+        detail.extend_from_slice(b" image=");
+        detail.extend_from_slice(&image.path);
+        ExtractError::new(prefix, &detail)
+    };
+    for p in &segments {
+        let in_source = cache
+            .file_image(p.source_file)
+            .is_some_and(|f| f.in_file(p.source_fileoff, p.size));
+        if !in_source {
+            return Err(segment_error("segment source out of range: ", p));
+        }
+    }
+
     if options.compact {
         segments.sort_by(|a, b| {
             a.image_fileoff
                 .cmp(&b.image_fileoff)
                 .then(a.vmaddr.cmp(&b.vmaddr))
         });
-        let mut next_off = align_up(mh_size + cmds_size, 0x1000);
+        let mut next_off = mh_size + cmds_size;
         for p in &mut segments {
-            p.target_fileoff = align_up(next_off, 0x1000);
-            next_off = p.target_fileoff.wrapping_add(p.size);
+            let target = align_up(next_off, 0x1000);
+            let end = target.and_then(|t| t.checked_add(p.size));
+            let (Some(target), Some(end)) = (target, end) else {
+                return Err(segment_error("segment target out of range: ", p));
+            };
+            p.target_fileoff = target;
+            next_off = end;
         }
     }
 
     let mut out_size = mh_size + cmds_size;
     for p in &segments {
-        if !data.in_file(p.source_fileoff, p.size) {
-            let mut detail = p.name.clone();
-            detail.extend_from_slice(b" image=");
-            detail.extend_from_slice(&image.path);
-            return Err(ExtractError::new("segment source out of range: ", &detail));
-        }
-        // QUIRK(parity): the end offset wraps at 64 bits, so a segment
-        // with an absurd file offset does not grow the reported size.
-        // `extract_image` refuses to write such a plan.
-        out_size = out_size.max(p.target_fileoff.wrapping_add(p.size));
+        let Some(end) = p.target_fileoff.checked_add(p.size) else {
+            return Err(segment_error("segment target out of range: ", p));
+        };
+        out_size = out_size.max(end);
     }
 
     Ok(ExtractPlan {
+        header_file,
         header_fileoff,
         is64,
         mh_size,
@@ -407,16 +435,22 @@ pub fn plan_extraction(
     })
 }
 
+/// New value of a file offset stored in a load command: the segment whose
+/// old file range contains it decides. An offset exactly at the end of a
+/// segment (an empty table placed last) moves with that segment when no
+/// other segment starts there. `None` when no segment holds the offset or
+/// the new offset does not fit in 32 bits.
 fn remap_file_offset(plans: &[SegmentCopyPlan], old_off: u32) -> Option<u32> {
     let old = old_off as u64;
-    for p in plans {
-        if old < p.image_fileoff || old >= p.image_fileoff.wrapping_add(p.size) {
-            continue;
-        }
-        let mapped = p.target_fileoff.wrapping_add(old - p.image_fileoff);
-        return u32::try_from(mapped).ok();
-    }
-    None
+    let delta_in = |p: &SegmentCopyPlan, inclusive: bool| {
+        let delta = old.checked_sub(p.image_fileoff)?;
+        (delta < p.size || (inclusive && delta == p.size)).then_some(delta)
+    };
+    let (p, delta) = plans
+        .iter()
+        .find_map(|p| Some((p, delta_in(p, false)?)))
+        .or_else(|| plans.iter().find_map(|p| Some((p, delta_in(p, true)?))))?;
+    u32::try_from(p.target_fileoff.checked_add(delta)?).ok()
 }
 
 fn get_u32(buf: &[u8], off: usize) -> Option<u32> {
@@ -449,11 +483,13 @@ fn patch_load_commands_for_compaction(cmds: &mut [u8], plans: &[SegmentCopyPlan]
     const LINKEDIT_DATA_COMMAND_SIZE: usize = 16;
     const TWOLEVEL_HINTS_COMMAND_SIZE: usize = 16;
 
-    // QUIRK(parity): an offset of 0 ("not present") is remapped like any
-    // other offset, so it becomes the new offset of the segment that used to
-    // start at file offset 0 (normally __TEXT).
+    // An offset of 0 means "not present" in every one of these commands
+    // and stays 0.
     fn remap_field(cmds: &mut [u8], plans: &[SegmentCopyPlan], off: usize) {
-        if let Some(mapped) = get_u32(cmds, off).and_then(|old| remap_file_offset(plans, old)) {
+        let mapped = get_u32(cmds, off)
+            .filter(|&old| old != 0)
+            .and_then(|old| remap_file_offset(plans, old));
+        if let Some(mapped) = mapped {
             put(cmds, off, &mapped.to_le_bytes());
         }
     }
@@ -519,7 +555,7 @@ const SEGMENT_COMMAND_SIZE: u64 = crate::macho::segment::SEGMENT_COMMAND_SIZE;
 const SEGMENT_COMMAND_64_SIZE: u64 = crate::macho::segment::SEGMENT_COMMAND_64_SIZE;
 
 fn write_plan(
-    data: &Image,
+    cache: &DyldSharedCache,
     plan: &ExtractPlan,
     compact: bool,
     out: &mut File,
@@ -531,8 +567,9 @@ fn write_plan(
     // The header range was bounds-checked while planning, which also bounds
     // this buffer (at most 64 MiB + 32 bytes).
     let header_len = plan.mh_size + plan.sizeofcmds as u64;
-    let mut header = data
-        .slice(plan.header_fileoff, header_len)
+    let mut header = cache
+        .file_image(plan.header_file)
+        .and_then(|data| data.slice(plan.header_fileoff, header_len))
         .ok_or(WriteError::Source)?
         .to_vec();
     if compact {
@@ -549,6 +586,7 @@ fn write_plan(
         .fold(0u64, |acc, p| acc.saturating_add(p.size));
     let mut bytes_done: u64 = 0;
     for p in &plan.segments {
+        let data: &Image = cache.file_image(p.source_file).ok_or(WriteError::Source)?;
         let mut copied: u64 = 0;
         while copied < p.size {
             if cancel.load(Ordering::Relaxed) {
@@ -623,30 +661,10 @@ pub fn extract_image(
         });
     }
 
-    // The original tool seeked to wrapped offsets, silently lost the data
-    // and still reported success; refuse instead.
-    if let Some(p) = plan
-        .segments
-        .iter()
-        .find(|p| p.target_fileoff.checked_add(p.size).is_none())
-    {
-        let mut detail = p.name.clone();
-        detail.extend_from_slice(b" image=");
-        detail.extend_from_slice(&image.path);
-        return Err(ExtractError::new("segment target out of range: ", &detail));
-    }
-
     let output_bytes = output.as_os_str().as_encoded_bytes();
     let mut file = File::create(output)
         .map_err(|_| ExtractError::new("cannot open output file: ", output_bytes))?;
-    match write_plan(
-        &cache.image,
-        &plan,
-        options.compact,
-        &mut file,
-        cancel,
-        progress,
-    ) {
+    match write_plan(cache, &plan, options.compact, &mut file, cancel, progress) {
         Ok(()) => Ok(outcome),
         Err(e) => {
             drop(file);
@@ -757,7 +775,7 @@ impl BatchNamer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::macho::dyld_cache::testutil::{build_cache, parse};
+    use crate::macho::dyld_cache::testutil::{build_cache, modern_cache, parse};
     use crate::macho::dyld_cache::CacheMapping;
 
     const BASE: u64 = 0x1_8000_0000;
@@ -974,6 +992,127 @@ mod tests {
         );
     }
 
+    /// A split cache on disk: the image's header and `__TEXT` are in the
+    /// main file, `__DATA` in sub-cache `.01`, `__LINKEDIT` in `.02.dylddata`.
+    #[test]
+    fn extraction_follows_sub_cache_files() {
+        let dir = tmp("split");
+        std::fs::create_dir_all(&dir).unwrap();
+        let main_path = dir.join("cache");
+        let mut main = modern_cache(BASE, 1, &[(2, 0x4000, ".01"), (3, 0x8000, ".02.dylddata")]);
+        let cmds = [
+            seg64("__TEXT", BASE + 0x800, 0x800, 0x200),
+            seg64("__DATA", BASE + 0x4400, 0x400, 0x80),
+            seg64("__LINKEDIT", BASE + 0x8600, 0x600, 0x40),
+            symtab(0x610, 0x620),
+        ]
+        .concat();
+        let mut header = Vec::new();
+        for w in [MH_MAGIC_64, 0x0100000c, 0, 6, 4, cmds.len() as u32, 0, 0] {
+            header.extend_from_slice(&w.to_le_bytes());
+        }
+        header.extend_from_slice(&cmds);
+        main[0x800..0x800 + header.len()].copy_from_slice(&header);
+        let mut sub1 = modern_cache(BASE + 0x4000, 2, &[]);
+        sub1[0x400..0x480].fill(0xD1);
+        let mut sub2 = modern_cache(BASE + 0x8000, 3, &[]);
+        sub2[0x600..0x640].fill(0xE2);
+        std::fs::write(&main_path, &main).unwrap();
+        std::fs::write(dir.join("cache.01"), &sub1).unwrap();
+        std::fs::write(dir.join("cache.02.dylddata"), &sub2).unwrap();
+
+        let cache = open_cache(&main_path).unwrap();
+        let image = cache.images().next().unwrap();
+        let plan = plan_extraction(&cache, &image, &ExtractOptions::default()).unwrap();
+        let sources: Vec<(usize, u64)> = plan
+            .segments
+            .iter()
+            .map(|p| (p.source_file, p.source_fileoff))
+            .collect();
+        assert_eq!(sources, [(0, 0x800), (1, 0x400), (2, 0x600)]);
+
+        let out = dir.join("out.macho");
+        let r = extract(
+            &cache,
+            0,
+            &out,
+            ExtractOptions {
+                compact: true,
+                dry_run: false,
+            },
+        )
+        .unwrap();
+        // __DATA (file offset 0x400) sorts first, then __LINKEDIT, __TEXT.
+        assert_eq!((r.segments, r.size), (3, 0x3200));
+        let bytes = std::fs::read(&out).unwrap();
+        assert!(bytes[0x1000..0x1080].iter().all(|&b| b == 0xD1));
+        assert!(bytes[0x2000..0x2040].iter().all(|&b| b == 0xE2));
+        assert_eq!(&bytes[0x3000..0x3004], &MH_MAGIC_64.to_le_bytes());
+        let sym = 32 + 3 * 72;
+        assert_eq!(
+            u32::from_le_bytes(bytes[sym + 8..sym + 12].try_into().unwrap()),
+            0x2010
+        );
+
+        // Without the sub-cache file the segment cannot be located.
+        std::fs::remove_file(dir.join("cache.01")).unwrap();
+        let cache = open_cache(&main_path).unwrap();
+        let plan = plan_extraction(&cache, &image, &ExtractOptions::default()).unwrap();
+        assert_eq!(plan.segments.len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn compaction_keeps_absent_offsets_zero() {
+        let plans = [
+            SegmentCopyPlan {
+                name: b"__TEXT".to_vec(),
+                vmaddr: 0x1000,
+                image_fileoff: 0,
+                source_file: 0,
+                source_fileoff: 0,
+                target_fileoff: 0x1000,
+                size: 0x400,
+            },
+            SegmentCopyPlan {
+                name: b"__LINKEDIT".to_vec(),
+                vmaddr: 0x3000,
+                image_fileoff: 0x8000,
+                source_file: 0,
+                source_fileoff: 0,
+                target_fileoff: 0x2000,
+                size: 0x100,
+            },
+        ];
+        // LC_DYSYMTAB: only the indirect symbol table is present.
+        let mut cmds = Vec::new();
+        for v in [LC_DYSYMTAB, 80] {
+            cmds.extend_from_slice(&v.to_le_bytes());
+        }
+        cmds.resize(80, 0);
+        cmds[56..60].copy_from_slice(&0x8040u32.to_le_bytes());
+        // LC_DYLD_INFO_ONLY: only export info, and one that is not in any
+        // segment (left alone).
+        for v in [LC_DYLD_INFO_ONLY, 48] {
+            cmds.extend_from_slice(&v.to_le_bytes());
+        }
+        cmds.resize(128, 0);
+        cmds[80 + 40..80 + 44].copy_from_slice(&0x8080u32.to_le_bytes());
+        cmds[80 + 8..80 + 12].copy_from_slice(&0x7000u32.to_le_bytes());
+        patch_load_commands_for_compaction(&mut cmds, &plans, true);
+        let at = |off: usize| get_u32(&cmds, off).unwrap();
+        // tocoff, modtaboff, extrefsymoff, extreloff, locreloff stay 0
+        for off in [32, 40, 48, 64, 72] {
+            assert_eq!(at(off), 0, "dysymtab field at {off}");
+        }
+        assert_eq!(at(56), 0x2040);
+        assert_eq!(at(80 + 8), 0x7000);
+        for off in [16, 24, 32] {
+            assert_eq!(at(80 + off), 0, "dyld info field at {off}");
+        }
+        assert_eq!(at(80 + 40), 0x2080);
+    }
+
     #[test]
     fn dry_run_writes_nothing() {
         let cache = sample_cache();
@@ -1097,8 +1236,8 @@ mod tests {
             "segment source out of range: __BIG image=/img"
         );
 
-        // target offset that wraps: planning succeeds (the size wraps like
-        // the original), writing is refused before the file is created
+        // target offset that wraps: refused while planning, so a dry run
+        // reports it too and nothing is created
         let far = seg64("__FAR", BASE, u64::MAX - 0x10, 0x100);
         let cache = make(1, 72, &far);
         assert_eq!(
@@ -1114,9 +1253,12 @@ mod tests {
                 compact: false,
                 dry_run: true,
             },
-        )
-        .unwrap();
-        assert_eq!(dry.size, 0xef);
+        );
+        assert_eq!(
+            String::from_utf8(dry.unwrap_err().message).unwrap(),
+            "segment target out of range: __FAR image=/img"
+        );
+        // compact mode does not use the stored offset
         assert!(run(&cache, true).is_ok());
         let _ = std::fs::remove_file(&out);
 
@@ -1170,13 +1312,26 @@ mod tests {
             name: b"__LINKEDIT".to_vec(),
             vmaddr: 0,
             image_fileoff: 0x8000,
+            source_file: 0,
             source_fileoff: 0,
             target_fileoff: 0x2000,
             size: 0x100,
         }];
         assert_eq!(remap_file_offset(&plans, 0x8010), Some(0x2010));
-        assert_eq!(remap_file_offset(&plans, 0x8100), None);
+        // The end of the segment moves with it (an empty trailing table).
+        assert_eq!(remap_file_offset(&plans, 0x8100), Some(0x2100));
+        assert_eq!(remap_file_offset(&plans, 0x8101), None);
         assert_eq!(remap_file_offset(&plans, 0x7fff), None);
+        // ... unless another segment starts there.
+        let two = [
+            plans[0].clone(),
+            SegmentCopyPlan {
+                image_fileoff: 0x8100,
+                target_fileoff: 0x5000,
+                ..plans[0].clone()
+            },
+        ];
+        assert_eq!(remap_file_offset(&two, 0x8100), Some(0x5000));
         let far = [SegmentCopyPlan {
             target_fileoff: 0xFFFF_FFF0,
             ..plans[0].clone()

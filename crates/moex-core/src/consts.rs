@@ -40,6 +40,15 @@ pub const CPU_TYPE_POWERPC64: u32 = CPU_TYPE_POWERPC | CPU_ARCH_ABI64;
 
 pub const CPU_SUBTYPE_MASK: u32 = 0xff00_0000;
 pub const CPU_SUBTYPE_LIB64: u32 = 0x8000_0000;
+pub const CPU_SUBTYPE_X86_64_H: u32 = 8;
+pub const CPU_SUBTYPE_ARM64E: u32 = 2;
+pub const CPU_SUBTYPE_ARM64_X1: u32 = 3;
+pub const CPU_SUBTYPE_ARM64E_X1: u32 = 12;
+/// arm64e subtypes only: the top byte carries a versioned
+/// pointer-authentication ABI.
+pub const CPU_SUBTYPE_PTRAUTH_ABI: u32 = 0x8000_0000;
+pub const CPU_SUBTYPE_ARM64E_KERNEL_ABI: u32 = 0x4000_0000;
+pub const CPU_SUBTYPE_ARM64_PTR_AUTH_MASK: u32 = 0x0f00_0000;
 
 // File types
 pub const MH_OBJECT: u32 = 0x1;

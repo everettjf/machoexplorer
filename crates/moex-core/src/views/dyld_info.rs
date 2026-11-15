@@ -13,11 +13,6 @@ use crate::macho::MachHeader;
 use crate::view::{leaf, Content, FnNode, Table, ViewNode};
 use std::sync::Arc;
 
-/// `0X`-prefixed upper-case hex without padding (`util::ToHexString`).
-fn to_hex_string(v: u64) -> String {
-    format!("0X{:X}", v)
-}
-
 pub fn node(mh: Arc<MachHeader>) -> Option<ViewNode> {
     let for_content = mh.clone();
     Some(ViewNode::new(FnNode {
@@ -82,9 +77,9 @@ fn content(mh: &MachHeader) -> Content {
 fn children(mh: &Arc<MachHeader>) -> Vec<ViewNode> {
     let mut nodes = Vec::new();
     if let Some(info) = mh.dyld_info() {
-        // QUIRK(parity): "present" is tested as `offset * size > 0` in 32
-        // bits, so a blob whose product wraps to zero gets no node.
-        let present = |off: u32, size: u32| off.wrapping_mul(size) > 0;
+        // A blob is present when it has a size (and, as offset 0 is the
+        // Mach-O header, an offset).
+        let present = |off: u32, size: u32| off != 0 && size != 0;
         if present(info.rebase_off, info.rebase_size) {
             let mh = mh.clone();
             nodes.push(leaf("Rebase Info", move || {
@@ -92,26 +87,12 @@ fn children(mh: &Arc<MachHeader>) -> Vec<ViewNode> {
             }));
         }
         let binds = [
-            (
-                "Binding Info",
-                BindKind::Bind,
-                info.bind_off,
-                info.bind_size,
-            ),
-            (
-                "Weak Binding Info",
-                BindKind::WeakBind,
-                info.weak_bind_off,
-                info.weak_bind_size,
-            ),
-            (
-                "Lazy Binding Info",
-                BindKind::LazyBind,
-                info.lazy_bind_off,
-                info.lazy_bind_size,
-            ),
+            ("Binding Info", BindKind::Bind),
+            ("Weak Binding Info", BindKind::WeakBind),
+            ("Lazy Binding Info", BindKind::LazyBind),
         ];
-        for (name, kind, off, size) in binds {
+        for (name, kind) in binds {
+            let (off, size) = info.bind_range(kind);
             if present(off, size) {
                 let mh = mh.clone();
                 nodes.push(leaf(name, move || opcodes::bind_content(&mh, &info, kind)));

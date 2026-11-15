@@ -233,8 +233,12 @@ moex cache-extract [--compact] [--all] [--exact] [--dry-run] [--json] [--max=N] 
 每个镜像写为 `<镜像文件名>.macho`。退出码：`0` 成功；`1` 没有匹配的镜像或提取失败
 （`--all` 模式下其余镜像仍会继续处理）；`2` 用法错误。
 
-分片 cache 的镜像位于子 cache 文件中，提取器不会跟随这些文件，
-因此从新系统 cache 的主文件提取时可能以退出码 `1` 失败。
+分片 cache 的镜像位于子 cache 文件中（`<cache>.01`、`<cache>.25.dylddata` 等）。
+传入主 cache 文件即可：提取器会从同一目录读取其头部列出的子 cache 文件，
+并从实际存放各 segment 的文件中复制数据。缺失或属于其他 cache（UUID 不同）的
+子 cache 文件会被跳过，依赖它的镜像以退出码 `1` 失败。分片 cache 建议使用 `--compact`：
+否则每个 segment 保留它在各自子 cache 文件中的文件偏移，来自不同文件的 segment
+在输出中可能重叠。
 
 ## 自动化示例
 

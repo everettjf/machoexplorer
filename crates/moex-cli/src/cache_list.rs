@@ -108,11 +108,10 @@ pub fn run(args: &[String]) -> ExitCode {
 
     let header = &cache.header;
     let mut buf: Vec<u8> = Vec::new();
-    // QUIRK(parity): all 16 magic bytes are written, including the
-    // trailing NUL padding (unescaped even in JSON mode).
+    let magic = header.magic_str();
     if o.json {
         buf.extend_from_slice(b"{\"magic\":\"");
-        buf.extend_from_slice(&json_escape(&header.magic));
+        buf.extend_from_slice(&json_escape(magic.as_bytes()));
         buf.extend_from_slice(
             format!(
                 "\",\"mappingCount\":{},\"imageCount\":{},\"images\":[",
@@ -122,7 +121,7 @@ pub fn run(args: &[String]) -> ExitCode {
         );
     } else {
         buf.extend_from_slice(b"magic: ");
-        buf.extend_from_slice(&header.magic);
+        buf.extend_from_slice(magic.as_bytes());
         buf.extend_from_slice(
             format!(
                 "\nmappingCount: {} imageCount: {}\n",

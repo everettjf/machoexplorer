@@ -20,7 +20,8 @@ pub struct Symbol {
     pub n_strx: u32,
     pub n_type: u8,
     pub n_sect: u8,
-    /// Raw 16 bits (signed in the 32-bit `nlist`).
+    /// A bit field (`REFERENCE_TYPE`, `N_WEAK_DEF`, library ordinal, ...),
+    /// so always treated as unsigned.
     pub n_desc: u16,
     /// Zero-extended for 32-bit entries.
     pub n_value: u64,
@@ -77,10 +78,9 @@ impl<'a> Symtab<'a> {
         self.mh.offset.saturating_add(self.symoff as u64)
     }
 
-    /// `nsyms * entry size`.
-    // QUIRK(parity): truncated to 32 bits, so a huge `nsyms` wraps.
-    pub fn symbol_table_total_bytes(&self) -> u32 {
-        (self.nsyms as u64).wrapping_mul(self.entry_size()) as u32
+    /// `nsyms * entry size` (the declared size; it may exceed the file).
+    pub fn symbol_table_total_bytes(&self) -> u64 {
+        self.nsyms as u64 * self.entry_size()
     }
 
     /// File offset of the string table.
@@ -234,7 +234,7 @@ mod tests {
         let st = mh.symtab().unwrap();
         // 39 bytes after symoff: two whole entries.
         assert_eq!(st.symbol_count(), 2);
-        assert_eq!(st.symbol_table_total_bytes(), 0xFFFF_FFF0);
+        assert_eq!(st.symbol_table_total_bytes(), 0xFFFF_FFFF * 16);
         assert_eq!(st.string_table_size_in_file(), 7);
         assert_eq!(st.string(1), "_a");
         assert_eq!(st.string(7), "");
