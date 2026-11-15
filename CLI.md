@@ -52,7 +52,7 @@ What is gone:
 
 Intentional differences in behaviour (for example, a non-numeric `--limit=`
 value is now a usage error instead of a crash) are listed in
-[docs/rust-port-quirks.md](docs/rust-port-quirks.md).
+[docs/analysis-notes.md](docs/analysis-notes.md).
 
 ## `moex dump`
 

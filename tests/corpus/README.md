@@ -15,6 +15,6 @@ sources and notes on how each was built.
 | `dyld_chained_x86_64.dylib` | `src/dyld/` with chained fixups (re-export terminals) |
 | `dyld_synth_b`, `dyld_synth_c` | `src/dyld/gen.py`: hand-built Mach-Os covering opcodes, trie terminals and chained pointer formats no linker emits |
 
-After adding a binary, regenerate its baseline with
-`tests/golden/make_baseline.sh` (needs the C++ oracle `build/moex-dump`) and
-add it to `CASES` in `crates/moex-core/tests/golden.rs`.
+After adding a binary, add it to `CASES` in
+`crates/moex-core/tests/golden.rs` and create its baseline with
+`MOEX_UPDATE_BASELINES=1 cargo test -p moex-core --test golden`.

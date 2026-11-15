@@ -23,7 +23,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build
         run: cargo build --release --locked -p moex-core -p moex-cli
-      # Unit tests, golden comparison against the C++ baselines and
+      # Unit tests, golden snapshot comparison and
       # malformed-input robustness.
       - name: Test
         run: cargo test --release --locked -p moex-core -p moex-cli

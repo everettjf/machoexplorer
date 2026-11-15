@@ -1,19 +1,22 @@
-//! Golden comparison against the C++ implementation.
+//! Snapshot test of the analysis output.
 //!
-//! `tests/golden/baseline/*.json.gz` holds the JSON dump produced by the
-//! original C++ `moex-dump` for every corpus file. The Rust dump must match
-//! node by node: same names, order, tables (every cell) and byte ranges.
+//! `tests/golden/baseline/*.json.gz` holds the JSON dump of every corpus
+//! file as this implementation produced it when the baseline was last
+//! accepted. The dump must match exactly: same nodes, order, tables (every
+//! cell) and byte ranges. A change that alters the output on purpose
+//! regenerates the baselines:
 //!
-//! While the port is in progress, subtrees listed in `PENDING` are skipped.
-//! When `PENDING` is empty the comparison is exact, including summary counts.
+//! ```text
+//! MOEX_UPDATE_BASELINES=1 cargo test -p moex-core --test golden
+//! ```
+//!
+//! and the resulting diff is reviewed like any other change (see
+//! `tests/golden/README.md`).
 
 use moex_core::dump::{dump_tree, DumpOptions};
 use serde_json::Value;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-
-/// View nodes (by display name) not ported yet. Remove entries as they land.
-const PENDING: &[&str] = &[];
 
 /// (corpus file relative to the repo root, baseline name)
 const CASES: &[(&str, &str)] = &[
@@ -57,18 +60,6 @@ const CASES: &[(&str, &str)] = &[
     ("tests/corpus/bin/swift_arm64", "swift_arm64"),
 ];
 
-/// `MOEX_GOLDEN_PORTED="Name A,Name B"` treats those nodes as ported, so a
-/// module can be checked before its entry is removed from `PENDING`.
-fn is_pending(name: &str) -> bool {
-    if !PENDING.contains(&name) {
-        return false;
-    }
-    match std::env::var("MOEX_GOLDEN_PORTED") {
-        Ok(v) => !v.split(',').any(|n| n.trim() == name),
-        Err(_) => true,
-    }
-}
-
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
@@ -76,10 +67,14 @@ fn repo_root() -> PathBuf {
         .unwrap()
 }
 
-fn load_baseline(name: &str) -> Value {
-    let path = repo_root()
+fn baseline_path(name: &str) -> PathBuf {
+    repo_root()
         .join("tests/golden/baseline")
-        .join(format!("{name}.json.gz"));
+        .join(format!("{name}.json.gz"))
+}
+
+fn load_baseline(name: &str) -> Value {
+    let path = baseline_path(name);
     let file =
         std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {}: {e}", path.display()));
     let mut text = String::new();
@@ -89,8 +84,8 @@ fn load_baseline(name: &str) -> Value {
     serde_json::from_str(&text).unwrap()
 }
 
-fn rust_dump(rel: &str) -> Value {
-    // Baselines are generated with TZ=UTC.
+fn rust_dump(rel: &str) -> Vec<u8> {
+    // Timestamps are rendered in local time; pin the zone.
     std::env::set_var("MOEX_TZ", "UTC");
     let root =
         moex_core::open(repo_root().join(rel)).unwrap_or_else(|e| panic!("parse {rel}: {e}"));
@@ -101,22 +96,17 @@ fn rust_dump(rel: &str) -> Value {
     };
     let mut out = Vec::new();
     dump_tree(&root, rel, &options, &mut out).unwrap();
-    serde_json::from_slice(&out).unwrap()
+    out
 }
 
-#[derive(Default)]
-struct Report {
-    compared: usize,
-    skipped: usize,
-    diffs: Vec<String>,
-}
-
-impl Report {
-    fn diff(&mut self, msg: String) {
-        if self.diffs.len() < 20 {
-            self.diffs.push(msg);
-        }
-    }
+fn write_baseline(name: &str, json: &[u8]) {
+    let file = std::fs::File::create(baseline_path(name)).unwrap();
+    // No timestamp in the gzip header, so equal dumps give equal files.
+    let mut gz = flate2::GzBuilder::new()
+        .mtime(0)
+        .write(file, flate2::Compression::best());
+    gz.write_all(json).unwrap();
+    gz.finish().unwrap();
 }
 
 fn count_nodes(node: &Value) -> usize {
@@ -126,179 +116,108 @@ fn count_nodes(node: &Value) -> usize {
         .unwrap_or(0)
 }
 
+/// Where two tables first differ.
 fn first_table_diff(want: &Value, got: &Value) -> String {
-    for key in [
-        "headers",
-        "totalRows",
-        "shownRows",
-        "tableMode",
-        "truncated",
-    ] {
-        if want.get(key) != got.get(key) {
-            return format!(
-                "table.{key}: want {:?}, got {:?}",
-                want.get(key),
-                got.get(key)
-            );
+    for key in ["headers", "totalRows", "shownRows", "tableMode", "truncated"] {
+        if want[key] != got[key] {
+            return format!("{key}: want {}, got {}", want[key], got[key]);
         }
     }
     let empty = Vec::new();
-    let (w, g) = (
-        want["rows"].as_array().unwrap_or(&empty),
-        got["rows"].as_array().unwrap_or(&empty),
-    );
-    for (i, (wr, gr)) in w.iter().zip(g).enumerate() {
-        if wr != gr {
-            return format!("row {i}:\n      want {wr}\n      got  {gr}");
+    let w = want["rows"].as_array().unwrap_or(&empty);
+    let g = got["rows"].as_array().unwrap_or(&empty);
+    for (i, (a, b)) in w.iter().zip(g).enumerate() {
+        if a != b {
+            return format!("row {i}:\n      want {a}\n      got  {b}");
         }
     }
     format!("row count: want {}, got {}", w.len(), g.len())
 }
 
-/// The C++ tool printed pointer-table values as `<process address of the
-/// entry>-><value>`, which changes on every run. The port prints the entry's
-/// file offset instead, so only the part after `->` is comparable.
-const POINTER_TABLE_NODES: &[&str] = &[
-    "Literal Pointers",
-    "Module Init Func Pointers",
-    "Module Term Func Pointers",
-];
-
-fn strip_pointer_prefix(table: &mut Value) {
-    fn strip(v: &mut Value) {
-        if let Some(text) = v.as_str() {
-            if let Some((_, tail)) = text.split_once("->") {
-                *v = Value::String(tail.to_string());
-            }
-        }
-    }
-    let Some(rows) = table.get_mut("rows").and_then(Value::as_array_mut) else {
+/// Differences between two nodes and their subtrees, at most `limit`.
+fn compare_node(want: &Value, got: &Value, diffs: &mut Vec<String>, limit: usize) {
+    if diffs.len() >= limit {
         return;
-    };
-    for row in rows {
-        if let Some(cell) = row.pointer_mut("/cells/Value") {
-            strip(cell);
-        }
-        if let Some(cell) = row.pointer_mut("/values/2") {
-            strip(cell);
+    }
+    let path = want["path"].as_str().unwrap_or("?").to_string();
+    for key in ["name", "path", "depth", "kind", "childIndex", "binary"] {
+        if want[key] != got[key] {
+            diffs.push(format!("{path}: {key}: want {}, got {}", want[key], got[key]));
         }
     }
-}
-
-fn compare_node(want: &Value, got: &Value, strict: bool, r: &mut Report) {
-    let name = want["name"].as_str().unwrap_or("");
-    if POINTER_TABLE_NODES.contains(&name)
-        && want.get("table").is_some()
-        && got.get("table").is_some()
-    {
-        let (mut want, mut got) = (want.clone(), got.clone());
-        strip_pointer_prefix(&mut want["table"]);
-        strip_pointer_prefix(&mut got["table"]);
-        return compare_node_inner(&want, &got, strict, r);
-    }
-    compare_node_inner(want, got, strict, r)
-}
-
-fn compare_node_inner(want: &Value, got: &Value, strict: bool, r: &mut Report) {
-    let path = want["path"].as_str().unwrap_or("?");
-    r.compared += 1;
-    let mut keys = vec!["name", "path", "depth", "kind", "binary"];
-    if strict {
-        keys.push("childIndex");
-    }
-    for key in keys {
-        if want.get(key) != got.get(key) {
-            r.diff(format!(
-                "{path}: {key}: want {:?}, got {:?}",
-                want.get(key),
-                got.get(key)
-            ));
-        }
-    }
-    match (want.get("table"), got.get("table")) {
-        (Some(w), Some(g)) if w != g => r.diff(format!("{path}: {}", first_table_diff(w, g))),
-        (Some(_), None) => r.diff(format!("{path}: table missing")),
-        (None, Some(_)) => r.diff(format!("{path}: unexpected table")),
-        _ => {}
-    }
-
-    let empty = Vec::new();
-    let pending = |n: &&Value| is_pending(n["name"].as_str().unwrap_or(""));
-    let want_children = want["children"].as_array().unwrap_or(&empty);
-    let got_children = got["children"].as_array().unwrap_or(&empty);
-    r.skipped += want_children
-        .iter()
-        .filter(pending)
-        .map(count_nodes)
-        .sum::<usize>();
-    let w: Vec<&Value> = want_children.iter().filter(|n| !pending(n)).collect();
-    let g: Vec<&Value> = got_children.iter().filter(|n| !pending(n)).collect();
-    if w.len() != g.len() {
-        let names = |v: &[&Value]| {
-            v.iter()
-                .map(|n| n["name"].as_str().unwrap_or("?").to_string())
-                .collect::<Vec<_>>()
-        };
-        r.diff(format!(
-            "{path}: children: want {:?}, got {:?}",
-            names(&w),
-            names(&g)
+    if want["table"] != got["table"] {
+        diffs.push(format!(
+            "{path}: {}",
+            first_table_diff(&want["table"], &got["table"])
         ));
     }
-    for (wc, gc) in w.iter().zip(&g) {
-        compare_node(wc, gc, strict, r);
+    let empty = Vec::new();
+    let w = want["children"].as_array().unwrap_or(&empty);
+    let g = got["children"].as_array().unwrap_or(&empty);
+    if w.len() != g.len() {
+        let names = |v: &[Value]| {
+            v.iter()
+                .map(|c| c["name"].as_str().unwrap_or("?").to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        diffs.push(format!(
+            "{path}: children: want [{}], got [{}]",
+            names(w),
+            names(g)
+        ));
+        return;
+    }
+    for (a, b) in w.iter().zip(g) {
+        compare_node(a, b, diffs, limit);
+    }
+}
+
+/// Whether the baseline of `name` can be reproduced on this platform.
+fn reproducible_here(name: &str) -> bool {
+    // C++ names are demangled by the platform's C++ runtime on macOS
+    // (libc++abi, which wrote the baselines) and Linux (libstdc++), and by
+    // the `cpp_demangle` crate on Windows; their text can differ.
+    match name {
+        "cxx_arm64" => cfg!(target_os = "macos"),
+        "dyld_chained_x86_64.dylib" | "dyld_classic_x86_64.dylib" => !cfg!(windows),
+        _ => true,
     }
 }
 
 #[test]
-fn matches_cpp_baseline() {
-    let strict = PENDING.is_empty();
+fn matches_baseline() {
+    let update = std::env::var_os("MOEX_UPDATE_BASELINES").is_some();
     let mut failures = Vec::new();
-    let (mut compared, mut skipped) = (0, 0);
+    let (mut files, mut nodes) = (0, 0);
     for (rel, name) in CASES {
-        // Demangled C++ names come from the system runtime on macOS and from
-        // a pure-Rust demangler elsewhere; only the former matches the
-        // baseline text exactly.
-        // Swift names are demangled by `xcrun swift-demangle`, macOS only.
-        let needs_macos = matches!(
-            *name,
-            "cxx_arm64" | "swift_arm64" | "sw_arm64" | "sw_x86_64"
-        );
-        if needs_macos && !cfg!(target_os = "macos") {
+        if !reproducible_here(name) {
             continue;
         }
+        let json = rust_dump(rel);
+        if update {
+            write_baseline(name, &json);
+        }
+        let got: Value = serde_json::from_slice(&json).unwrap();
         let want = load_baseline(name);
-        let got = rust_dump(rel);
-        let mut r = Report::default();
-        compare_node(&want["analysis"], &got["analysis"], strict, &mut r);
-        if strict {
-            for key in [
-                "summary",
-                "options",
-                "schemaVersion",
-                "generator",
-                "format",
-                "file",
-            ] {
-                if want[key] != got[key] {
-                    r.diff(format!("{key}: want {}, got {}", want[key], got[key]));
-                }
+        files += 1;
+        nodes += count_nodes(&got["analysis"]);
+        if want == got {
+            continue;
+        }
+        let mut diffs = Vec::new();
+        compare_node(&want["analysis"], &got["analysis"], &mut diffs, 20);
+        for key in ["summary", "options", "schemaVersion", "generator", "format", "file"] {
+            if want[key] != got[key] {
+                diffs.push(format!("{key}: want {}, got {}", want[key], got[key]));
             }
         }
-        compared += r.compared;
-        skipped += r.skipped;
-        if !r.diffs.is_empty() {
-            failures.push(format!("{rel}:\n    {}", r.diffs.join("\n    ")));
-        }
+        failures.push(format!("{rel}:\n    {}", diffs.join("\n    ")));
     }
-    println!(
-        "golden: {} files, {compared} nodes compared, {skipped} pending ({:.1}% ported)",
-        CASES.len(),
-        100.0 * compared as f64 / (compared + skipped).max(1) as f64
-    );
+    println!("golden: {files} files, {nodes} nodes compared");
     assert!(
         failures.is_empty(),
-        "mismatch against C++ baseline:\n{}",
+        "output differs from the baseline (MOEX_UPDATE_BASELINES=1 accepts it):\n{}",
         failures.join("\n")
     );
 }

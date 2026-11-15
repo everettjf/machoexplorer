@@ -15,7 +15,7 @@ has been removed; Qt, CMake and a system Capstone are no longer needed.
 
 Platform-specific behaviour:
 - Attach by PID (Memory Snapshot) works on macOS only. Attach by PID (Executable Path) is implemented for macOS and Linux.
-- C++ symbol demangling uses the system `libc++abi` on macOS and the `cpp_demangle` crate elsewhere; the text can differ for heavily templated names.
+- C++ symbol demangling uses the C++ runtime (`libc++abi` on macOS, `libstdc++` on Linux) and the `cpp_demangle` crate on Windows, where the text can differ.
 - Swift demangling uses Swift's own demangler as bundled by the `symbolic-demangle` crate (C++ sources compiled by `cc`, so a C++ compiler is needed to build). It works on every platform and starts no process. Type sugar is not synthesised (`Swift.Optional<Swift.Int>`, not `Swift.Int?`), and manglings newer than the bundled demangler stay mangled.
 
 ## Workspace layout
@@ -26,7 +26,7 @@ Platform-specific behaviour:
 | `crates/moex-app` | GPUI desktop app, binary `MachOExplorer`. |
 | `fuzz/` | cargo-fuzz target `parse_dump`. Separate workspace, not built by default. |
 | `tests/regression/` | Shell regression for the `moex` binary. |
-| `tests/golden/` | Baselines from the last C++ release and tooling around them. |
+| `tests/golden/` | Snapshots of the analysis of every corpus file. |
 | `tests/corpus/` | Checked-in test binaries and their sources. |
 | `sample/` | Sample binaries `simple` and `complex`. |
 
@@ -99,7 +99,7 @@ tests/regression/run_all.sh
 
 `cargo test --workspace` covers:
 - unit tests in all three crates;
-- the golden comparison, `crates/moex-core/tests/golden.rs`: the Rust JSON dump of every file in `sample/` and `tests/corpus/bin` must equal the baseline in `tests/golden/baseline/*.json.gz`, which the last C++ release produced. See [tests/golden/README.md](tests/golden/README.md);
+- the golden comparison, `crates/moex-core/tests/golden.rs`: the Rust JSON dump of every file in `sample/` and `tests/corpus/bin` must equal the snapshot in `tests/golden/baseline/*.json.gz`. See [tests/golden/README.md](tests/golden/README.md);
 - malformed-input robustness, `crates/moex-core/tests/robustness.rs`: truncated and mutated corpus files must not panic. Mutations are deterministic. `MOEX_ROBUSTNESS_ITERS` sets the number of mutants per file (default 24);
 - GUI tests, `crates/moex-app/tests/ui.rs`, which open headless windows.
 
@@ -117,10 +117,9 @@ cargo install cargo-fuzz
 cargo +nightly fuzz run parse_dump tests/corpus/bin sample -- -max_len=262144
 ```
 
-### Output parity with the C++ implementation
-[docs/rust-port-quirks.md](docs/rust-port-quirks.md) lists the C++ behaviours
-that the Rust code reproduces on purpose (marked `QUIRK(parity)` in the
-source) and the places where it intentionally differs.
+### Analysis notes
+[docs/analysis-notes.md](docs/analysis-notes.md) describes how the output
+differs from the C++ releases and lists the known limits.
 
 ## CI
 `.github/workflows/rust.yml` runs on pushes to `master`, on pull requests and

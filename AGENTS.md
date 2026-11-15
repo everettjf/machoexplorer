@@ -18,7 +18,7 @@ This guide describes how autonomous contributors should work in this repository 
 - `fuzz/`: cargo-fuzz target `parse_dump` (its own workspace, not built by `cargo build`/`cargo test`)
 - `tests/`:
   - `regression/` shell regression for the `moex` binary; `run_all.sh` is the entry
-  - `golden/` JSON baselines from the last C++ release plus tooling (see `tests/golden/README.md`)
+  - `golden/` JSON snapshots of the analysis of every corpus file (see `tests/golden/README.md`)
   - `corpus/` checked-in test binaries and their sources (see `tests/corpus/README.md`)
 - `sample/`: reproducible sample binaries (`simple`, `complex`)
 - `scripts/`:
@@ -31,7 +31,7 @@ This guide describes how autonomous contributors should work in this repository 
 - `packaging/`: `macos/MachOExplorer.icns`, `linux/machoexplorer.desktop` + icon, `windows/MachOExplorer.iss` (Inno Setup)
 - `deploy.sh`: one-command macOS release pipeline (bump/test/bundle/sign/notarize/tag/release/homebrew)
 - `.github/workflows/rust.yml`: CI (macOS / Linux / Windows matrix)
-- `docs/`: `release_packaging.md`, `rust-port-quirks.md` (C++ quirks kept for output parity, and intentional differences)
+- `docs/`: `release_packaging.md`, `analysis-notes.md` (what the analysis shows, changes from the C++ releases, known limits)
 
 ## Build & Run (macOS)
 Requirements: a stable Rust toolchain and the Xcode command line tools.
@@ -52,9 +52,9 @@ cargo build --release -p moex-cli
 tests/regression/run_all.sh
 ```
 
-- `cargo test --workspace` runs the unit tests, the golden comparison against the C++ baselines (`crates/moex-core/tests/golden.rs`), the malformed-input robustness tests (`crates/moex-core/tests/robustness.rs`) and the GUI tests (`crates/moex-app/tests/ui.rs`, headless windows).
+- `cargo test --workspace` runs the unit tests, the golden snapshot comparison (`crates/moex-core/tests/golden.rs`), the malformed-input robustness tests (`crates/moex-core/tests/robustness.rs`) and the GUI tests (`crates/moex-app/tests/ui.rs`, headless windows).
 - `tests/regression/run_all.sh` drives the release `moex` binary (`target/release/moex`, override with `MOEX_BIN`).
-- The golden test requires the Rust JSON dump to equal the baselines exactly. If a change alters dump output on purpose, read `tests/golden/README.md` and `docs/rust-port-quirks.md` first.
+- The golden test requires the JSON dump to equal the baselines exactly. If a change alters dump output on purpose, check the new output against Apple's tools (`otool`, `dyld_info`, `nm`), regenerate with `MOEX_UPDATE_BASELINES=1 cargo test -p moex-core --test golden`, and review the baseline diff (see `tests/golden/README.md`).
 
 ## Release Workflows
 
@@ -137,7 +137,7 @@ Produces `dist/linux/MachOExplorer-<version>-linux-<arch>.tar.gz`. Build depende
 - Avoid broad formatting-only churn.
 - Keep changes scoped and reversible.
 - Add/adjust regression coverage for parser hardening changes when possible (a robustness or golden case, or an input in `tests/regression/run_crash_regression.sh`).
-- Behaviour kept only for output parity with the C++ implementation is marked `QUIRK(parity)` in the code and listed in `docs/rust-port-quirks.md`; update that file when such behaviour changes.
+- Decode according to the format, not according to what the C++ releases printed. Known gaps are listed in `docs/analysis-notes.md`; update it when one is closed or a new one is found.
 
 ## Safety Rules
 - Do not use destructive git commands (`reset --hard`, forced checkout) unless explicitly requested.

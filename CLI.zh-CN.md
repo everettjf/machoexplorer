@@ -50,7 +50,7 @@ MachOExplorer 2.x 的图形程序带有 `--cli` 模式，另有若干独立的 `
 - 不再有 `moex-parse`、`moex-diff`、`moex-cache-list`、`moex-cache-extract` 这些二进制。
 
 行为上有意为之的差异（例如 `--limit=` 的值不是数字时，现在是参数错误而不是崩溃）列在
-[docs/rust-port-quirks.md](docs/rust-port-quirks.md)。
+[docs/analysis-notes.md](docs/analysis-notes.md)。
 
 ## `moex dump`
 

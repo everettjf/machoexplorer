@@ -100,8 +100,8 @@ brew update && brew tap everettjf/homebrew-tap && brew install --cask machoexplo
 请从源码构建（见[从源码构建](#从源码构建)），并欢迎反馈实际情况。
 
 通过内存快照附加进程仅限 macOS。Swift 符号由内置的 Swift 官方 demangler 还原，所有平台均可用。
-C++ 符号在 macOS 上由系统 `libc++abi` 还原，在其他平台由 `cpp_demangle` crate 还原，
-因此不同平台上还原出的文本可能略有差异。
+C++ 符号在 macOS 和 Linux 上由 C++ 运行库还原，在 Windows 上由 `cpp_demangle` crate 还原，
+后者还原出的文本可能不同。
 
 ## 快速开始
 1. 启动 MachOExplorer，或直接打开文件：`MachOExplorer <路径>`。也可以把文件拖到窗口上。
@@ -155,8 +155,8 @@ JSON 输出便于自动化且稳定：包含 `schemaVersion`、`summary`、节�
 | `moex-cache-list ...` | `moex cache-list ...` |
 | `moex-cache-extract ...` | `moex cache-extract ...` |
 
-参数与退出码保持不变，并且在测试语料上，JSON 输出会与最后一个 C++ 版本的输出逐项比对。
-少数有意为之的差异列在 [docs/rust-port-quirks.md](docs/rust-port-quirks.md)。
+参数与退出码保持不变。分析结果本身改为严格按 Mach-O 格式解码，2.x 版本中不正确的地方已修正，
+具体变化列在 [docs/analysis-notes.md](docs/analysis-notes.md)。
 `MachOExplorer --cli` 本身已不存在：`MachOExplorer` 二进制只是图形界面。
 详见 [CLI.zh-CN.md](CLI.zh-CN.md#从-2x-迁移)。
 
@@ -190,7 +190,7 @@ sudo apt-get install -y build-essential pkg-config clang \
 - 开发文档（构建 / 测试 / 发布）：[DEVELOP.md](DEVELOP.md)
 - CLI 文档：[CLI.zh-CN.md](CLI.zh-CN.md)
 - 打包说明：[docs/release_packaging.md](docs/release_packaging.md)
-- 与 C++ 实现的差异：[docs/rust-port-quirks.md](docs/rust-port-quirks.md)
+- 相对 2.x 的分析变化与已知限制：[docs/analysis-notes.md](docs/analysis-notes.md)
 
 ## 贡献
 欢迎提交 Issue 和 PR：

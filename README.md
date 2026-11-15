@@ -106,8 +106,8 @@ Build from source (see [Build from source](#build-from-source)) and please repor
 
 Attaching to a process by memory snapshot is macOS only. Swift symbols are demangled by
 Swift's own demangler, built into the tool, on every platform. C++ symbols are demangled by
-the system `libc++abi` on macOS and by the `cpp_demangle` crate elsewhere, so demangled text
-can differ slightly between platforms.
+the C++ runtime on macOS and Linux and by the `cpp_demangle` crate on Windows, where the text
+can differ.
 
 ## Quick start
 1. Launch MachOExplorer, or open a file directly: `MachOExplorer <path>`. You can also drop a
@@ -164,9 +164,9 @@ are now subcommands of one binary:
 | `moex-cache-list ...` | `moex cache-list ...` |
 | `moex-cache-extract ...` | `moex cache-extract ...` |
 
-Options and exit codes are the same, and on the test corpus the JSON dump is checked against the
-output of the last C++ release. The few intentional differences are listed in
-[docs/rust-port-quirks.md](docs/rust-port-quirks.md). `MachOExplorer --cli` itself no longer
+Options and exit codes are the same. The analysis itself now follows the Mach-O format where
+the 2.x releases did not; what changed is listed in
+[docs/analysis-notes.md](docs/analysis-notes.md). `MachOExplorer --cli` itself no longer
 exists: the `MachOExplorer` binary is the GUI only. Details are in
 [CLI.md](CLI.md#migrating-from-2x).
 
@@ -200,7 +200,7 @@ See [DEVELOP.md](DEVELOP.md) for the full developer, testing, and release workfl
 - Developer guide (build / test / release): [DEVELOP.md](DEVELOP.md)
 - CLI guide: [CLI.md](CLI.md)
 - Packaging notes: [docs/release_packaging.md](docs/release_packaging.md)
-- Differences from the C++ implementation: [docs/rust-port-quirks.md](docs/rust-port-quirks.md)
+- Changes from the 2.x analysis and known limits: [docs/analysis-notes.md](docs/analysis-notes.md)
 
 ## Contributing
 Issues and pull requests are welcome:
