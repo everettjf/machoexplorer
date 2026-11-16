@@ -4,7 +4,7 @@ members = ["crates/moex-core", "crates/moex-cli", "crates/moex-app"]
 default-members = ["crates/moex-core", "crates/moex-cli"]
 
 [workspace.package]
-version = "3.0.0"
+version = "3.0.1"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/everettjf/MachOExplorer"

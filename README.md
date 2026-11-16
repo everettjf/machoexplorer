@@ -21,7 +21,7 @@ MachOExplorer turns an opaque Mach-O file into a navigable tree. Open a binary a
 file structure all the way down to load commands, sections, symbols, disassembly, and Apple-specific
 metadata (Objective-C, Swift, code signing) — in one window, or fully scripted from the command line.
 
-Current major release: `v3.0.0` ([release page](https://github.com/everettjf/MachOExplorer/releases/tag/v3.0.0)).
+Current major release: `v3.0.1` ([release page](https://github.com/everettjf/MachOExplorer/releases/tag/v3.0.1)).
 Version 3 is a rewrite in Rust with a [GPUI](https://www.gpui.rs/) interface; it replaces the
 C++/Qt implementation of the 2.x releases. If you used the 2.x command-line tools, see
 [Migrating from 2.x](#migrating-from-2x).
