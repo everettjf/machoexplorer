@@ -10,7 +10,7 @@ use std::sync::atomic::AtomicBool;
 fn print_usage() {
     eprint!(
         "usage: moex cache-extract [--compact] [--all] [--exact] [--dry-run] [--json] [--max=N] <dyld_shared_cache_file> <image-path-or-substr> <output-macho-or-dir>\n\
-         \x20 --compact   rewrite segment file offsets for compact output\n\
+         \x20 --compact   pack segments back to back instead of keeping their recorded file offsets\n\
          \x20 --all       extract all matched images into output directory\n\
          \x20 --exact     exact path match (default: substring)\n\
          \x20 --dry-run   print extraction plan without writing output files\n\

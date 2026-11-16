@@ -49,6 +49,5 @@ by the `cpp_demangle` crate on Windows, and the text can differ, so:
 | --- | --- |
 | `cxx_arm64` | macOS |
 | `dyld_chained_x86_64.dylib`, `dyld_classic_x86_64.dylib` | macOS, Linux |
-| `complex` | macOS, Linux (Capstone built with MSVC prints one negative 32-bit immediate differently) |
 
 Everything else, including the Swift cases, is compared on every platform.

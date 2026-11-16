@@ -56,8 +56,11 @@ pad_to() {
 # make_synthetic_cache <file>: a 0x1000-byte single-file dyld shared cache
 # with one mapping (vm 0x10000 -> file 0) and two images:
 #   /usr/lib/libsynthetic.dylib  64-bit Mach-O at file offset 0x200 with a
-#                                __TEXT segment (0x100 bytes) and a
-#                                __LINKEDIT segment (0x80 bytes at 0x400)
+#                                __TEXT segment (0x100 bytes), a
+#                                __LINKEDIT segment (0x80 bytes at 0x400,
+#                                recorded file offset 0x4000) and an
+#                                LC_SYMTAB with one symbol, _syn: nlist at
+#                                0x400, 8 bytes of strings at 0x410
 #   /usr/lib/libnotmacho.dylib   points at zero bytes
 make_synthetic_cache() {
   local f="$1" h=""
@@ -72,9 +75,14 @@ make_synthetic_cache() {
   h+="$(hexstr '/usr/lib/libnotmacho.dylib' 27)"        # at 236
   write_hex "${f}" "${h}"
   pad_to "${f}" 512
-  h="$(le32 0xfeedfacf)$(le32 0x0100000c)$(le32 0)$(le32 6)$(le32 2)$(le32 144)$(le32 0)$(le32 0)"
+  h="$(le32 0xfeedfacf)$(le32 0x0100000c)$(le32 0)$(le32 6)$(le32 3)$(le32 168)$(le32 0)$(le32 0)"
   h+="$(le32 0x19)$(le32 72)$(hexstr '__TEXT' 16)$(le64 0x10200)$(le64 0x100)$(le64 0)$(le64 0x100)$(le32 5)$(le32 5)$(le32 0)$(le32 0)"
   h+="$(le32 0x19)$(le32 72)$(hexstr '__LINKEDIT' 16)$(le64 0x10400)$(le64 0x80)$(le64 0x4000)$(le64 0x80)$(le32 1)$(le32 1)$(le32 0)$(le32 0)"
+  h+="$(le32 0x2)$(le32 24)$(le32 0x4000)$(le32 1)$(le32 0x4010)$(le32 8)"   # LC_SYMTAB
+  write_hex "${f}" "${h}"
+  pad_to "${f}" 1024
+  h="$(le32 1)0f010000$(le64 0x10200)"                  # nlist_64: _syn, N_SECT | N_EXT
+  h+="$(hexstr '' 1)$(hexstr '_syn' 7)"                 # string table
   write_hex "${f}" "${h}"
   pad_to "${f}" 4096
 }

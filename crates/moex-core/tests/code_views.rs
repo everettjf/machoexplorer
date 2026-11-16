@@ -122,8 +122,10 @@ fn disassembly_rows() {
     ] {
         let found = disassembly(rel);
         assert!(!found.is_empty(), "{rel}");
+        // `__text` comes first; stub sections can be a few rows long.
+        assert!(found[0].1.rows.len() > 10, "{rel}");
         for (_, table) in &found {
-            assert!(table.rows.len() > 10, "{rel}");
+            assert!(!table.rows.is_empty(), "{rel}");
             for (i, r) in table.rows.iter().enumerate() {
                 assert_eq!(r.cells.len(), table.headers.len(), "{rel} row {i}");
                 // Every row is backed by its bytes, in address order.
@@ -140,6 +142,88 @@ fn disassembly_rows() {
             );
         }
     }
+}
+
+#[test]
+fn every_code_section_is_disassembled() {
+    // hello_arm64 has `__text` and `__stubs`; each stub is
+    // `adrp x16` / `ldr x16, [x16, ...]` / `br x16`.
+    let found = disassembly("tests/corpus/bin/hello_arm64");
+    assert_eq!(found.len(), 2);
+    let stubs = &found[1].1;
+    assert_eq!(stubs.rows.len() % 3, 0);
+    for stub in stubs.rows.chunks(3) {
+        assert!(
+            stub[0].cells[2].starts_with("adrp x16, "),
+            "{:?}",
+            stub[0].cells
+        );
+        assert!(
+            stub[1].cells[2].starts_with("ldr x16, [x16"),
+            "{:?}",
+            stub[1].cells
+        );
+        assert_eq!(stub[2].cells[2], "br x16");
+    }
+    // The stubs are swept for references too: each loads its GOT slot.
+    let root = open("tests/corpus/bin/hello_arm64");
+    let (_, xrefs) = &tables(&root, "Xref Report")[0];
+    let from_stubs = xrefs
+        .rows
+        .iter()
+        .filter(|r| r.cells[3].starts_with("__TEXT/__stubs [load]"))
+        .count();
+    assert_eq!(from_stubs, stubs.rows.len() / 3);
+}
+
+#[test]
+fn big_endian_object_file() {
+    // A PowerPC object: everything is stored big-endian. The instructions
+    // were checked against `llvm-objdump -d`, the relocations against
+    // `llvm-objdump -r`.
+    let root = open("tests/corpus/bin/hello_ppc.o");
+    assert_eq!(root.children()[0].name(), "Mach Header (ppc)");
+    let (_, code) = &tables(&root, "Disassembly (Capstone)")[0];
+    let text: Vec<&str> = code.rows.iter().map(|r| r.cells[2].as_str()).collect();
+    assert_eq!(
+        text,
+        [
+            "mflr r0",
+            "stw r0, 8(r1)",
+            "stwu r1, -0x40(r1)",
+            "bl 0x24",
+            "bl 0x10",
+            "addi r1, r1, 0x40",
+            "lwz r0, 8(r1)",
+            "mtlr r0",
+            "blr",
+            "li r3, 0x2a",
+            "blr"
+        ]
+    );
+    assert_eq!(row(code, "00000000")[3], "_main");
+    assert_eq!(row(code, "00000024")[3], "_helper");
+    let cell = |name: &str, r: usize, c: usize| tables(&root, name)[0].1.rows[r].cells[c].clone();
+    assert_eq!(cell("C String Literals", 1, 3), "ppc");
+    assert_eq!(cell("Floating Point Literals", 0, 2), "2.5");
+    // The initializer pointer holds 0; its relocation names `_helper`.
+    assert_eq!(cell("Module Init Func Pointers", 0, 2), "20C->24");
+    let (_, xrefs) = &tables(&root, "Xref Report")[0];
+    let referrers: Vec<&str> = xrefs
+        .rows
+        .iter()
+        .filter(|r| r.cells[0] == "00000024" && r.cells[3].contains(" @ raw "))
+        .map(|r| r.cells[3].as_str())
+        .collect();
+    assert_eq!(
+        referrers,
+        [
+            "__DATA/__mod_init_func [pointer] @ raw 0x20C",
+            "__TEXT/__text [call] @ raw 0x1D8 vm 0xC"
+        ]
+    );
+    // The call to the undefined `_puts` has no address to refer to.
+    assert!(xrefs.rows.iter().all(|r| !r.cells[3].contains("vm 0x10")));
 }
 
 #[test]

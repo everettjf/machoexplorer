@@ -13,6 +13,7 @@ sources and notes on how each was built.
 | `cxx_arm64` | `src/cxx.cpp` |
 | `dyld_classic_x86_64.dylib` | `src/dyld/` with `-Wl,-no_fixup_chains` (weak/lazy binds, re-exports, classic opcodes) |
 | `dyld_chained_x86_64.dylib` | `src/dyld/` with chained fixups (re-export terminals) |
+| `hello_ppc.o` | `src/ppc/gen.py`: a hand-built big-endian (PowerPC) object file; no current toolchain targets Mach-O PowerPC |
 | `dyld_synth_b`, `dyld_synth_c` | `src/dyld/gen.py`: hand-built Mach-Os covering opcodes, trie terminals and chained pointer formats no linker emits |
 
 After adding a binary, add it to `CASES` in

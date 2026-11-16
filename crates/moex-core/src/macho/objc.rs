@@ -468,7 +468,7 @@ impl<'a> ObjcResolver<'a> {
     }
 
     /// The pointer stored at file offset `off`, decoded.
-    pub fn pointer_at(&self, off: u64) -> Option<Pointer<'a>> {
+    pub fn pointer_at(&self, off: u64) -> Option<Pointer<'_>> {
         self.decoder.read(off, self.layout.is64)
     }
 

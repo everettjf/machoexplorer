@@ -2,7 +2,8 @@
 //! lazy / non-lazy symbol pointers and symbol stubs.
 
 use super::{chunks, pointer_offsets, pointer_text, SectionContext};
-use crate::hex::{as_address, as_hex_data, as_short_hex_string};
+use crate::hex::{as_address, as_hex_data, as_short_hex_string, utf8_safe};
+use crate::macho::ptr::{Pointer, PointerDecoder};
 use crate::macho::{MachHeader, Section};
 use crate::view::Table;
 
@@ -12,6 +13,18 @@ fn pointer_size(section: &Section) -> u64 {
     } else {
         4
     }
+}
+
+/// Display text of the pointer at file offset `offset`. A slot the weak
+/// bind stream names is followed by `(weak <symbol>)`: dyld points it at
+/// the definition of that symbol that wins across all images, which is the
+/// address shown unless another image overrides it.
+fn target_text(decoder: &PointerDecoder<'_>, offset: u64, pointer: Pointer<'_>) -> String {
+    let mut text = pointer_text(pointer);
+    if let (Pointer::Address(_), Some(name)) = (pointer, decoder.weak_symbol(offset)) {
+        text.push_str(&format!(" (weak {})", utf8_safe(name)));
+    }
+    text
 }
 
 /// "Literal Pointers" / "Module Init Func Pointers" / "Module Term Func
@@ -26,7 +39,11 @@ pub(super) fn pointers(context: &SectionContext, section: &Section) -> Table {
         let Some(pointer) = decoder.read(offset, section.is64) else {
             break;
         };
-        let text = format!("{}->{}", as_short_hex_string(offset), pointer_text(pointer));
+        let text = format!(
+            "{}->{}",
+            as_short_hex_string(offset),
+            target_text(&decoder, offset, pointer)
+        );
         t.add_data(
             offset,
             size,
@@ -53,7 +70,7 @@ pub(super) fn indirect_pointers(context: &SectionContext, section: &Section) -> 
             [
                 as_address(offset),
                 "Indirect Pointer".to_string(),
-                pointer_text(pointer),
+                target_text(&decoder, offset, pointer),
             ],
         );
     }

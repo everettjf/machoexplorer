@@ -12,6 +12,7 @@ pub mod header;
 pub mod linkedit;
 pub mod objc;
 pub mod ptr;
+pub mod reloc;
 pub mod segment;
 pub mod swift;
 pub mod symtab;

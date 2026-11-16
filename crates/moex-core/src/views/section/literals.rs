@@ -35,14 +35,15 @@ pub(super) fn cstrings(mh: &MachHeader, section: &Section) -> Table {
 ///
 /// 4- and 8-byte literals are IEEE 754 single and double precision numbers.
 /// A 16-byte literal has no single meaning (vector constants, masks, long
-/// doubles), so it is shown as the 128-bit little-endian integer it stores
+/// doubles), so it is shown as the 128-bit integer it stores (in the byte
+/// order of the file)
 /// together with its reading as two doubles.
 fn literals(mh: &MachHeader, section: &Section, unit: u64) -> Table {
     let mut t = Table::new();
     t.set_headers(&["Offset", "Description", "Value", "Bytes"]);
     t.set_widths(&[100, 160, 320, 300]);
     for (offset, bytes) in chunks(mh, section, unit) {
-        let (description, value) = describe(bytes);
+        let (description, value) = describe(bytes, mh.big_endian);
         t.add_data(
             offset,
             unit,
@@ -57,26 +58,40 @@ fn literals(mh: &MachHeader, section: &Section, unit: u64) -> Table {
     t
 }
 
-/// `(description, value)` cells for the bytes of one literal.
-fn describe(bytes: &[u8]) -> (&'static str, String) {
+/// `(description, value)` cells for the bytes of one literal, stored in
+/// the byte order of the file.
+fn describe(bytes: &[u8], big_endian: bool) -> (&'static str, String) {
+    let f64_of = |b: [u8; 8]| {
+        if big_endian {
+            f64::from_be_bytes(b)
+        } else {
+            f64::from_le_bytes(b)
+        }
+    };
     if let Ok(b) = <[u8; 4]>::try_from(bytes) {
-        ("Float", format!("{:?}", f32::from_le_bytes(b)))
+        let value = if big_endian {
+            f32::from_be_bytes(b)
+        } else {
+            f32::from_le_bytes(b)
+        };
+        ("Float", format!("{value:?}"))
     } else if let Ok(b) = <[u8; 8]>::try_from(bytes) {
-        ("Double", format!("{:?}", f64::from_le_bytes(b)))
+        ("Double", format!("{:?}", f64_of(b)))
     } else if let Ok(b) = <[u8; 16]>::try_from(bytes) {
-        let (lo, hi) = b.split_at(8);
-        let double = |half: &[u8]| {
-            <[u8; 8]>::try_from(half)
-                .map(f64::from_le_bytes)
-                .unwrap_or(f64::NAN)
+        let (first, second) = b.split_at(8);
+        let double = |half: &[u8]| <[u8; 8]>::try_from(half).map(f64_of).unwrap_or(f64::NAN);
+        let integer = if big_endian {
+            u128::from_be_bytes(b)
+        } else {
+            u128::from_le_bytes(b)
         };
         (
             "16-byte Literal",
             format!(
                 "0x{:032X} (doubles: {:?}, {:?})",
-                u128::from_le_bytes(b),
-                double(lo),
-                double(hi)
+                integer,
+                double(first),
+                double(second)
             ),
         )
     } else {
@@ -94,4 +109,32 @@ pub(super) fn literals8(mh: &MachHeader, section: &Section) -> Table {
 
 pub(super) fn literals16(mh: &MachHeader, section: &Section) -> Table {
     literals(mh, section, 16)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn literals_follow_the_byte_order_of_the_file() {
+        let value = |bytes: &[u8], big_endian| describe(bytes, big_endian).1;
+        assert_eq!(value(&2.5f32.to_le_bytes(), false), "2.5");
+        assert_eq!(value(&2.5f32.to_be_bytes(), true), "2.5");
+        assert_eq!(value(&(-0.125f64).to_le_bytes(), false), "-0.125");
+        assert_eq!(value(&(-0.125f64).to_be_bytes(), true), "-0.125");
+        // 16 bytes: the integer, then the two halves in file order.
+        let mut little = 1.0f64.to_le_bytes().to_vec();
+        little.extend(2.0f64.to_le_bytes());
+        assert_eq!(
+            value(&little, false),
+            "0x40000000000000003FF0000000000000 (doubles: 1.0, 2.0)"
+        );
+        let mut big = 1.0f64.to_be_bytes().to_vec();
+        big.extend(2.0f64.to_be_bytes());
+        assert_eq!(
+            value(&big, true),
+            "0x3FF00000000000004000000000000000 (doubles: 1.0, 2.0)"
+        );
+        assert_eq!(describe(&[1, 2, 3], false), ("Literal", String::new()));
+    }
 }

@@ -1,9 +1,9 @@
-//! "Disassembly (Capstone)": the instructions of `__TEXT,__text` with the
+//! "Disassembly (Capstone)": the instructions of a code section with the
 //! symbol at each address, function starts and data-in-code ranges.
 
 use crate::hex::{as_address, as_hex_data};
 use crate::macho::disasm::{
-    data_text, function_start_addresses, insn_text, regions, DisasmError, Disassembler, Item,
+    data_text_in, function_start_addresses, insn_text, regions, DisasmError, Disassembler, Item,
     SymbolLookup,
 };
 use crate::macho::{DataInCodeEntry, MachHeader, Section};
@@ -50,11 +50,17 @@ pub(super) fn disassembly(mh: &MachHeader, section: &Section) -> Table {
     let result = disassembler.run(code, base, &layout, |item| {
         let (address, bytes, text, kind) = match item {
             Item::Code { insn, .. } => (insn.address(), insn.bytes(), insn_text(insn), None),
+            Item::Extra {
+                address,
+                bytes,
+                insn,
+                ..
+            } => (address, bytes, insn.text(), None),
             Item::Data {
                 address,
                 bytes,
                 kind,
-            } => (address, bytes, data_text(bytes), kind),
+            } => (address, bytes, data_text_in(bytes, mh.big_endian), kind),
         };
         let mut notes = String::new();
         if function_starts.contains(&address) {

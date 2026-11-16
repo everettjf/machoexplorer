@@ -1,13 +1,15 @@
 //! Machine-code disassembly (Capstone), the code/data layout of a code
 //! section, and address → symbol lookup.
 
+pub mod extra;
+
 use super::{MachHeader, Section};
 use crate::consts::{
     CPU_SUBTYPE_MASK, CPU_TYPE_ARM, CPU_TYPE_ARM64, CPU_TYPE_ARM64_32, CPU_TYPE_I386,
-    CPU_TYPE_X86_64,
+    CPU_TYPE_POWERPC, CPU_TYPE_POWERPC64, CPU_TYPE_X86_64,
 };
 use crate::hex::{as_short_hex_string, utf8_safe};
-use capstone::{Arch, Capstone, ExtraMode, Insn, Mode};
+use capstone::{Arch, Capstone, Endian, ExtraMode, Insn, Mode};
 use std::collections::HashMap;
 
 const N_STAB: u8 = 0xe0;
@@ -50,6 +52,29 @@ pub struct Region {
     pub start: usize,
     pub end: usize,
     pub kind: RegionKind,
+}
+
+const SECTION_TYPE: u32 = 0x0000_00ff;
+const S_ZEROFILL: u32 = 0x1;
+const S_SYMBOL_STUBS: u32 = 0x8;
+const S_GB_ZEROFILL: u32 = 0xc;
+const S_THREAD_LOCAL_ZEROFILL: u32 = 0x12;
+const S_ATTR_PURE_INSTRUCTIONS: u32 = 0x8000_0000;
+const S_ATTR_SOME_INSTRUCTIONS: u32 = 0x0000_0400;
+
+/// True when the section holds machine code: its attributes say so
+/// (`S_ATTR_PURE_INSTRUCTIONS`, `S_ATTR_SOME_INSTRUCTIONS`), it is a symbol
+/// stub section, or it is `__TEXT,__text` (which old tools emitted without
+/// the attributes). Covers `__stubs`, `__stub_helper`, `__auth_stubs`,
+/// `__objc_stubs`, and the `__TEXT_EXEC,__text` of kernels and kexts.
+pub fn is_code_section(section: &Section) -> bool {
+    let kind = section.flags & SECTION_TYPE;
+    if matches!(kind, S_ZEROFILL | S_GB_ZEROFILL | S_THREAD_LOCAL_ZEROFILL) {
+        return false;
+    }
+    section.flags & (S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS) != 0
+        || kind == S_SYMBOL_STUBS
+        || (section.segname == "__TEXT" && section.sectname == "__text")
 }
 
 /// Function entry addresses from `LC_FUNCTION_STARTS`: the running sum of
@@ -232,6 +257,13 @@ pub enum Item<'a> {
         /// First item of its region: nothing decoded earlier leads here.
         region_start: bool,
     },
+    /// An instruction Capstone does not know, decoded by [`extra`].
+    Extra {
+        address: u64,
+        bytes: &'a [u8],
+        insn: &'a extra::Extra,
+        region_start: bool,
+    },
     /// Bytes that are not an instruction: an `LC_DATA_IN_CODE` range
     /// (`kind` is its `DICE_KIND_*`) or, with `kind` `None`, bytes that do
     /// not decode.
@@ -246,15 +278,57 @@ pub enum Item<'a> {
 pub fn insn_text(insn: &Insn<'_>) -> String {
     let mnemonic = insn.mnemonic().unwrap_or("");
     match insn.op_str() {
-        Some(operands) if !operands.is_empty() => format!("{mnemonic} {operands}"),
+        Some(operands) if !operands.is_empty() => {
+            format!("{mnemonic} {}", narrow_negative_immediates(operands))
+        }
         _ => mnemonic.to_string(),
     }
+}
+
+/// Undoes a rendering fault of Capstone built with MSVC: a negative 32-bit
+/// immediate comes out sign-extended to 64 bits and then negated as an
+/// unsigned number (`#-0xffffffff80000000` for `#-0x80000000`). No real
+/// immediate has a magnitude above 2^63, so such a number is cut back to
+/// its low 32 bits; everything else is returned as it is.
+fn narrow_negative_immediates(operands: &str) -> std::borrow::Cow<'_, str> {
+    const MARK: &str = "-0x";
+    if !operands.contains("-0xffffffff") {
+        return operands.into();
+    }
+    let mut out = String::with_capacity(operands.len());
+    let mut rest = operands;
+    while let Some(at) = rest.find(MARK) {
+        let digits_at = at + MARK.len();
+        let digits = rest
+            .get(digits_at..)
+            .map_or(0, |d| d.bytes().take_while(u8::is_ascii_hexdigit).count());
+        let number = rest.get(digits_at..digits_at + digits).unwrap_or("");
+        out.push_str(rest.get(..digits_at).unwrap_or(""));
+        match u64::from_str_radix(number, 16) {
+            Ok(value) if digits == 16 && value > 1 << 63 => {
+                out.push_str(&format!("{:x}", value & 0xffff_ffff));
+            }
+            _ => out.push_str(number),
+        }
+        rest = rest.get(digits_at + digits..).unwrap_or("");
+    }
+    out.push_str(rest);
+    out.into()
 }
 
 /// Assembler directive for data bytes: `.long` / `.short` for one
 /// little-endian unit of that size, otherwise `.byte` with every byte.
 pub fn data_text(bytes: &[u8]) -> String {
+    data_text_in(bytes, false)
+}
+
+/// [`data_text`] for a file of the given byte order.
+pub fn data_text_in(bytes: &[u8], big_endian: bool) -> String {
     match *bytes {
+        [a, b] if big_endian => format!(".short 0x{:04x}", u16::from_be_bytes([a, b])),
+        [a, b, c, d] if big_endian => {
+            format!(".long 0x{:08x}", u32::from_be_bytes([a, b, c, d]))
+        }
         [a, b] => format!(".short 0x{:04x}", u16::from_le_bytes([a, b])),
         [a, b, c, d] => format!(".long 0x{:08x}", u32::from_le_bytes([a, b, c, d])),
         _ => {
@@ -273,23 +347,54 @@ pub struct Disassembler {
     /// bytes are skipped in steps of this size.
     unit: usize,
     arm: bool,
+    /// Decoder for what Capstone leaves undecoded.
+    extra: ExtraSet,
+}
+
+/// Which instructions of [`extra`] apply to a CPU type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExtraSet {
+    None,
+    Arm64,
+    X86_64,
+}
+
+impl ExtraSet {
+    fn decode(self, code: &[u8], address: u64) -> Option<extra::Extra> {
+        match self {
+            ExtraSet::None => None,
+            ExtraSet::Arm64 => {
+                let word = code.get(..4)?;
+                extra::arm64(
+                    u32::from_le_bytes([word[0], word[1], word[2], word[3]]),
+                    address,
+                )
+            }
+            ExtraSet::X86_64 => extra::x86_64(code),
+        }
+    }
 }
 
 impl Disassembler {
-    /// Engines for a Mach-O CPU type: x86 (32/64), ARM (ARM and Thumb) and
-    /// ARM64 (also for arm64_32). `detail` turns on operand details.
+    /// Engines for a Mach-O CPU type: x86 (32/64), ARM (ARM and Thumb),
+    /// ARM64 (also for arm64_32) and big-endian PowerPC (32/64). `detail`
+    /// turns on operand details.
     pub fn new(cputype: u32, cpusubtype: u32, detail: bool) -> Result<Self, DisasmError> {
         let (arch, mode, unit) = match cputype {
             CPU_TYPE_I386 => (Arch::X86, Mode::Mode32, 1),
             CPU_TYPE_X86_64 => (Arch::X86, Mode::Mode64, 1),
             CPU_TYPE_ARM => (Arch::ARM, Mode::Arm, 4),
             CPU_TYPE_ARM64 | CPU_TYPE_ARM64_32 => (Arch::ARM64, Mode::Arm, 4),
+            CPU_TYPE_POWERPC => (Arch::PPC, Mode::Mode32, 4),
+            CPU_TYPE_POWERPC64 => (Arch::PPC, Mode::Mode64, 4),
             _ => return Err(DisasmError::UnsupportedArch),
         };
+        // Mach-O PowerPC is big-endian; everything else here is little.
+        let endian = (arch == Arch::PPC).then_some(Endian::Big);
         let engine = |mode: Mode| {
             let extra =
                 (cputype == CPU_TYPE_ARM && is_m_profile(cpusubtype)).then_some(ExtraMode::MClass);
-            let mut cs = Capstone::new_raw(arch, mode, extra.into_iter(), None)
+            let mut cs = Capstone::new_raw(arch, mode, extra.into_iter(), endian)
                 .map_err(|_| DisasmError::Init)?;
             cs.set_detail(detail).map_err(|_| DisasmError::Init)?;
             // Undecodable bytes come back as data instead of ending the run.
@@ -303,6 +408,11 @@ impl Disassembler {
                 .transpose()?,
             unit,
             arm: arch != Arch::X86,
+            extra: match cputype {
+                CPU_TYPE_ARM64 | CPU_TYPE_ARM64_32 => ExtraSet::Arm64,
+                CPU_TYPE_X86_64 => ExtraSet::X86_64,
+                _ => ExtraSet::None,
+            },
         })
     }
 
@@ -363,13 +473,36 @@ impl Disassembler {
                 (true, Some(cs), Some(iter)) => (cs, iter, 2),
                 _ => (&self.main, &mut main_iter, self.unit),
             };
+            let extra = if thumb { ExtraSet::None } else { self.extra };
             let mut rest = chunk;
             let mut region_start = true;
             while !rest.is_empty() {
                 let at = base.wrapping_add((chunk.len() - rest.len()) as u64);
                 iter.reset(rest, at);
+                // Where decoding resumes when an instruction of `extra`
+                // replaces what the engine skipped.
+                let mut resume = None;
                 while let Some(insn) = iter.next() {
                     if insn.id().0 == 0 {
+                        let offset = insn.address().wrapping_sub(base) as usize;
+                        let tail = chunk.get(offset..).unwrap_or(&[]);
+                        if let Some(found) = extra
+                            .decode(tail, insn.address())
+                            .filter(|e| e.len > 0 && e.len <= tail.len())
+                        {
+                            sink(Item::Extra {
+                                address: insn.address(),
+                                bytes: tail.get(..found.len).unwrap_or(&[]),
+                                insn: &found,
+                                region_start,
+                            });
+                            region_start = false;
+                            if found.len != insn.bytes().len() {
+                                resume = Some(offset + found.len);
+                                break;
+                            }
+                            continue;
+                        }
                         sink(Item::Data {
                             address: insn.address(),
                             bytes: insn.bytes(),
@@ -383,6 +516,10 @@ impl Disassembler {
                         });
                     }
                     region_start = false;
+                }
+                if let Some(offset) = resume {
+                    rest = chunk.get(offset..).unwrap_or(&[]);
+                    continue;
                 }
                 let done = rest.len() - iter.code().len().min(rest.len());
                 rest = rest.get(done..).unwrap_or(&[]);
@@ -565,6 +702,9 @@ mod tests {
                     Item::Code { insn, .. } => {
                         format!("{:x} {}", insn.address(), insn_text(insn))
                     }
+                    Item::Extra { address, insn, .. } => {
+                        format!("{:x} {}", address, insn.text())
+                    }
                     Item::Data { address, bytes, .. } => {
                         format!("{:x} {}", address, data_text(bytes))
                     }
@@ -602,9 +742,101 @@ mod tests {
             ["1000 push rbp", "1001 mov rbp, rsp", "1004 ret"]
         );
         assert!(matches!(
-            Disassembler::new(0x12, 0, false),
+            Disassembler::new(6, 0, false),
             Err(DisasmError::UnsupportedArch)
         ));
+    }
+
+    #[test]
+    fn instructions_capstone_lacks_are_decoded() {
+        // pacibsppc ; addpt x19, x9, x8 ; retabsppc (signed 2 back) ; not
+        // an instruction ; ret
+        let code = [
+            0xfe, 0xa7, 0xc1, 0xda, 0x33, 0x21, 0x08, 0x9a, 0x5f, 0x00, 0x20, 0x55, 0x00, 0x00,
+            0xe0, 0xd4, 0xc0, 0x03, 0x5f, 0xd6,
+        ];
+        assert_eq!(
+            rows(CPU_TYPE_ARM64, 2, &code, &[code_region(0, 20, false)]),
+            [
+                "1000 pacibsppc",
+                "1004 addpt x19, x9, x8",
+                "1008 retabsppc #0x1000",
+                "100c .long 0xd4e00000",
+                "1010 ret"
+            ]
+        );
+        // x86-64: ret ; movsxd eax, [rdi + 8] ; ret. Capstone steps over
+        // one byte at a time; decoding resumes after the whole instruction.
+        assert_eq!(
+            rows(
+                CPU_TYPE_X86_64,
+                3,
+                &[0xc3, 0x63, 0x47, 0x08, 0xc3],
+                &[code_region(0, 5, false)]
+            ),
+            [
+                "1000 ret",
+                "1001 movsxd eax, dword ptr [rdi + 8]",
+                "1004 ret"
+            ]
+        );
+        // Cut off by the end of the region: data.
+        assert_eq!(
+            rows(CPU_TYPE_X86_64, 3, &[0x63], &[code_region(0, 1, false)]),
+            ["1000 .byte 0x63"]
+        );
+        // 32-bit x86 has no such instruction (`63` is `arpl` there).
+        assert_eq!(
+            rows(CPU_TYPE_I386, 3, &[0x63, 0xc1], &[code_region(0, 2, false)]),
+            ["1000 arpl cx, ax"]
+        );
+    }
+
+    #[test]
+    fn negative_immediates_are_32_bit() {
+        let fix = |s: &str| narrow_negative_immediates(s).into_owned();
+        assert_eq!(fix("w28, #-0xffffffff80000000"), "w28, #-0x80000000");
+        assert_eq!(
+            fix("w0, #-0xffffffff80000000, w1, #-0xffffffffffffff00"),
+            "w0, #-0x80000000, w1, #-0xffffff00"
+        );
+        // Real immediates are left alone, whatever their size.
+        for s in [
+            "x0, #-0x8000000000000000",
+            "x0, #-0x7fffffffffffffff",
+            "x0, #0xffffffff80000000",
+            "w0, #-0x80000000",
+            "x1, [x2, #-0x10]!",
+            "rax, qword ptr [rip - 0xffffffff]",
+            "",
+        ] {
+            assert_eq!(fix(s), s);
+        }
+    }
+
+    #[test]
+    fn powerpc_is_big_endian() {
+        // mflr r0 ; bl 0x100c ; (not an instruction) ; blr
+        let code = [
+            0x7c, 0x08, 0x02, 0xa6, 0x48, 0x00, 0x00, 0x09, 0x00, 0x00, 0x00, 0x01, 0x4e, 0x80,
+            0x00, 0x20,
+        ];
+        let mut out = Vec::new();
+        Disassembler::new(CPU_TYPE_POWERPC, 0, false)
+            .unwrap()
+            .run(&code, 0x1000, &[code_region(0, 16, false)], |item| {
+                out.push(match item {
+                    Item::Code { insn, .. } => insn_text(insn),
+                    Item::Extra { insn, .. } => insn.text(),
+                    Item::Data { bytes, .. } => data_text_in(bytes, true),
+                })
+            })
+            .unwrap();
+        assert_eq!(out, ["mflr r0", "bl 0x100c", ".long 0x00000001", "blr"]);
+        assert!(Disassembler::new(CPU_TYPE_POWERPC64, 0, false).is_ok());
+        assert_eq!(data_text_in(&[0x12, 0x34], true), ".short 0x1234");
+        assert_eq!(data_text_in(&[0x12, 0x34], false), ".short 0x3412");
+        assert_eq!(data_text_in(&[1, 2, 3], true), ".byte 0x01, 0x02, 0x03");
     }
 
     #[test]

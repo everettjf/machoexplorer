@@ -46,16 +46,6 @@ impl NodeSource for MachHeaderNode {
         use super::*;
         use crate::consts::*;
         let mh = &self.0;
-        if mh.big_endian {
-            return vec![crate::view::leaf("Unsupported Byte Order", || {
-                let mut t = Table::new();
-                t.set_headers(&["Information"]);
-                t.set_widths(&[600]);
-                t.add(["This Mach-O is big-endian (byte-swapped)."]);
-                t.add(["Only its header is decoded; load commands and their data are not."]);
-                Content::table(t)
-            })];
-        }
         // Order is part of the output format.
         let mut nodes = vec![Some(load_commands::load_commands_node(mh.clone()))];
         nodes.push(integrity::node(mh.clone()));

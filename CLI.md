@@ -224,7 +224,7 @@ output file cannot be opened, `2` usage error.
 moex cache-extract [--compact] [--all] [--exact] [--dry-run] [--json] [--max=N] <dyld_shared_cache_file> <image-path-or-substr> <output-macho-or-dir>
 ```
 
-- `--compact`: rewrite segment file offsets for compact output
+- `--compact`: pack the segments back to back instead of keeping their recorded file offsets
 - `--all`: extract all matched images into the output directory
 - `--exact`: exact path match (default: substring)
 - `--dry-run`: print the extraction plan without writing output files
@@ -233,8 +233,8 @@ moex cache-extract [--compact] [--all] [--exact] [--dry-run] [--json] [--max=N] 
 
 Purpose:
 
-- Extract one or multiple images from dyld shared cache
-- Optional compact rewrite of segment file offsets
+- Extract one or multiple images from dyld shared cache as standalone
+  Mach-O files with their own `__LINKEDIT`
 
 Options must come before the cache path. Without `--all` the last argument
 is the output file; with `--all` it is a directory and each image is written
@@ -247,9 +247,53 @@ Images of a split cache live in sub-cache files (`<cache>.01`,
 named in its header are read from the same directory, and each segment is
 copied from the file that holds it. A sub-cache file that is missing or
 belongs to another cache (different UUID) is skipped; images that need it
-fail with exit code `1`. Use `--compact` for split caches: without it each
-segment keeps the file offset it has in its own sub-cache file, and segments
-from different files can overlap in the output.
+fail with exit code `1` (`segment not in any cache file: ...`).
+
+What the output file is:
+
+- **Layout.** With `--compact` the segment that holds the Mach-O header
+  (`__TEXT`) is at offset 0, the other segments follow in load command
+  order, each at the next 4 KiB boundary, and `__LINKEDIT` is last. Without
+  it (`mode: raw-fileoff`) every segment keeps the file offset recorded in
+  its load command. That is only done when the whole image is in one cache
+  file and the recorded ranges overlap neither each other nor the header at
+  the start of the file; otherwise the compact layout is used and the
+  report says `mode: compact`. Every image of a split cache (any current
+  macOS) is such a case: its recorded offsets are relative to different
+  files. In the raw layout `__TEXT` is usually not at offset 0, so the
+  header is written twice: at the start of the file and at the start of
+  `__TEXT`.
+- **Load commands.** Segment `fileoff`, section `offset` and every linkedit
+  offset describe the output file. Sections the cache builder emptied
+  (offset 0, size 0) get the offset of their address, and a segment without
+  file content whose recorded offset is not in the output gets the end of
+  the segment before it. `MH_DYLIB_IN_CACHE` is cleared from the header
+  flags. Addresses are not changed: segments
+  keep the `vmaddr` they have in the cache.
+- **`__LINKEDIT`.** The cache's shared `__LINKEDIT` (over 1.5 GB on a
+  current macOS) is not copied. The output gets a new one with only this
+  image's data: the `LC_DYLD_INFO[_ONLY]` tables, the data of
+  `LC_DYLD_EXPORTS_TRIE`, `LC_DYLD_CHAINED_FIXUPS`, `LC_FUNCTION_STARTS`,
+  `LC_DATA_IN_CODE`, `LC_SEGMENT_SPLIT_INFO`, `LC_DYLIB_CODE_SIGN_DRS`,
+  `LC_LINKER_OPTIMIZATION_HINT`, `LC_ATOM_INFO`, `LC_FUNCTION_VARIANTS`,
+  `LC_FUNCTION_VARIANT_FIXUPS` and `LC_LAZY_LOAD_DYLIB_INFO`, the symbols in
+  the local, external and undefined ranges of `LC_DYSYMTAB` (all symbols
+  when there is no `LC_DYSYMTAB`), the indirect symbol table, and a string
+  table with just the names of those symbols. Symbols are renumbered from 0
+  and the indirect symbol table follows. `__LINKEDIT`'s `filesize` is the
+  new size and its `vmsize` that size rounded up to a page.
+- **Dropped** (offset and count set to 0): `LC_CODE_SIGNATURE` data,
+  `LC_TWOLEVEL_HINTS`, the table of contents, module table, external
+  reference table and relocation tables of `LC_DYSYMTAB`, and section
+  relocations.
+- **Local symbols.** The symbols are the ones the image's `LC_SYMTAB`
+  points at in the cache. When the cache builder moved local symbols to the
+  separate `.symbols` file, that file is not read and the output has no
+  local symbols.
+
+An image whose linkedit data is not inside its `__LINKEDIT` segment, or
+whose symbol, string or indirect symbol tables are inconsistent, is not
+extracted (`cannot rebuild __LINKEDIT (...)`, exit code `1`).
 
 ## Automation examples
 

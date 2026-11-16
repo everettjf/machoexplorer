@@ -60,7 +60,7 @@ C++/Qt implementation of the 2.x releases. If you used the 2.x command-line tool
 - **dyld info**: rebase / bind / lazy-bind / exports trie and chained-fixups structures.
 
 ### Code & cross-references
-- [Capstone](https://www.capstone-engine.org/) disassembly of `__TEXT,__text` (arm64, x86_64, arm, i386). Capstone is built in; nothing extra to install.
+- [Capstone](https://www.capstone-engine.org/) disassembly of every code section (arm64, x86_64, arm, i386, ppc). Capstone is built in; nothing extra to install.
 - Xref report: call / jump targets, computed addresses and memory references found in the code, plus stored pointers, tied back to symbols.
 
 ### dyld shared cache

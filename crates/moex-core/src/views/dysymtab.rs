@@ -110,6 +110,7 @@ fn relocation_cells(
     scope: &str,
     r: &Relocation,
     cputype: u32,
+    big_endian: bool,
     symbol_name: &dyn Fn(u32) -> Option<String>,
     sections: &[String],
 ) -> [String; 4] {
@@ -128,12 +129,15 @@ fn relocation_cells(
         ];
     }
 
+    // The bit fields of the second word are laid out from the other end
+    // in a big-endian file.
+    let fields = crate::macho::reloc::Reloc::decode(word0, word1, false, big_endian);
     let r_address = word0 as i32;
-    let r_symbolnum = word1 & 0x00FF_FFFF;
-    let r_pcrel = (word1 >> 24) & 0x01 != 0;
-    let r_length = (word1 >> 25) & 0x03;
-    let r_extern = (word1 >> 27) & 0x01 != 0;
-    let r_type = (word1 >> 28) & 0x0F;
+    let r_symbolnum = fields.symbolnum;
+    let r_pcrel = fields.pcrel;
+    let r_length = u32::from(fields.length);
+    let r_extern = fields.external;
+    let r_type = u32::from(fields.kind);
 
     // Unreachable in practice: bit 31 set means scattered. Kept to mirror
     // the original's formatting of a negative address.
@@ -188,7 +192,14 @@ fn relocations(mh: &MachHeader) -> Content {
         t.add_data(
             r.offset,
             8,
-            relocation_cells(scope, &r, mh.cputype, &symbol_name, &sections),
+            relocation_cells(
+                scope,
+                &r,
+                mh.cputype,
+                mh.big_endian,
+                &symbol_name,
+                &sections,
+            ),
         );
     };
     for r in dysym.external_relocations() {
@@ -215,7 +226,14 @@ mod tests {
             word1,
         };
         let names = |i: u32| (i == 1).then(|| "_sym".to_string());
-        relocation_cells("ext", &r, cputype, &names, &["__TEXT/__text".to_string()])
+        relocation_cells(
+            "ext",
+            &r,
+            cputype,
+            false,
+            &names,
+            &["__TEXT/__text".to_string()],
+        )
     }
 
     #[test]
@@ -251,6 +269,28 @@ mod tests {
             "X86_64_RELOC_UNKNOWN(11)"
         );
         assert_eq!(cells(0, 1 << 28, 7)[2], "RELOC_TYPE(1)");
+    }
+
+    #[test]
+    fn big_endian_bit_fields() {
+        // The same entry as in `plain_relocations`, as a big-endian
+        // compiler lays the fields out.
+        let r = Relocation {
+            index: 3,
+            offset: 0,
+            word0: 0x10,
+            word1: 1 << 8 | 0x80 | 2 << 5 | 0x10 | 3,
+        };
+        let names = |i: u32| (i == 1).then(|| "_sym".to_string());
+        assert_eq!(
+            relocation_cells("ext", &r, 18, true, &names, &[]),
+            [
+                "ext#3",
+                "addr=0x10 target=_sym",
+                "RELOC_TYPE(3)",
+                "extern=true pcrel=true len=4"
+            ]
+        );
     }
 
     #[test]

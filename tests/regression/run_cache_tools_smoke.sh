@@ -49,16 +49,25 @@ grep -q "^shown: 0$" "${TMP_DIR}/exact.txt" || fail "--exact should not match a 
 
 "${MOEX_BIN}" cache-extract "${SYN}" libsynthetic "${TMP_DIR}/raw.macho" >"${TMP_DIR}/extract.txt"
 grep -q "^extracted: /usr/lib/libsynthetic.dylib$" "${TMP_DIR}/extract.txt" || fail "missing extracted line"
-grep -q "size=16512 bytes segments=2$" "${TMP_DIR}/extract.txt" || fail "unexpected raw extraction summary"
-[[ "$(wc -c < "${TMP_DIR}/raw.macho" | tr -d ' ')" -eq 16512 ]] || fail "raw output has the wrong size"
-cmp -s -n 256 "${TMP_DIR}/raw.macho" <(tail -c +513 "${SYN}") || fail "raw output does not start with the image's __TEXT"
+# Raw layout: __TEXT at 0, the rebuilt __LINKEDIT (one nlist + 8 bytes of
+# strings) at its recorded offset 0x4000.
+grep -q "^mode: raw-fileoff$" "${TMP_DIR}/extract.txt" || fail "raw extraction did not keep the recorded offsets"
+grep -q "size=16408 bytes segments=2$" "${TMP_DIR}/extract.txt" || fail "unexpected raw extraction summary"
+[[ "$(wc -c < "${TMP_DIR}/raw.macho" | tr -d ' ')" -eq 16408 ]] || fail "raw output has the wrong size"
+cmp -s -n 32 "${TMP_DIR}/raw.macho" <(tail -c +513 "${SYN}") || fail "raw output does not start with the image's Mach-O header"
+cmp -s <(tail -c 24 "${TMP_DIR}/raw.macho") <(tail -c +1025 "${SYN}" | head -c 24) \
+  || fail "raw output does not end with the image's symbol and string table"
 
 "${MOEX_BIN}" cache-extract --compact --json "${SYN}" libsynthetic "${TMP_DIR}/compact.macho" >"${TMP_DIR}/extract.json"
-grep -q '"event":"extracted".*"mode":"compact","size":8320,"segments":2}' "${TMP_DIR}/extract.json" \
+grep -q '"event":"extracted".*"mode":"compact","size":4120,"segments":2}' "${TMP_DIR}/extract.json" \
   || fail "unexpected compact extraction summary"
-[[ "$(wc -c < "${TMP_DIR}/compact.macho" | tr -d ' ')" -eq 8320 ]] || fail "compact output has the wrong size"
-# The extracted images are themselves parseable Mach-O files.
+[[ "$(wc -c < "${TMP_DIR}/compact.macho" | tr -d ' ')" -eq 4120 ]] || fail "compact output has the wrong size"
+# The extracted images are themselves parseable Mach-O files, and their
+# symbol table is where LC_SYMTAB says.
 "${MOEX_BIN}" parse "${TMP_DIR}/raw.macho" "${TMP_DIR}/compact.macho" >/dev/null || fail "extracted image does not parse"
+for extracted in raw compact; do
+  "${MOEX_BIN}" dump "${TMP_DIR}/${extracted}.macho" | grep -q "_syn" || fail "${extracted} output lost its symbol"
+done
 
 "${MOEX_BIN}" cache-extract --dry-run --all "${SYN}" libsynthetic "${TMP_DIR}/never-created" >"${TMP_DIR}/plan.txt"
 grep -q "^plan: /usr/lib/libsynthetic.dylib -> ${TMP_DIR}/never-created/libsynthetic.dylib.macho " "${TMP_DIR}/plan.txt" \
@@ -92,8 +101,8 @@ if [[ -z "${CACHE_FILE}" || ! -f "${CACHE_FILE}" ]]; then
 fi
 
 "${MOEX_BIN}" cache-list --json --limit=1 "${CACHE_FILE}" libobjc >/dev/null
-# Images of a split cache live in sub-cache files that the extractor does not
-# follow, so the plan may legitimately fail (exit 1); it must not crash.
+# A sub-cache file may be missing, so the plan may legitimately fail
+# (exit 1); it must not crash.
 set +e
 "${MOEX_BIN}" cache-extract --dry-run --compact --all --max=1 "${CACHE_FILE}" libswift "${TMP_DIR}/real" >/dev/null 2>&1
 rc=$?

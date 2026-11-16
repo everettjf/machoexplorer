@@ -10,13 +10,21 @@
 //! rebase (target, plus pointer-authentication data on arm64e) or bind
 //! (import ordinal) and the link to the next slot; with `LC_DYLD_INFO` the
 //! bind opcodes name the symbol of a bound slot (which holds zero, or the
-//! address of its stub helper when it is bound lazily).
+//! address of its stub helper when it is bound lazily); the first arm64e
+//! images thread their rebases and binds through the slots themselves
+//! (`BIND_OPCODE_THREADED`). In an object file a pointer is whatever its
+//! relocation entry says: a symbol plus the addend stored in the slot.
 
 use super::header::MachHeader;
+use super::reloc::{self, ARM64_RELOC_AUTHENTICATED_POINTER, RELOC_UNSIGNED};
 use super::segment::Segment;
-use crate::consts::{LC_DYLD_CHAINED_FIXUPS, LC_DYLD_INFO, LC_DYLD_INFO_ONLY};
+use crate::consts::{
+    CPU_TYPE_ARM64, CPU_TYPE_ARM64_32, CPU_TYPE_X86_64, LC_DYLD_CHAINED_FIXUPS, LC_DYLD_INFO,
+    LC_DYLD_INFO_ONLY,
+};
 use crate::image::Image;
 use crate::leb::{read_sleb128, read_uleb128};
+use std::io::Read;
 use std::sync::Arc;
 
 /// Which segment commands a [`SliceReader`] searches.
@@ -287,21 +295,47 @@ fn decode_chained(format: u16, raw: u64, base: u64) -> Chained {
     }
 }
 
+/// Where the symbol names of the chained import table are.
+#[derive(Debug, Clone, Default)]
+enum ImportNames {
+    #[default]
+    None,
+    /// File offset of the strings.
+    InFile(u64),
+    /// The strings, inflated (`symbols_format` 1: zlib).
+    Inflated(Vec<u8>),
+}
+
+/// Most bytes inflated from a compressed import name table. No real image
+/// comes close; it bounds what a crafted stream can ask for.
+const MAX_INFLATED_NAMES: u64 = 64 << 20;
+
+/// Inflates a zlib stream; `None` when it is not one. A stream that ends
+/// early or exceeds the bound yields what was read.
+fn inflate(compressed: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut decoder = flate2::read::ZlibDecoder::new(compressed).take(MAX_INFLATED_NAMES);
+    match decoder.read_to_end(&mut out) {
+        Ok(_) => Some(out),
+        Err(_) if !out.is_empty() => Some(out),
+        Err(_) => None,
+    }
+}
+
 /// The import table of `LC_DYLD_CHAINED_FIXUPS`.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 struct Imports {
     /// File offset of the first entry.
     table: u64,
     count: u32,
     /// `DYLD_CHAINED_IMPORT` (1), `_ADDEND` (2) or `_ADDEND64` (3).
     format: u32,
-    /// File offset of the symbol strings; `None` when they are compressed.
-    symbols: Option<u64>,
+    names: ImportNames,
 }
 
 impl Imports {
     /// `(name, addend)` of import `ordinal`.
-    fn get<'a>(&self, image: &'a Image, ordinal: u32) -> Option<(&'a [u8], i64)> {
+    fn get<'s>(&'s self, image: &'s Image, ordinal: u32) -> Option<(&'s [u8], i64)> {
         if ordinal >= self.count {
             return None;
         }
@@ -320,10 +354,21 @@ impl Imports {
             ),
             _ => (image.u64(at)? >> 32, image.u64(at + 8)? as i64),
         };
-        let name_at = self.symbols?.checked_add(name_offset)?;
-        let name = image
-            .cstr(name_at, MAX_NAME)
-            .filter(|_| name_at < image.len())?;
+        let name = match &self.names {
+            ImportNames::None => return None,
+            ImportNames::InFile(strings) => {
+                let name_at = strings.checked_add(name_offset)?;
+                image
+                    .cstr(name_at, MAX_NAME)
+                    .filter(|_| name_at < image.len())?
+            }
+            ImportNames::Inflated(strings) => {
+                let rest = strings.get(usize::try_from(name_offset).ok()?..)?;
+                let rest = rest.get(..rest.len().min(MAX_NAME as usize))?;
+                let end = rest.iter().position(|&c| c == 0).unwrap_or(rest.len());
+                rest.get(..end)?
+            }
+        };
         Some((name, addend))
     }
 }
@@ -341,6 +386,28 @@ struct ClassicBind {
     addend: i64,
 }
 
+/// One pointer slot of an object file that a relocation entry describes.
+#[derive(Debug, Clone, Copy)]
+struct RelocSlot {
+    /// File offset of the slot.
+    slot: u64,
+    /// Symbol table index.
+    symbol: u32,
+    /// `ARM64_RELOC_AUTHENTICATED_POINTER`: the low 32 bits of the slot are
+    /// the addend, the rest describes the signature.
+    authenticated: bool,
+}
+
+/// The bind opcode streams of `LC_DYLD_INFO`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BindStream {
+    /// `bind_off` and `lazy_bind_off`: the slot is bound to the symbol.
+    Bind,
+    /// `weak_bind_off`: the slot is rebound if another image has a
+    /// definition that overrides this one.
+    Weak,
+}
+
 /// Which pointer slots of one Mach-O image dyld fixes up, and how: read
 /// once from `LC_DYLD_CHAINED_FIXUPS` and `LC_DYLD_INFO`. Building it walks
 /// every fixup chain, so share one per image (see
@@ -352,8 +419,21 @@ pub struct Fixups {
     /// sorted by offset.
     chained: Vec<(u64, u16)>,
     imports: Imports,
+    /// File offsets of the slots on the threaded chains of old arm64e
+    /// images (`BIND_OPCODE_THREADED`), sorted. They are packed like
+    /// `DYLD_CHAINED_PTR_ARM64E`; a bind's ordinal indexes `threaded_table`.
+    threaded: Vec<u64>,
+    /// `(file offset of the name, addend)` per threaded bind ordinal.
+    threaded_table: Vec<(u64, i64)>,
     /// Sorted by slot.
     classic: Vec<ClassicBind>,
+    /// Slots named in the weak bind stream, sorted by slot.
+    weak: Vec<ClassicBind>,
+    /// Pointer slots with a relocation entry, sorted by slot.
+    relocs: Vec<RelocSlot>,
+    /// File offsets of the pointer slots whose relocation entry is
+    /// section-relative (the slot already holds the address), sorted.
+    local_relocs: Vec<u64>,
 }
 
 impl Fixups {
@@ -362,7 +442,12 @@ impl Fixups {
             base: mh.base_address(),
             chained: Vec::new(),
             imports: Imports::default(),
+            threaded: Vec::new(),
+            threaded_table: Vec::new(),
             classic: Vec::new(),
+            weak: Vec::new(),
+            relocs: Vec::new(),
+            local_relocs: Vec::new(),
         };
         // The work is bounded by the file size: a crafted file can make
         // chains, page tables or bind runs revisit the same slots, and no
@@ -370,12 +455,73 @@ impl Fixups {
         let mut budget = mh.image.len() / 4 + 1024;
         d.read_chained_fixups(mh, &mut budget);
         d.read_classic_binds(mh, &mut budget);
+        d.read_relocations(mh, &mut budget);
         d.chained.sort_unstable();
         d.chained.dedup_by_key(|e| e.0);
-        // A stable sort: of several binds of one slot the first stays.
+        d.threaded.sort_unstable();
+        d.threaded.dedup();
+        // Stable sorts: of several entries for one slot the first stays.
         d.classic.sort_by_key(|b| b.slot);
         d.classic.dedup_by_key(|b| b.slot);
+        d.weak.sort_by_key(|b| b.slot);
+        d.weak.dedup_by_key(|b| b.slot);
+        d.relocs.sort_by_key(|r| r.slot);
+        d.relocs.dedup_by_key(|r| r.slot);
+        d.local_relocs.sort_unstable();
+        d.local_relocs.dedup();
         d
+    }
+
+    /// The pointer slots of an object file that relocation entries turn
+    /// into "symbol + addend": external, absolute, pointer-sized entries of
+    /// the plain pointer type. The second half of a subtraction (a
+    /// `SUBTRACTOR` entry followed by an `UNSIGNED` one at the same address)
+    /// is a difference, not a pointer, and is left out.
+    fn read_relocations(&mut self, mh: &MachHeader, budget: &mut u64) {
+        let subtractor: Option<u8> = match mh.cputype {
+            CPU_TYPE_X86_64 => Some(5),
+            CPU_TYPE_ARM64 | CPU_TYPE_ARM64_32 => Some(1),
+            _ => None,
+        };
+        let arm64 = matches!(mh.cputype, CPU_TYPE_ARM64 | CPU_TYPE_ARM64_32);
+        for sect in mh.sections() {
+            if sect.nreloc == 0 || *budget == 0 {
+                continue;
+            }
+            let entries = reloc::section_relocs(mh, sect, *budget);
+            *budget -= (entries.len() as u64).min(*budget);
+            let mut difference_at = None;
+            for r in entries {
+                if r.scattered {
+                    continue;
+                }
+                if Some(r.kind) == subtractor {
+                    difference_at = Some(r.address);
+                    continue;
+                }
+                let second_half = difference_at.take() == Some(r.address);
+                let authenticated = arm64 && r.kind == ARM64_RELOC_AUTHENTICATED_POINTER;
+                let width = 1u64 << r.length;
+                if second_half
+                    || r.pcrel
+                    || !(r.kind == RELOC_UNSIGNED || authenticated)
+                    || !(width == 4 || width == 8)
+                    || u64::from(r.address) + width > u64::from(sect.data_size)
+                {
+                    continue;
+                }
+                let slot = sect.data_offset + u64::from(r.address);
+                if r.external {
+                    self.relocs.push(RelocSlot {
+                        slot,
+                        symbol: r.symbolnum,
+                        authenticated,
+                    });
+                } else {
+                    self.local_relocs.push(slot);
+                }
+            }
+        }
     }
 
     fn read_chained_fixups(&mut self, mh: &MachHeader, budget: &mut u64) {
@@ -390,11 +536,21 @@ impl Fixups {
         }
         let field = |i: u64| image.u32(blob + 4 * i).unwrap_or(0);
         let (starts_offset, imports_offset, symbols_offset) = (field(1), field(2), field(3));
+        let strings = blob + u64::from(symbols_offset);
         self.imports = Imports {
             table: blob + u64::from(imports_offset),
             count: field(4),
             format: field(5),
-            symbols: (field(6) == 0).then_some(blob + u64::from(symbols_offset)),
+            names: match field(6) {
+                0 => ImportNames::InFile(strings),
+                // zlib: the stream runs to the end of the blob.
+                1 => u64::from(datasize)
+                    .checked_sub(u64::from(symbols_offset))
+                    .and_then(|size| image.slice(strings, size))
+                    .and_then(inflate)
+                    .map_or(ImportNames::None, ImportNames::Inflated),
+                _ => ImportNames::None,
+            },
         };
 
         // dyld_chained_starts_in_image: seg_count, seg_info_offset[].
@@ -500,17 +656,28 @@ impl Fixups {
         let Some(lc) = mh.find_load_command(&[LC_DYLD_INFO, LC_DYLD_INFO_ONLY]) else {
             return;
         };
-        // `bind_off` / `bind_size`, then `lazy_bind_off` / `lazy_bind_size`.
-        // (Weak binds only say which definitions may be coalesced.)
-        for field in [16, 32] {
+        // `bind_off` / `bind_size`, `lazy_bind_off` / `lazy_bind_size`, then
+        // `weak_bind_off` / `weak_bind_size`.
+        for (field, stream) in [
+            (16, BindStream::Bind),
+            (32, BindStream::Bind),
+            (24, BindStream::Weak),
+        ] {
             let (off, size) = (mh.lc_u32(lc, field), mh.lc_u32(lc, field + 4));
-            self.read_bind_opcodes(mh, off, size, budget);
+            self.read_bind_opcodes(mh, off, size, stream, budget);
         }
     }
 
     /// Runs one bind opcode stream, recording the slots it binds. A lazy
     /// stream is a series of single binds, each ended by `DONE`.
-    fn read_bind_opcodes(&mut self, mh: &MachHeader, off: u32, size: u32, budget: &mut u64) {
+    fn read_bind_opcodes(
+        &mut self,
+        mh: &MachHeader,
+        off: u32,
+        size: u32,
+        stream: BindStream,
+        budget: &mut u64,
+    ) {
         let start = mh.offset.saturating_add(u64::from(off));
         let image: &Image = &mh.image;
         let Some(ops) = image.slice(start, u64::from(size)) else {
@@ -519,20 +686,34 @@ impl Fixups {
         let word: u64 = if mh.is64 { 8 } else { 4 };
         let (mut segment, mut offset) = (0usize, 0u64);
         let (mut name, mut addend) = (None::<u64>, 0i64);
+        // After `THREADED_SET_BIND_ORDINAL_TABLE_SIZE` every `DO_BIND` adds
+        // an entry to the ordinal table instead of binding a slot.
+        let mut threaded = false;
         let mut pos = 0usize;
         let uleb = |pos: &mut usize| {
             let (value, len) = read_uleb128(ops.get(*pos..)?)?;
             *pos += len as usize;
             Some(value)
         };
-        let mut bind = |segment: usize, offset: u64, name: Option<u64>, addend: i64| {
-            let slot = mh.segments.get(segment).and_then(|seg| {
+        let slot_of = |segment: usize, offset: u64| {
+            mh.segments.get(segment).and_then(|seg| {
                 (offset < seg.filesize)
                     .then(|| mh.offset.checked_add(seg.fileoff)?.checked_add(offset))
                     .flatten()
-            });
-            if let (Some(slot), Some(name)) = (slot, name) {
-                self.classic.push(ClassicBind { slot, name, addend });
+            })
+        };
+        let mut bound: Vec<ClassicBind> = Vec::new();
+        let mut bind = |d: &mut Self,
+                        threaded: bool,
+                        segment: usize,
+                        offset: u64,
+                        name: Option<u64>,
+                        addend| {
+            let Some(name) = name else { return };
+            if threaded {
+                d.threaded_table.push((name, addend));
+            } else if let Some(slot) = slot_of(segment, offset) {
+                bound.push(ClassicBind { slot, name, addend });
             }
         };
         while let Some(&byte) = ops.get(pos) {
@@ -581,18 +762,20 @@ impl Fixups {
                 }
                 // DO_BIND
                 0x90 => {
-                    bind(segment, offset, name, addend);
-                    offset = offset.wrapping_add(word);
+                    bind(self, threaded, segment, offset, name, addend);
+                    if !threaded {
+                        offset = offset.wrapping_add(word);
+                    }
                 }
                 // DO_BIND_ADD_ADDR_ULEB
                 0xa0 => {
-                    bind(segment, offset, name, addend);
+                    bind(self, threaded, segment, offset, name, addend);
                     let Some(value) = uleb(&mut pos) else { break };
                     offset = offset.wrapping_add(value).wrapping_add(word);
                 }
                 // DO_BIND_ADD_ADDR_IMM_SCALED
                 0xb0 => {
-                    bind(segment, offset, name, addend);
+                    bind(self, threaded, segment, offset, name, addend);
                     offset = offset.wrapping_add((imm + 1) * word);
                 }
                 // DO_BIND_ULEB_TIMES_SKIPPING_ULEB
@@ -605,22 +788,73 @@ impl Fixups {
                             break;
                         }
                         *budget -= 1;
-                        bind(segment, offset, name, addend);
+                        bind(self, threaded, segment, offset, name, addend);
                         offset = offset.wrapping_add(skip).wrapping_add(word);
                     }
                 }
-                // Threaded binds (old arm64e) and anything unknown.
+                // THREADED
+                0xd0 => match imm {
+                    // SET_BIND_ORDINAL_TABLE_SIZE_ULEB: a new table.
+                    0 => {
+                        if uleb(&mut pos).is_none() {
+                            break;
+                        }
+                        threaded = true;
+                        self.threaded_table.clear();
+                    }
+                    // APPLY: the chain that starts at the current slot.
+                    1 => {
+                        if let Some(slot) = slot_of(segment, offset) {
+                            self.walk_threaded(image, slot, budget);
+                        }
+                    }
+                    _ => break,
+                },
+                // Anything unknown.
                 _ => break,
             }
         }
+        match stream {
+            BindStream::Bind => self.classic.append(&mut bound),
+            BindStream::Weak => self.weak.append(&mut bound),
+        }
+    }
+
+    /// Follows a threaded chain: 8-byte slots whose bits 51-61 give the
+    /// distance to the next one in slots.
+    fn walk_threaded(&mut self, image: &Image, start: u64, budget: &mut u64) {
+        let mut at = start;
+        while *budget > 0 {
+            *budget -= 1;
+            let Some(raw) = image.u64(at) else { break };
+            self.threaded.push(at);
+            let next = chain_next(PTR_ARM64E, raw);
+            let Some(following) = at.checked_add(next * 8).filter(|_| next != 0) else {
+                break;
+            };
+            at = following;
+        }
+    }
+
+    /// File offset of the name the weak bind stream gives the slot at file
+    /// offset `at`.
+    fn weak_bind(&self, at: u64) -> Option<&ClassicBind> {
+        let i = self.weak.binary_search_by_key(&at, |b| b.slot).ok()?;
+        self.weak.get(i)
     }
 }
 
 /// Decodes the pointers stored in the data of one Mach-O image.
 pub struct PointerDecoder<'a> {
+    mh: &'a MachHeader,
     image: &'a Image,
     fixups: Arc<Fixups>,
 }
+
+const N_STAB: u8 = 0xe0;
+const N_TYPE: u8 = 0x0e;
+const N_ABS: u8 = 0x02;
+const N_SECT: u8 = 0x0e;
 
 impl<'a> PointerDecoder<'a> {
     /// A decoder with fixup tables of its own, read now.
@@ -631,41 +865,138 @@ impl<'a> PointerDecoder<'a> {
     /// A decoder using the already read `fixups` of `mh`.
     pub fn with_fixups(mh: &'a MachHeader, fixups: Arc<Fixups>) -> Self {
         PointerDecoder {
+            mh,
             image: &mh.image,
             fixups,
         }
     }
 
     /// The pointer whose stored value `raw` was read at file offset `at`.
-    pub fn decode(&self, at: u64, raw: u64) -> Pointer<'a> {
+    pub fn decode(&self, at: u64, raw: u64) -> Pointer<'_> {
+        self.fixed_up(at, raw).unwrap_or(Pointer::Address(raw))
+    }
+
+    /// What the slot at file offset `at` holding `raw` becomes, when a
+    /// fixup or a relocation says so; `None` for a slot nothing touches.
+    pub fn fixed_up(&self, at: u64, raw: u64) -> Option<Pointer<'_>> {
         let fixups = &self.fixups;
+        let import = |ordinal: u32, addend: i64| {
+            let (name, import_addend) = fixups.imports.get(self.image, ordinal).unwrap_or((&[], 0));
+            Pointer::Import {
+                name,
+                addend: addend.wrapping_add(import_addend),
+            }
+        };
         if let Ok(i) = fixups.chained.binary_search_by_key(&at, |e| e.0) {
             let format = fixups.chained.get(i).map_or(0, |e| e.1);
-            return match decode_chained(format, raw, fixups.base) {
+            return Some(match decode_chained(format, raw, fixups.base) {
                 Chained::Rebase(address) => Pointer::Address(address),
-                Chained::Bind { ordinal, addend } => {
-                    let (name, import_addend) =
-                        fixups.imports.get(self.image, ordinal).unwrap_or((&[], 0));
-                    Pointer::Import {
-                        name,
-                        addend: addend.wrapping_add(import_addend),
-                    }
-                }
-            };
+                Chained::Bind { ordinal, addend } => import(ordinal, addend),
+            });
+        }
+        if let Some(pointer) = self.threaded(at, raw) {
+            return Some(pointer);
         }
         if let Ok(i) = fixups.classic.binary_search_by_key(&at, |b| b.slot) {
             if let Some(b) = fixups.classic.get(i) {
-                return Pointer::Import {
+                return Some(Pointer::Import {
                     name: self.image.cstr(b.name, MAX_NAME).unwrap_or(&[]),
                     addend: b.addend,
-                };
+                });
             }
         }
-        Pointer::Address(raw)
+        if let Some(pointer) = self.relocated(at, raw) {
+            return Some(pointer);
+        }
+        // A weak bind of a slot that holds nothing: only another image's
+        // definition can fill it.
+        if raw == 0 {
+            if let Some(b) = fixups.weak_bind(at) {
+                return Some(Pointer::Import {
+                    name: self.image.cstr(b.name, MAX_NAME).unwrap_or(&[]),
+                    addend: b.addend,
+                });
+            }
+        }
+        None
+    }
+
+    /// The slot at file offset `at` when it is on a threaded chain of an
+    /// old arm64e image.
+    fn threaded(&self, at: u64, raw: u64) -> Option<Pointer<'_>> {
+        let fixups = &self.fixups;
+        fixups.threaded.binary_search(&at).ok()?;
+        Some(match decode_chained(PTR_ARM64E, raw, fixups.base) {
+            Chained::Rebase(address) => Pointer::Address(address),
+            Chained::Bind { ordinal, addend } => {
+                let entry = fixups.threaded_table.get(ordinal as usize);
+                Pointer::Import {
+                    name: entry
+                        .and_then(|e| self.image.cstr(e.0, MAX_NAME))
+                        .unwrap_or(&[]),
+                    addend: addend.wrapping_add(entry.map_or(0, |e| e.1)),
+                }
+            }
+        })
+    }
+
+    /// What a relocation entry of an object file or a threaded fixup makes
+    /// of the slot at file offset `at`; `None` when neither covers it.
+    pub fn relocated_or_threaded(&self, at: u64, raw: u64) -> Option<Pointer<'_>> {
+        self.threaded(at, raw).or_else(|| self.relocated(at, raw))
+    }
+
+    /// True when a relocation entry marks the slot at file offset `at` as a
+    /// pointer (object files: every pointer has one).
+    pub fn has_relocation(&self, at: u64) -> bool {
+        let fixups = &self.fixups;
+        fixups.local_relocs.binary_search(&at).is_ok()
+            || fixups.relocs.binary_search_by_key(&at, |r| r.slot).is_ok()
+    }
+
+    /// The pointer a relocation entry of an object file describes: the
+    /// symbol's address plus the addend stored in the slot, or an import
+    /// when the symbol is not defined in this file.
+    fn relocated(&self, at: u64, raw: u64) -> Option<Pointer<'_>> {
+        let relocs = &self.fixups.relocs;
+        let r = relocs.get(relocs.binary_search_by_key(&at, |r| r.slot).ok()?)?;
+        let symtab = self.mh.symtab()?;
+        let symbol = symtab.symbol(r.symbol)?;
+        let addend = if r.authenticated {
+            i64::from(raw as u32 as i32)
+        } else if self.mh.is64 {
+            raw as i64
+        } else {
+            i64::from(raw as u32 as i32)
+        };
+        let defined =
+            symbol.n_type & N_STAB == 0 && matches!(symbol.n_type & N_TYPE, N_SECT | N_ABS);
+        Some(if defined {
+            let address = symbol.n_value.wrapping_add(addend as u64);
+            Pointer::Address(if self.mh.is64 {
+                address
+            } else {
+                address & 0xffff_ffff
+            })
+        } else {
+            Pointer::Import {
+                name: symtab.string_bytes(symbol.n_strx),
+                addend,
+            }
+        })
+    }
+
+    /// Name of the symbol the weak bind stream of `LC_DYLD_INFO` gives the
+    /// slot at file offset `at`: dyld points the slot at whichever
+    /// definition of that symbol wins across all loaded images, which is
+    /// the one in this image unless another overrides it.
+    pub fn weak_symbol(&self, at: u64) -> Option<&[u8]> {
+        let b = self.fixups.weak_bind(at)?;
+        self.image.cstr(b.name, MAX_NAME)
     }
 
     /// The pointer stored at file offset `at` (8 bytes when `is64`, else 4).
-    pub fn read(&self, at: u64, is64: bool) -> Option<Pointer<'a>> {
+    pub fn read(&self, at: u64, is64: bool) -> Option<Pointer<'_>> {
         let raw = if is64 {
             self.image.u64(at)?
         } else {
@@ -920,6 +1251,252 @@ mod tests {
             assert_eq!(Pointer::Address(5).address(), 5);
             assert_eq!(d.read(s + 0x218, true).map(|p| p.address()), Some(0));
         }
+    }
+
+    #[test]
+    fn compressed_import_names_are_inflated() {
+        use std::io::Write;
+        let mut file = chained_file(0);
+        // The same names, deflated, with `symbols_format` 1.
+        let mut encoder =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(b"\0_one\0_two\0").unwrap();
+        let packed = encoder.finish().unwrap();
+        assert!(0x58 + packed.len() <= 0x80);
+        file[0x300 + 24..0x300 + 28].copy_from_slice(&1u32.to_le_bytes());
+        file[0x358..0x380].fill(0);
+        file[0x358..0x358 + packed.len()].copy_from_slice(&packed);
+        let mh = parse(file.clone(), 0);
+        assert_eq!(
+            PointerDecoder::new(&mh).read(0x218, true),
+            Some(Pointer::Import {
+                name: b"_two",
+                addend: 3
+            })
+        );
+        // Not a zlib stream, or an unknown format: the bind has no name.
+        for (format, garbage) in [(1u32, true), (2, false)] {
+            let mut file = file.clone();
+            file[0x300 + 24..0x300 + 28].copy_from_slice(&format.to_le_bytes());
+            if garbage {
+                file[0x358..0x360].fill(0xff);
+            }
+            let mh = parse(file, 0);
+            assert_eq!(
+                PointerDecoder::new(&mh).read(0x218, true),
+                Some(Pointer::Import {
+                    name: b"",
+                    addend: 3
+                })
+            );
+        }
+    }
+
+    /// An `LC_DYLD_INFO_ONLY` command whose bind stream is at 0x300 and
+    /// whose weak bind stream is at 0x340.
+    fn dyld_info_file(bind: &[u8], weak: &[u8]) -> Vec<u8> {
+        let mut lc = Vec::new();
+        for v in [
+            0x8000_0022u32,
+            48,
+            0,
+            0,
+            0x300,
+            bind.len() as u32,
+            0x340,
+            weak.len() as u32,
+            0,
+            0,
+            0,
+            0,
+        ] {
+            put32(&mut lc, v);
+        }
+        let mut file = macho(0, &lc, 1);
+        file[0x300..0x300 + bind.len()].copy_from_slice(bind);
+        file[0x340..0x340 + weak.len()].copy_from_slice(weak);
+        file
+    }
+
+    #[test]
+    fn threaded_binds_are_followed() {
+        // An ordinal table of two symbols, then the chain that starts at
+        // `__DATA` + 0x10.
+        let mut ops = vec![0xd0, 2, 0x40];
+        ops.extend_from_slice(b"_one\0");
+        ops.extend_from_slice(&[0x90, 0x40]);
+        ops.extend_from_slice(b"_two\0");
+        ops.extend_from_slice(&[0x60, 5, 0x90, 0x71, 0x10, 0xd1, 0x00]);
+        let mut file = dyld_info_file(&ops, &[]);
+        let slots: [(usize, u64); 4] = [
+            // Bind to ordinal 1; the next slot follows.
+            (0x210, (1 << 62) | 1 | (1 << 51)),
+            // Authenticated rebase to image base + 0x40; skip one slot.
+            (0x218, (1 << 63) | 0x40 | (2 << 51)),
+            // Not on the chain.
+            (0x220, 0x77),
+            // Plain rebase to 0x2020; the end.
+            (0x228, 0x2020),
+        ];
+        for (at, raw) in slots {
+            file[at..at + 8].copy_from_slice(&raw.to_le_bytes());
+        }
+        let mh = parse(file, 0);
+        let d = PointerDecoder::new(&mh);
+        assert_eq!(
+            d.read(0x210, true),
+            Some(Pointer::Import {
+                name: b"_two",
+                addend: 5
+            })
+        );
+        assert_eq!(d.read(0x218, true), Some(Pointer::Address(0x1040)));
+        assert_eq!(d.read(0x220, true), Some(Pointer::Address(0x77)));
+        assert_eq!(d.read(0x228, true), Some(Pointer::Address(0x2020)));
+        // In threaded mode `DO_BIND` binds no slot itself.
+        assert_eq!(d.read(0x200, true), Some(Pointer::Address(0)));
+        assert!(d.relocated_or_threaded(0x218, 0).is_some());
+        assert!(d.relocated_or_threaded(0x220, 0).is_none());
+    }
+
+    #[test]
+    fn threaded_ordinal_out_of_the_table_has_no_name() {
+        let ops = [0xd0, 1, 0x71, 0x10, 0xd1];
+        let mut file = dyld_info_file(&ops, &[]);
+        file[0x210..0x218].copy_from_slice(&((1u64 << 62) | 7).to_le_bytes());
+        let mh = parse(file, 0);
+        assert_eq!(
+            PointerDecoder::new(&mh).read(0x210, true),
+            Some(Pointer::Import {
+                name: b"",
+                addend: 0
+            })
+        );
+    }
+
+    #[test]
+    fn weak_binds_name_the_slot() {
+        // Weak stream: `_w` at `__DATA` + 0x30 and + 0x38.
+        let mut weak = vec![0x40];
+        weak.extend_from_slice(b"_w\0");
+        weak.extend_from_slice(&[0x71, 0x30, 0x90, 0x90]);
+        let mut file = dyld_info_file(&[], &weak);
+        file[0x230..0x238].copy_from_slice(&0x1234u64.to_le_bytes());
+        let mh = parse(file, 0);
+        let d = PointerDecoder::new(&mh);
+        // A slot that holds this image's definition keeps its address and
+        // is known to be coalesced.
+        assert_eq!(d.read(0x230, true), Some(Pointer::Address(0x1234)));
+        assert_eq!(d.weak_symbol(0x230), Some(&b"_w"[..]));
+        // An empty slot can only be filled by another image.
+        assert_eq!(
+            d.read(0x238, true),
+            Some(Pointer::Import {
+                name: b"_w",
+                addend: 0
+            })
+        );
+        assert_eq!(d.weak_symbol(0x240), None);
+    }
+
+    /// x86-64 object file: one `__DATA,__objc_classlist` section of four
+    /// pointers at 0xd0 with five relocation entries, and two symbols
+    /// (`_def` at 0x500, `_undef` undefined).
+    fn object_file() -> Vec<u8> {
+        let mut f = Vec::new();
+        for v in [0xfeedfacfu32, 0x0100_0007, 3, 1, 2, 176, 0, 0] {
+            put32(&mut f, v);
+        }
+        put32(&mut f, 0x19);
+        put32(&mut f, 152);
+        name16(&mut f, "");
+        for v in [0u64, 0x20, 0xd0, 0x20] {
+            put64(&mut f, v);
+        }
+        for v in [7u32, 7, 1, 0] {
+            put32(&mut f, v);
+        }
+        name16(&mut f, "__objc_classlist");
+        name16(&mut f, "__DATA");
+        put64(&mut f, 0);
+        put64(&mut f, 0x20);
+        for v in [0xd0u32, 3, 0xf0, 5, 0, 0, 0, 0] {
+            put32(&mut f, v);
+        }
+        for v in [2u32, 24, 0x118, 2, 0x138, 12] {
+            put32(&mut f, v);
+        }
+        assert_eq!(f.len(), 0xd0);
+        for raw in [8u64, 0x10, 0x99, 0x18] {
+            put64(&mut f, raw);
+        }
+        // r_symbolnum | r_length 3 | r_extern | r_type.
+        let entry = |symbol: u32, external: bool, kind: u32| {
+            symbol | 3 << 25 | u32::from(external) << 27 | kind << 28
+        };
+        for (address, word) in [
+            (0u32, entry(0, true, 0)),
+            (8, entry(1, true, 0)),
+            // A difference: SUBTRACTOR, then UNSIGNED at the same address.
+            (0x10, entry(0, true, 5)),
+            (0x10, entry(1, true, 0)),
+            // Section-relative: the slot holds the address.
+            (0x18, entry(1, false, 0)),
+        ] {
+            put32(&mut f, address);
+            put32(&mut f, word);
+        }
+        assert_eq!(f.len(), 0x118);
+        for (strx, n_type, n_sect, value) in [(1u32, 0x0fu8, 1u8, 0x500u64), (6, 0x01, 0, 0)] {
+            put32(&mut f, strx);
+            f.extend_from_slice(&[n_type, n_sect, 0, 0]);
+            put64(&mut f, value);
+        }
+        f.extend_from_slice(b"\0_def\0_undef");
+        f
+    }
+
+    #[test]
+    fn object_file_pointers_follow_their_relocations() {
+        let mh = parse(object_file(), 0);
+        let d = PointerDecoder::new(&mh);
+        // Symbol address plus the addend in the slot.
+        assert_eq!(d.read(0xd0, true), Some(Pointer::Address(0x508)));
+        assert_eq!(
+            d.read(0xd8, true),
+            Some(Pointer::Import {
+                name: b"_undef",
+                addend: 0x10
+            })
+        );
+        // A difference of two symbols is a number.
+        assert_eq!(d.read(0xe0, true), Some(Pointer::Address(0x99)));
+        assert!(!d.has_relocation(0xe0));
+        // A section-relative entry: the value is the address.
+        assert_eq!(d.read(0xe8, true), Some(Pointer::Address(0x18)));
+        assert!(d.has_relocation(0xe8) && d.has_relocation(0xd0));
+        assert!(d.relocated_or_threaded(0xd8, 0).is_some());
+        assert!(d.relocated_or_threaded(0xe8, 0).is_none());
+    }
+
+    #[test]
+    fn relocations_out_of_range_are_ignored() {
+        // A symbol index past the table, and an entry past the section.
+        let mut file = object_file();
+        file[0xf4..0xf8].copy_from_slice(&(0x00ff_ffffu32 | 3 << 25 | 1 << 27).to_le_bytes());
+        file[0xf8..0xfc].copy_from_slice(&0x1cu32.to_le_bytes());
+        let mh = parse(file, 0);
+        let d = PointerDecoder::new(&mh);
+        assert_eq!(d.read(0xd0, true), Some(Pointer::Address(8)));
+        assert_eq!(d.read(0xd8, true), Some(Pointer::Address(0x10)));
+        // A relocation table that runs off the file.
+        let mut file = object_file();
+        file[0xa4..0xa8].copy_from_slice(&u32::MAX.to_le_bytes());
+        let mh = parse(file, 0);
+        assert_eq!(
+            PointerDecoder::new(&mh).read(0xd0, true),
+            Some(Pointer::Address(0x508))
+        );
     }
 
     #[test]

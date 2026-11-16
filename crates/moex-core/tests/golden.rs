@@ -39,6 +39,7 @@ const CASES: &[(&str, &str)] = &[
     ("tests/corpus/bin/hello_arm64", "hello_arm64"),
     ("tests/corpus/bin/hello_arm64e", "hello_arm64e"),
     ("tests/corpus/bin/hello_fat", "hello_fat"),
+    ("tests/corpus/bin/hello_ppc.o", "hello_ppc.o"),
     ("tests/corpus/bin/hello_signed_arm64", "hello_signed_arm64"),
     ("tests/corpus/bin/hello_x86_64", "hello_x86_64"),
     ("tests/corpus/bin/lib_arm64.o", "lib_arm64.o"),
@@ -181,10 +182,6 @@ fn reproducible_here(name: &str) -> bool {
     match name {
         "cxx_arm64" => cfg!(target_os = "macos"),
         "dyld_chained_x86_64.dylib" | "dyld_classic_x86_64.dylib" => !cfg!(windows),
-        // Capstone formats one negative 32-bit immediate differently when
-        // built with MSVC (`mov w28, #-0xffffffff80000000` for
-        // `#-0x80000000`).
-        "complex" => !cfg!(windows),
         _ => true,
     }
 }

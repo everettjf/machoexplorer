@@ -1,5 +1,5 @@
 //! "Xref Report" node: who refers to which address, from pointer sections
-//! and from the code of `__TEXT,__text` (calls, jumps, address computations
+//! and from the code sections (calls, jumps, address computations
 //! and memory accesses), followed by a call graph summary per instruction
 //! and per function.
 
@@ -26,17 +26,31 @@ impl Symbols {
     fn load(mh: &MachHeader) -> Self {
         let mut s = Symbols::default();
         let Some(symtab) = mh.symtab() else { return s };
+        // Whether the name at an address so far is that of a local symbol.
+        let mut local: HashMap<u64, bool> = HashMap::new();
         for sym in symtab.symbols() {
-            if sym.n_strx == 0 || sym.n_value == 0 || s.exact.contains_key(&sym.n_value) {
+            // Defined in a section: only such a symbol can be at address 0
+            // (the first function of an object file).
+            let in_section = sym.n_type & 0xe0 == 0 && sym.n_type & 0x0e == 0x0e;
+            let external = sym.n_type & 0x01 != 0;
+            if sym.n_strx == 0 || (sym.n_value == 0 && !in_section) {
                 continue;
             }
-            // The first named symbol at an address wins.
+            // The first named symbol at an address wins, except that an
+            // external symbol replaces a local one (`_main` rather than
+            // the assembler's `ltmp0`).
+            match local.get(&sym.n_value) {
+                Some(true) if external => {}
+                Some(_) => continue,
+                None => {}
+            }
             let name = symtab.string(sym.n_strx);
             if !name.is_empty() {
-                s.sorted.push((sym.n_value, name.clone()));
+                local.insert(sym.n_value, !external);
                 s.exact.insert(sym.n_value, name);
             }
         }
+        s.sorted = s.exact.iter().map(|(a, n)| (*a, n.clone())).collect();
         s.sorted.sort_by_key(|(addr, _)| *addr);
         s
     }

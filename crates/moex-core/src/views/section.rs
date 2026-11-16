@@ -134,7 +134,7 @@ fn content_views(section: &Section) -> Vec<(&'static str, TableBuilder)> {
     if sect == "__cfstring" {
         views.push(("ObjC CFStrings", Pointers(objc::cfstrings)));
     }
-    if seg == "__TEXT" && sect == "__text" {
+    if crate::macho::disasm::is_code_section(section) {
         views.push(("Disassembly (Capstone)", Plain(disasm::disassembly)));
     }
     if sect.starts_with("__swift5_") {
@@ -369,11 +369,12 @@ mod tests {
         Arc::new(MachHeader::parse(&image, 0).unwrap())
     }
 
-    /// `(row size, cells)` of the only content view of section `index`.
+    /// `(row size, cells)` of the first content view of section `index`
+    /// (the one its section type selects).
     fn view_rows(mh: &Arc<MachHeader>, index: usize) -> Vec<(u64, Vec<String>)> {
         let node = section_node(SectionContext::new(mh.clone()), index).unwrap();
-        let [child] = node.children() else {
-            panic!("expected one content view")
+        let Some(child) = node.children().first() else {
+            panic!("expected a content view")
         };
         // The node shows the section header, its view the contents.
         let section = mh.sections().nth(index).unwrap();
@@ -827,9 +828,25 @@ mod tests {
             )),
             ["Module Term Func Pointers"]
         );
+        // Stubs are code: listed as stubs and disassembled.
         assert_eq!(
             names(&section("__TEXT", "__stubs", 0x8000_0408)),
-            ["Symbol Stubs"]
+            ["Symbol Stubs", "Disassembly (Capstone)"]
+        );
+        // So is every section marked as instructions, whatever its name,
+        // but not one that only shares the name `__text`.
+        assert_eq!(
+            names(&section("__TEXT_EXEC", "__text", 0x8000_0400)),
+            ["Disassembly (Capstone)"]
+        );
+        assert_eq!(
+            names(&section("__TEXT", "__stub_helper", 0x8000_0400)),
+            ["Disassembly (Capstone)"]
+        );
+        assert_eq!(names(&section("__DATA", "__text", 0)), Vec::<&str>::new());
+        assert_eq!(
+            names(&section("__TEXT", "__text", 0x8000_0401)),
+            Vec::<&str>::new()
         );
         // Type view first, then the name-based one.
         assert_eq!(

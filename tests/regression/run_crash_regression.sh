@@ -103,7 +103,8 @@ write_hex "${IN_DIR}/ar_valid.a" "${macho64_header}"
 
 # A well-formed synthetic cache, then single-field corruptions of it.
 # Layout (see make_synthetic_cache): header 0..112, mapping at 112, image
-# table at 144, Mach-O image at 0x200 (load commands at 0x220).
+# table at 144, Mach-O image at 0x200 (load commands at 0x220), its
+# __LINKEDIT at 0x400.
 good_cache="${IN_DIR}/dyld_valid.cache"
 make_synthetic_cache "${good_cache}"
 
@@ -141,6 +142,14 @@ mutate seg_filesize_max       592 "ffffffffffffffff"
 mutate seg_filesize_past_end  592 "$(le64 0xe01)"
 mutate seg2_fileoff_overlaps  656 "$(le64 0x10)"
 mutate seg2_filesize_max      664 "ffffffffffffff7f"
+# LC_SYMTAB at 688 and its one nlist at 0x400: cache-extract rebuilds
+# __LINKEDIT from them.
+mutate symtab_symoff_outside  696 "$(le32 0x3fff)"
+mutate symtab_nsyms_max       700 "ffffffff"
+mutate symtab_stroff_max      704 "ffffffff"
+mutate symtab_strsize_max     708 "ffffffff"
+mutate nlist_strx_outside    1024 "$(le32 8)"
+mutate nlist_strx_max        1024 "ffffffff"
 
 # Cache without an image table but with a hostile sibling .map file.
 cp "${good_cache}" "${IN_DIR}/dyld_map_fallback.cache"

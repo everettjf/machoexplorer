@@ -33,8 +33,9 @@ pub struct MachHeader {
     pub flags: u32,
     /// Only meaningful when `is64`.
     pub reserved: u32,
-    /// The file is in the opposite (big-endian) byte order. Only the header
-    /// is decoded for such files: `loadcmds` and `segments` stay empty.
+    /// The Mach-O is big-endian (PowerPC and older architectures). `image`
+    /// is then a big-endian view of the file, so that everything read
+    /// through it comes out in the file's byte order.
     pub big_endian: bool,
     pub loadcmds: Vec<LoadCommand>,
     /// `LC_SEGMENT` / `LC_SEGMENT_64` commands in load-command order.
@@ -65,18 +66,15 @@ impl MachHeader {
         if !image.in_file(offset, size) {
             return err(OOB);
         }
-        // Every reader in this crate is little-endian. A byte-swapped
-        // (big-endian: PowerPC, m68k, ...) file gets its header decoded and
-        // is otherwise reported as unsupported instead of being misread.
+        // A byte-swapped magic means a big-endian file: read it through a
+        // big-endian view from here on.
         let swap = raw_magic == MH_CIGAM || raw_magic == MH_CIGAM_64;
-        let rd = |o: u64| {
-            let v = image.u32(offset + o).unwrap_or(0);
-            if swap {
-                v.swap_bytes()
-            } else {
-                v
-            }
+        let image = &if swap {
+            Arc::new(image.big_endian_view())
+        } else {
+            image.clone()
         };
+        let rd = |o: u64| image.u32(offset + o).unwrap_or(0);
         let mut mh = MachHeader {
             image: image.clone(),
             offset,
@@ -101,9 +99,6 @@ impl MachHeader {
         }
         if size + sizeofcmds > slice_size {
             return err("Malformed Mach-O: load commands exceed file size");
-        }
-        if swap {
-            return Ok(mh);
         }
         let align: u32 = if is64 { 8 } else { 4 };
         let mut cur = offset + size;
@@ -241,11 +236,11 @@ mod tests {
     }
 
     #[test]
-    fn big_endian_header_is_decoded_but_not_its_commands() {
+    fn big_endian_files_are_read_in_their_byte_order() {
         // 32-bit PowerPC executable with one LC_UUID command.
         let words = [MH_MAGIC, 18, 0, 2, 1, 24, 0x85, LC_UUID, 24, 1, 2, 3, 4];
         let mh = MachHeader::parse(&image(&words, true), 0).unwrap();
-        assert!(mh.big_endian);
+        assert!(mh.big_endian && mh.image.is_big_endian());
         assert_eq!(
             (
                 mh.magic,
@@ -257,12 +252,19 @@ mod tests {
             ),
             (MH_MAGIC, 18, 2, 1, 24, 0x85)
         );
-        assert!(mh.loadcmds.is_empty() && mh.segments.is_empty());
         assert_eq!(mh.arch(), "ppc");
-        // The same bytes in little-endian order are fully parsed.
-        let mh = MachHeader::parse(&image(&words, false), 0).unwrap();
-        assert!(!mh.big_endian);
         assert_eq!(mh.loadcmds.len(), 1);
+        let lc = mh.loadcmds[0];
+        assert_eq!((lc.cmd, lc.cmdsize, mh.lc_u32(&lc, 8)), (LC_UUID, 24, 1));
+        // The same words in little-endian order read the same.
+        let le = MachHeader::parse(&image(&words, false), 0).unwrap();
+        assert!(!le.big_endian && !le.image.is_big_endian());
+        assert_eq!(le.loadcmds.len(), 1);
+        assert_eq!(le.lc_u32(&le.loadcmds[0], 8), 1);
+        // A load command size that only makes sense in the other byte
+        // order is an error, not a misread.
+        let bad = [MH_MAGIC, 18, 0, 2, 1, 24, 0, LC_UUID, 24u32.swap_bytes()];
+        assert!(MachHeader::parse(&image(&bad, true), 0).is_err());
     }
 
     #[test]

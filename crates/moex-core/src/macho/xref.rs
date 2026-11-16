@@ -1,24 +1,34 @@
 //! Cross references: pointer values stored in pointer-like sections plus
-//! what the code of `__TEXT,__text` refers to.
+//! what the code sections (`__text`, `__stubs`, `__stub_helper`, ...) refer
+//! to.
 //!
 //! The code is decoded by Capstone (see [`super::disasm`]) region by region:
 //! decoding restarts at every symbol and function start and steps over
 //! data-in-code ranges and undecodable bytes. Per instruction the
-//! architecture modules ([`arm64`], [`x86`], [`arm`]) turn Capstone's
+//! architecture modules ([`arm64`], [`x86`], [`arm`], [`ppc`]) turn Capstone's
 //! groups, operands and register access lists into a [`Step`]; the sweep
 //! follows the values of the general registers through straight-line code
 //! to complete addresses that take more than one instruction (`adrp` +
 //! `add`, `adrp` + `ldr`, loads through a pointer slot).
 //!
-//! This is a linear sweep, not a data-flow analysis: what a register holds
-//! is forgotten at every region start, after an unconditional jump or a
-//! return, across calls (caller-saved registers) and whenever an
-//! instruction writes it in a way the sweep does not model. A label that is
-//! reached both by falling through and by a jump is treated as if only the
-//! fall-through existed.
+//! Register values are followed within one run of code at a time (the
+//! instructions between two places where decoding restarts: in practice a
+//! function), along every path: at a label, what a register holds is what
+//! it holds on all the ways of getting there, loops included. Nothing is
+//! known at the start of a run, at a label that is also reached from
+//! elsewhere, across calls (caller-saved registers) and whenever an
+//! instruction writes a register in a way the sweep does not model.
+//! Indirect jumps (jump tables) are not followed: the code after an
+//! unconditional jump or a return starts with nothing known unless a
+//! direct jump leads there.
+//!
+//! In an object file the operands of an instruction a relocation patches
+//! are placeholders; the relocation entry supplies the symbol, and with it
+//! the address when the symbol is defined in the file.
 
 mod arm;
 mod arm64;
+mod ppc;
 mod x86;
 
 use super::chained_fixups::{
@@ -29,10 +39,12 @@ use super::chained_fixups::{
 };
 use super::disasm::{self, Disassembler, Item};
 use super::header::MachHeader;
+use super::ptr::{Pointer as Decoded, PointerDecoder};
+use super::reloc;
 use super::segment::Section;
 use crate::consts::{
-    CPU_TYPE_ARM, CPU_TYPE_ARM64, CPU_TYPE_ARM64_32, CPU_TYPE_I386, CPU_TYPE_X86_64,
-    LC_DYLD_CHAINED_FIXUPS,
+    CPU_TYPE_ARM, CPU_TYPE_ARM64, CPU_TYPE_ARM64_32, CPU_TYPE_I386, CPU_TYPE_POWERPC,
+    CPU_TYPE_POWERPC64, CPU_TYPE_X86_64, LC_DYLD_CHAINED_FIXUPS, MH_OBJECT,
 };
 use capstone::{Capstone, Insn, InsnGroupType};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -178,6 +190,7 @@ enum Arch {
     X64,
     Arm64,
     Arm,
+    Ppc,
 }
 
 impl Arch {
@@ -187,6 +200,7 @@ impl Arch {
             CPU_TYPE_X86_64 => Some(Arch::X64),
             CPU_TYPE_ARM64 | CPU_TYPE_ARM64_32 => Some(Arch::Arm64),
             CPU_TYPE_ARM => Some(Arch::Arm),
+            CPU_TYPE_POWERPC | CPU_TYPE_POWERPC64 => Some(Arch::Ppc),
             _ => None,
         }
     }
@@ -197,6 +211,7 @@ impl Arch {
             Arch::Arm64 => arm64::step(insn, &detail),
             Arch::X64 | Arch::X86 => x86::step(insn, &detail),
             Arch::Arm => arm::step(insn, &detail),
+            Arch::Ppc => ppc::step(insn, &detail),
         })
     }
 
@@ -209,7 +224,7 @@ impl Arch {
             Arch::X64 => 0x0fc7,
             // eax, ecx, edx.
             Arch::X86 => 0x0007,
-            Arch::Arm => 0,
+            Arch::Arm | Arch::Ppc => 0,
         }
     }
 }
@@ -415,6 +430,8 @@ struct Memory<'a> {
     /// Chained pointer format per segment (by load command order), from
     /// `LC_DYLD_CHAINED_FIXUPS`; `None` for segments without fixups.
     chained: Vec<Option<u16>>,
+    /// For the slots of object-file relocations and threaded binds.
+    decoder: PointerDecoder<'a>,
 }
 
 impl<'a> Memory<'a> {
@@ -424,6 +441,7 @@ impl<'a> Memory<'a> {
             pointer_size: if mh.is64 { 8 } else { 4 },
             image_base: mh.base_address(),
             chained: chained_formats(mh),
+            decoder: PointerDecoder::new(mh),
         }
     }
 
@@ -457,7 +475,8 @@ impl<'a> Memory<'a> {
         Some((index, offset))
     }
 
-    /// The little-endian value of `size` (1, 2, 4 or 8) bytes at `vmaddr`.
+    /// The value of `size` (1, 2, 4 or 8) bytes at `vmaddr`, in the byte
+    /// order of the file.
     fn read(&self, vmaddr: u64, size: u8) -> Option<u64> {
         let (_, offset) = self.locate(vmaddr, size as u64)?;
         let image = &self.mh.image;
@@ -470,9 +489,19 @@ impl<'a> Memory<'a> {
         }
     }
 
-    /// What the raw pointer value `raw`, stored in segment `segment`, will
-    /// point at. `None` for null and for pointers bound at load time.
-    fn resolve(&self, segment: Option<usize>, raw: u64) -> Option<u64> {
+    /// What the raw pointer value `raw`, stored at file offset `at` in
+    /// segment `segment`, will point at. `None` for null and for pointers
+    /// bound at load time.
+    fn resolve(&self, segment: Option<usize>, at: u64, raw: u64) -> Option<u64> {
+        // A relocation of an object file or a threaded fixup decides.
+        match self.decoder.relocated_or_threaded(at, raw) {
+            // An object file can define a symbol at address 0.
+            Some(Decoded::Address(address)) => {
+                return (address != 0 || self.mh.filetype == MH_OBJECT).then_some(address)
+            }
+            Some(Decoded::Import { .. }) => return None,
+            None => {}
+        }
         if raw == 0 {
             return None;
         }
@@ -488,8 +517,8 @@ impl<'a> Memory<'a> {
 
     /// The address the pointer stored at `vmaddr` will hold.
     fn pointer(&self, vmaddr: u64) -> Option<u64> {
-        let (segment, _) = self.locate(vmaddr, self.pointer_size as u64)?;
-        self.resolve(Some(segment), self.read(vmaddr, self.pointer_size)?)
+        let (segment, at) = self.locate(vmaddr, self.pointer_size as u64)?;
+        self.resolve(Some(segment), at, self.read(vmaddr, self.pointer_size)?)
     }
 }
 
@@ -528,26 +557,215 @@ fn scan_budget(mh: &MachHeader) -> u64 {
     mh.image.len().saturating_mul(4).saturating_add(4096)
 }
 
-/// Offsets into `sect` that a relocation entry patches, sorted. Only
-/// object files have them.
-fn relocated_offsets(mh: &MachHeader, sect: &Section) -> Vec<u64> {
-    // Scattered entries (high bit of the first word) exist on the 32-bit
-    // architectures only; elsewhere the word is the offset itself.
-    let scattered = matches!(mh.cputype, CPU_TYPE_I386 | CPU_TYPE_ARM);
-    let mut out = Vec::new();
-    let Some(table) = mh.offset.checked_add(sect.reloff as u64) else {
-        return out;
+/// What a relocation entry of an object file does to the instruction it
+/// patches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Patch {
+    /// The operands already hold the address (section-relative entries:
+    /// the assembler wrote the value the linker would).
+    Keep,
+    /// Not resolved: an undefined symbol, a difference of two addresses, a
+    /// thread-local or other special entry.
+    Drop,
+    /// x86-64, pc-relative, to a symbol defined at `symbol`. The decoded
+    /// operand is `bias + addend`. `got`: through the symbol's GOT slot.
+    X64 { symbol: u64, bias: u64, got: bool },
+    /// arm64 entry of type `kind` whose target (symbol plus addend) is
+    /// `target`.
+    A64 { kind: u8, target: u64 },
+}
+
+/// The patches of a code section, sorted by the section offset they apply
+/// to. Charges `budget` 8 bytes per entry read.
+fn code_patches(mh: &MachHeader, sect: &Section, budget: &mut u64) -> Vec<(u32, Patch)> {
+    use reloc::*;
+    let entries = section_relocs(mh, sect, *budget / ENTRY_SIZE);
+    *budget -= entries.len() as u64 * ENTRY_SIZE;
+    let symtab = mh.symtab();
+    // Address of a symbol defined in this file.
+    let defined = |index: u32| {
+        let symbol = symtab.as_ref()?.symbol(index)?;
+        let here = symbol.n_type & 0xe0 == 0 && matches!(symbol.n_type & 0x0e, 0x0e | 0x02);
+        here.then_some(symbol.n_value)
     };
-    for i in 0..sect.nreloc as u64 {
-        // Entries are 8 bytes; the table ends where the file does.
-        let Some(word) = table.checked_add(i * 8).and_then(|at| mh.image.u32(at)) else {
-            break;
+    let mut out: Vec<(u32, Patch)> = Vec::with_capacity(entries.len());
+    // `ARM64_RELOC_ADDEND` applies to the entry after it.
+    let mut addend: Option<(u32, i64)> = None;
+    for r in entries {
+        let patch = match mh.cputype {
+            _ if r.scattered => {
+                // The entry names the target's address, which the operand
+                // holds too; section differences are not addresses.
+                if r.kind == RELOC_UNSIGNED {
+                    Patch::Keep
+                } else {
+                    Patch::Drop
+                }
+            }
+            CPU_TYPE_X86_64 => match (r.kind, r.external, r.pcrel) {
+                (
+                    X86_64_RELOC_SIGNED
+                    | X86_64_RELOC_SIGNED_1
+                    | X86_64_RELOC_SIGNED_2
+                    | X86_64_RELOC_SIGNED_4
+                    | X86_64_RELOC_BRANCH,
+                    false,
+                    true,
+                ) => Patch::Keep,
+                (
+                    kind @ (X86_64_RELOC_SIGNED
+                    | X86_64_RELOC_SIGNED_1
+                    | X86_64_RELOC_SIGNED_2
+                    | X86_64_RELOC_SIGNED_4
+                    | X86_64_RELOC_BRANCH
+                    | X86_64_RELOC_GOT_LOAD
+                    | X86_64_RELOC_GOT),
+                    true,
+                    true,
+                ) if r.length == 2 => match defined(r.symbolnum) {
+                    Some(symbol) => Patch::X64 {
+                        symbol,
+                        // The stored displacement counts from the end of
+                        // its own four bytes.
+                        bias: sect.addr.wrapping_add(u64::from(r.address)).wrapping_add(4),
+                        got: matches!(kind, X86_64_RELOC_GOT_LOAD | X86_64_RELOC_GOT),
+                    },
+                    None => Patch::Drop,
+                },
+                _ => Patch::Drop,
+            },
+            CPU_TYPE_ARM64 | CPU_TYPE_ARM64_32 => {
+                if r.kind == ARM64_RELOC_ADDEND {
+                    // A signed 24-bit number in place of the symbol.
+                    let value = ((r.symbolnum << 8) as i32 >> 8) as i64;
+                    addend = Some((r.address, value));
+                    continue;
+                }
+                let extra = match addend.take() {
+                    Some((address, value)) if address == r.address => value,
+                    _ => 0,
+                };
+                match r.kind {
+                    ARM64_RELOC_BRANCH26
+                    | ARM64_RELOC_PAGE21
+                    | ARM64_RELOC_PAGEOFF12
+                    | ARM64_RELOC_GOT_LOAD_PAGEOFF12
+                        if r.external =>
+                    {
+                        match defined(r.symbolnum) {
+                            Some(symbol) => Patch::A64 {
+                                kind: r.kind,
+                                target: symbol.wrapping_add(extra as u64),
+                            },
+                            None => Patch::Drop,
+                        }
+                    }
+                    ARM64_RELOC_BRANCH26 | ARM64_RELOC_PAGE21 | ARM64_RELOC_PAGEOFF12 => {
+                        Patch::Keep
+                    }
+                    _ => Patch::Drop,
+                }
+            }
+            // 32-bit x86 and ARM: a section-relative entry leaves the
+            // address in the instruction; what an external one leaves
+            // there depends on the instruction form and is not followed.
+            _ => {
+                if !r.external && r.kind == RELOC_UNSIGNED {
+                    Patch::Keep
+                } else {
+                    Patch::Drop
+                }
+            }
         };
-        out.push(if scattered && word & 0x8000_0000 != 0 {
-            (word & 0x00ff_ffff) as u64
-        } else {
-            word as u64
-        });
+        out.push((r.address, patch));
+    }
+    // Stable, so entries for one offset stay in table order.
+    out.sort_by_key(|p| p.0);
+    out
+}
+
+/// Targets of the direct jumps and calls of a code section, sorted, one
+/// entry per instruction. The sweep uses them to know every way a label is
+/// reached; calls are included so that a label that is called is never
+/// taken for one that is only fallen into.
+fn branch_targets(
+    mh: &MachHeader,
+    arch: Arch,
+    code: &[u8],
+    base: u64,
+    regions: &[disasm::Region],
+) -> Vec<u64> {
+    let mut out = Vec::new();
+    match arch {
+        // Fixed-width instructions: the branch encodings are recognised
+        // directly. A word Capstone would not decode can add a label, which
+        // only makes the sweep more careful.
+        Arch::Arm64 => {
+            for region in regions {
+                if !matches!(region.kind, disasm::RegionKind::Code { .. }) {
+                    continue;
+                }
+                let Some(chunk) = code.get(region.start..region.end) else {
+                    continue;
+                };
+                for (i, word) in chunk.chunks_exact(4).enumerate() {
+                    let word = u32::from_le_bytes([word[0], word[1], word[2], word[3]]);
+                    let field = |shift: u32, bits: u32| {
+                        let value = (word >> shift) & ((1 << bits) - 1);
+                        // Sign-extend and scale by the instruction size.
+                        (((value << (32 - bits)) as i32) >> (32 - bits)) as i64 * 4
+                    };
+                    let offset = if word & 0x7c00_0000 == 0x1400_0000 {
+                        // b, bl
+                        field(0, 26)
+                    } else if word & 0xff00_0000 == 0x5400_0000 || word & 0x7e00_0000 == 0x3400_0000
+                    {
+                        // b.cond, bc.cond, cbz, cbnz
+                        field(5, 19)
+                    } else if word & 0x7e00_0000 == 0x3600_0000 {
+                        // tbz, tbnz
+                        field(5, 14)
+                    } else {
+                        continue;
+                    };
+                    let at = base.wrapping_add((region.start + 4 * i) as u64);
+                    out.push(at.wrapping_add(offset as u64));
+                }
+            }
+        }
+        // Variable-width: decoded without operand details, the target read
+        // from the text of the one operand a direct branch has.
+        Arch::X64 | Arch::X86 => {
+            if let Ok(plain) = Disassembler::new(mh.cputype, mh.cpusubtype, false) {
+                let _ = plain.run(code, base, regions, |item| {
+                    let Item::Code { insn, .. } = item else {
+                        return;
+                    };
+                    let mnemonic = insn.mnemonic().unwrap_or("");
+                    if !(mnemonic.starts_with('j')
+                        || mnemonic.starts_with("loop")
+                        || mnemonic == "call")
+                    {
+                        return;
+                    }
+                    let target = insn
+                        .op_str()
+                        .and_then(|text| text.strip_prefix("0x"))
+                        .and_then(|digits| u64::from_str_radix(digits, 16).ok());
+                    // `call next` only reads the program counter (32-bit
+                    // position-independent code): nothing arrives there
+                    // from elsewhere.
+                    let next = insn.address().wrapping_add(insn.len() as u64);
+                    let reads_pc = arch == Arch::X86 && mnemonic == "call" && target == Some(next);
+                    if let Some(target) = target.filter(|_| !reads_pc) {
+                        out.push(target);
+                    }
+                });
+            }
+        }
+        // No registers are followed for 32-bit ARM and PowerPC, so labels
+        // do not matter.
+        Arch::Arm | Arch::Ppc => {}
     }
     out.sort_unstable();
     out
@@ -558,6 +776,7 @@ pub fn collect(mh: &MachHeader) -> Xrefs {
     let mut refs = Xrefs::default();
     let mut budget = scan_budget(mh);
     let memory = Memory::new(mh);
+    let object = mh.filetype == MH_OBJECT;
 
     // 32-bit segments first, then 64-bit ones.
     for want64 in [false, true] {
@@ -578,17 +797,22 @@ pub fn collect(mh: &MachHeader) -> Xrefs {
                 let source = refs.source(format!("{}/{}", sect.segname, sect.sectname));
                 let width = if sect.is64 { 8 } else { 4 };
                 for (i, chunk) in data.chunks_exact(width).enumerate() {
-                    let mut raw = [0u8; 8];
-                    for (dst, src) in raw.iter_mut().zip(chunk) {
-                        *dst = *src;
-                    }
+                    let raw = mh.image.value_of(chunk).unwrap_or(0);
+                    let ref_raw = sect.data_offset.wrapping_add((i * width) as u64);
+                    // In an object file addresses start at 0, so any small
+                    // number looks mapped; there the relocation entries
+                    // say which slots are pointers.
+                    let is_pointer = |target: u64| match scan {
+                        PointerScan::All => true,
+                        _ if object => memory.decoder.has_relocation(ref_raw),
+                        _ => memory.is_mapped(target),
+                    };
                     let Some(target) = memory
-                        .resolve(Some(seg_index), u64::from_le_bytes(raw))
-                        .filter(|t| scan == PointerScan::All || memory.is_mapped(*t))
+                        .resolve(Some(seg_index), ref_raw, raw)
+                        .filter(|t| is_pointer(*t))
                     else {
                         continue;
                     };
-                    let ref_raw = sect.data_offset.wrapping_add((i * width) as u64);
                     refs.add(
                         target,
                         RefItem {
@@ -617,7 +841,7 @@ pub fn collect(mh: &MachHeader) -> Xrefs {
                 .filter(|s| s.is64 == want64)
                 .flat_map(|s| s.sections.iter())
             {
-                if sect.segname != "__TEXT" || sect.sectname != "__text" {
+                if !disasm::is_code_section(sect) {
                     continue;
                 }
                 let code = sect.data(&mh.image);
@@ -629,20 +853,20 @@ pub fn collect(mh: &MachHeader) -> Xrefs {
                 }
                 // Besides its bytes, a swept section costs a walk over the
                 // symbols, function starts and relocations; charging for
-                // that keeps a file with thousands of `__text` sections
+                // that keeps a file with thousands of code sections
                 // from repeating it for each.
                 budget = (budget - code.len() as u64).saturating_sub(mh.image.len() / 4);
+                let regions = disasm::regions(mh, sect, code.len());
                 let mut sweep = Sweep {
                     memory: &memory,
                     arch,
-                    source: refs.source("__TEXT/__text".to_string()),
+                    source: refs.source(format!("{}/{}", sect.segname, sect.sectname)),
                     base: sect.addr,
                     raw_base: sect.data_offset,
-                    relocated: relocated_offsets(mh, sect),
-                    regs: [None; 32],
-                    pushed_pc: None,
+                    patches: code_patches(mh, sect, &mut budget),
+                    targets: branch_targets(mh, arch, code, sect.addr, &regions),
+                    run: Vec::new(),
                 };
-                let regions = disasm::regions(mh, sect, code.len());
                 // An engine failure only loses the rest of this section.
                 let _ = disassembler.run(code, sect.addr, &regions, |item| match item {
                     Item::Code {
@@ -651,12 +875,24 @@ pub fn collect(mh: &MachHeader) -> Xrefs {
                         region_start,
                     } => {
                         if region_start {
-                            sweep.forget();
+                            sweep.flush(&mut refs);
                         }
                         sweep.instruction(cs, insn, &mut refs);
                     }
-                    Item::Data { .. } => sweep.forget(),
+                    Item::Extra {
+                        address,
+                        insn,
+                        region_start,
+                        ..
+                    } => {
+                        if region_start {
+                            sweep.flush(&mut refs);
+                        }
+                        sweep.extra(address, insn, &mut refs);
+                    }
+                    Item::Data { .. } => sweep.flush(&mut refs),
                 });
+                sweep.flush(&mut refs);
             }
         }
     }
@@ -675,7 +911,67 @@ struct Value {
     address: bool,
 }
 
-/// Linear sweep over one `__TEXT,__text` section.
+/// What is known at one point of the code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct State {
+    regs: [Option<Value>; 32],
+    /// Return address pushed by a call to the next instruction.
+    pushed_pc: Option<u64>,
+}
+
+impl State {
+    /// Nothing is known.
+    const UNKNOWN: State = State {
+        regs: [None; 32],
+        pushed_pc: None,
+    };
+
+    fn reg(&self, reg: Reg) -> Option<Value> {
+        self.regs.get(reg as usize).copied().flatten()
+    }
+
+    /// What holds whichever of the two states the code came from.
+    fn meet(&self, other: &State) -> State {
+        let mut out = State::UNKNOWN;
+        for ((slot, a), b) in out.regs.iter_mut().zip(&self.regs).zip(&other.regs) {
+            if a == b {
+                *slot = *a;
+            }
+        }
+        if self.pushed_pc == other.pushed_pc {
+            out.pushed_pc = self.pushed_pc;
+        }
+        out
+    }
+}
+
+/// One instruction of a run, as the sweep sees it.
+#[derive(Debug, Clone, Copy)]
+struct Seen {
+    address: u64,
+    len: u8,
+    step: Step,
+    /// A relocation changed where it points.
+    patched: bool,
+}
+
+/// Longest run analysed as one piece. A longer stretch without a symbol or
+/// function start is cut; labels reached from the other piece are then
+/// treated as reached from outside.
+const MAX_RUN: usize = 1 << 16;
+
+/// Passes over a run before giving up on loops: each pass can only lose
+/// knowledge at a label, and there are 32 registers to lose.
+const MAX_PASSES: usize = 40;
+
+/// Sweep over one code section, one run at a time. A run is the code
+/// between two places where decoding restarts (symbols, function starts,
+/// data): in practice a function. Within a run the values of the general
+/// registers are followed along every path: at a label the sweep knows
+/// what holds on all the ways of reaching it (falling in from above and
+/// each jump to it, loops included). A label that is also reached from
+/// another run, by a call, or by a jump whose target a relocation supplies
+/// starts with nothing known, as does every run.
 struct Sweep<'a> {
     memory: &'a Memory<'a>,
     arch: Arch,
@@ -685,80 +981,325 @@ struct Sweep<'a> {
     base: u64,
     /// File offset of the first byte.
     raw_base: u64,
-    /// Section offsets patched by relocations, sorted.
-    relocated: Vec<u64>,
-    regs: [Option<Value>; 32],
-    /// Return address pushed by a call to the next instruction.
-    pushed_pc: Option<u64>,
+    /// What relocations do, by section offset, sorted.
+    patches: Vec<(u32, Patch)>,
+    /// Every direct jump and call target of the section, sorted.
+    targets: Vec<u64>,
+    /// The instructions of the current run.
+    run: Vec<Seen>,
 }
 
 impl Sweep<'_> {
-    fn forget(&mut self) {
-        self.regs = [None; 32];
-        self.pushed_pc = None;
-    }
-
-    fn reg(&self, reg: Reg) -> Option<Value> {
-        self.regs.get(reg as usize).copied().flatten()
-    }
-
     /// The address of a memory operand, when the base register is known.
-    fn address_of(&self, mem: Mem) -> Option<Value> {
+    fn address_of(state: &State, mem: Mem) -> Option<Value> {
         match mem.base {
             None => Some(Value {
                 value: mem.offset,
                 address: true,
             }),
-            Some(base) => self.reg(base).map(|v| Value {
+            Some(base) => state.reg(base).map(|v| Value {
                 value: v.value.wrapping_add(mem.offset),
                 address: v.address,
             }),
         }
     }
 
-    /// True when a relocation patches the instruction: its operands are
-    /// placeholders until the object file is linked.
-    fn is_relocated(&self, offset: u64, len: u64) -> bool {
-        let i = self.relocated.partition_point(|r| *r < offset);
-        self.relocated
-            .get(i)
-            .is_some_and(|r| *r < offset.saturating_add(len))
+    /// The patch of the instruction at section offset `offset`; `Drop` when
+    /// several entries patch it.
+    fn patch(&self, offset: u64, len: u64) -> Option<Patch> {
+        let i = self.patches.partition_point(|p| u64::from(p.0) < offset);
+        let end = offset.saturating_add(len);
+        let mut inside = self
+            .patches
+            .get(i..)
+            .unwrap_or(&[])
+            .iter()
+            .take_while(|p| u64::from(p.0) < end);
+        let first = inside.next()?.1;
+        Some(if inside.next().is_some() {
+            Patch::Drop
+        } else {
+            first
+        })
+    }
+
+    /// Applies a relocation to what was decoded. True when the step now
+    /// points somewhere the bytes alone do not say.
+    fn apply_patch(step: &mut Step, patch: Patch) -> bool {
+        let drop = |step: &mut Step| {
+            step.target = Target::None;
+            step.mem = None;
+            step.def = Def::None;
+        };
+        match patch {
+            Patch::Keep => return false,
+            Patch::Drop => drop(step),
+            Patch::X64 { symbol, bias, got } => {
+                let moved = |decoded: u64| symbol.wrapping_add(decoded.wrapping_sub(bias));
+                match (step.flow, step.target, step.mem) {
+                    (Flow::Call | Flow::Jump { .. }, Target::Address(decoded), _) if !got => {
+                        step.target = Target::Address(moved(decoded));
+                    }
+                    // `call [rip + sym@GOTPCREL]` calls the symbol.
+                    (Flow::Call | Flow::Jump { .. }, Target::Mem, Some((mem, _)))
+                        if got && mem.base.is_none() =>
+                    {
+                        step.target = Target::Address(moved(mem.offset));
+                        step.mem = None;
+                    }
+                    (Flow::None, _, Some((mem, usage))) if mem.base.is_none() => {
+                        let address = moved(mem.offset);
+                        if got {
+                            // Loading the GOT slot yields the address.
+                            step.mem = None;
+                            step.def = match step.def {
+                                Def::Load { size: 8, .. } => Def::Address(address),
+                                _ => Def::None,
+                            };
+                        } else {
+                            step.mem = Some((
+                                Mem {
+                                    base: None,
+                                    offset: address,
+                                },
+                                usage,
+                            ));
+                        }
+                    }
+                    _ => drop(step),
+                }
+            }
+            Patch::A64 { kind, target } => match (kind, step.flow, step.def, step.mem) {
+                (reloc::ARM64_RELOC_BRANCH26, Flow::Call | Flow::Jump { .. }, _, _) => {
+                    step.target = Target::Address(target);
+                }
+                (reloc::ARM64_RELOC_PAGE21, Flow::None, Def::Page(_), _) => {
+                    step.def = Def::Page(target & !0xfff);
+                }
+                (reloc::ARM64_RELOC_PAGEOFF12, Flow::None, Def::Add { src, .. }, _) => {
+                    step.def = Def::Add {
+                        src,
+                        imm: target & 0xfff,
+                    };
+                }
+                (reloc::ARM64_RELOC_PAGEOFF12, Flow::None, _, Some((mem, usage)))
+                    if mem.base.is_some() =>
+                {
+                    step.mem = Some((
+                        Mem {
+                            offset: target & 0xfff,
+                            ..mem
+                        },
+                        usage,
+                    ));
+                }
+                // Loading the GOT slot yields the address.
+                (
+                    reloc::ARM64_RELOC_GOT_LOAD_PAGEOFF12,
+                    Flow::None,
+                    Def::Load { size: 8, .. },
+                    _,
+                ) => {
+                    step.mem = None;
+                    step.def = Def::Address(target);
+                }
+                _ => drop(step),
+            },
+        }
+        true
+    }
+
+    fn push(&mut self, seen: Seen, refs: &mut Xrefs) {
+        if self.run.len() >= MAX_RUN {
+            self.flush(refs);
+        }
+        self.run.push(seen);
     }
 
     fn instruction(&mut self, cs: &Capstone, insn: &Insn<'_>, refs: &mut Xrefs) {
         let address = insn.address();
-        let offset = address.wrapping_sub(self.base);
-        let next = address.wrapping_add(insn.len() as u64);
+        let len = insn.len() as u64;
         let Some(mut step) = self.arch.step(cs, insn) else {
-            self.forget();
+            // Nothing is known about what it does.
+            self.flush(refs);
             return;
         };
-        if self.is_relocated(offset, insn.len() as u64) {
-            step.target = Target::None;
-            step.mem = None;
-            step.def = Def::None;
+        let patched = self
+            .patch(address.wrapping_sub(self.base), len)
+            .is_some_and(|patch| Self::apply_patch(&mut step, patch));
+        self.push(
+            Seen {
+                address,
+                len: len as u8,
+                step,
+                patched,
+            },
+            refs,
+        );
+    }
+
+    /// An instruction decoded outside Capstone: it refers to nothing, but
+    /// what it writes is no longer known and a return ends the path.
+    fn extra(&mut self, address: u64, insn: &disasm::extra::Extra, refs: &mut Xrefs) {
+        let step = Step {
+            flow: if insn.returns {
+                Flow::Return
+            } else {
+                Flow::None
+            },
+            writes: insn.writes.map_or(0, bit),
+            ..Step::default()
+        };
+        self.push(
+            Seen {
+                address,
+                len: insn.len as u8,
+                step,
+                patched: false,
+            },
+            refs,
+        );
+    }
+
+    /// Number of direct jumps and calls of the section that go to `address`.
+    fn branches_to(&self, address: u64) -> usize {
+        let from = self.targets.partition_point(|t| *t < address);
+        self.targets
+            .get(from..)
+            .unwrap_or(&[])
+            .iter()
+            .take_while(|t| **t == address)
+            .count()
+    }
+
+    /// Analyses the current run and reports its references.
+    fn flush(&mut self, refs: &mut Xrefs) {
+        let run = std::mem::take(&mut self.run);
+        if run.is_empty() {
+            return;
+        }
+        // Index of the instruction at an address of the run.
+        let index_of = |address: u64| run.binary_search_by_key(&address, |s| s.address).ok();
+        let jump_to = |seen: &Seen| match (seen.step.flow, seen.step.target) {
+            (Flow::Jump { .. }, Target::Address(target)) => index_of(target),
+            _ => None,
+        };
+
+        // Labels: instructions something branches to. `inside` counts the
+        // jumps of this run whose target the bytes give; when the section
+        // has more branches to the label than that, some come from
+        // elsewhere and nothing is assumed there.
+        let mut labels: HashMap<usize, Label> = HashMap::new();
+        for seen in &run {
+            if let Some(target) = jump_to(seen) {
+                let label = labels.entry(target).or_default();
+                if seen.patched {
+                    label.outside = true;
+                } else {
+                    label.inside += 1;
+                }
+            }
+        }
+        for (index, seen) in run.iter().enumerate() {
+            let branches = self.branches_to(seen.address);
+            if branches == 0 && !labels.contains_key(&index) {
+                continue;
+            }
+            let label = labels.entry(index).or_default();
+            if branches != label.inside || index == 0 {
+                label.outside = true;
+            }
         }
 
+        // Passes until what is known at the labels no longer changes. The
+        // first pass takes a loop's head as reached from above only; the
+        // jump back then takes away whatever the loop body changes.
+        let mut settled = false;
+        for _ in 0..MAX_PASSES {
+            if !self.pass(&run, &mut labels, &jump_to, None) {
+                settled = true;
+                break;
+            }
+        }
+        if !settled {
+            for label in labels.values_mut() {
+                label.outside = true;
+            }
+        }
+        self.pass(&run, &mut labels, &jump_to, Some(refs));
+    }
+
+    /// One pass over a run in address order. Returns whether a jump back
+    /// lowered what is known at its label, so that another pass is needed.
+    /// With `refs`, reports the references instead.
+    fn pass(
+        &self,
+        run: &[Seen],
+        labels: &mut HashMap<usize, Label>,
+        jump_to: &impl Fn(&Seen) -> Option<usize>,
+        mut refs: Option<&mut Xrefs>,
+    ) -> bool {
+        let mut changed = false;
+        // The state falling into the next instruction; `None` after a
+        // return or an unconditional jump.
+        let mut falling: Option<State> = Some(State::UNKNOWN);
+        for (index, seen) in run.iter().enumerate() {
+            let state = match labels.get(&index) {
+                Some(label) if label.outside => State::UNKNOWN,
+                Some(label) => match (falling, label.jumped) {
+                    (Some(a), Some(b)) => a.meet(&b),
+                    (Some(a), None) => a,
+                    (None, Some(b)) => b,
+                    // Only reached by jumps that come later.
+                    (None, None) => State::UNKNOWN,
+                },
+                // Not a label: reached from above, or (after a return or a
+                // jump) by a way the sweep does not see.
+                None => falling.unwrap_or(State::UNKNOWN),
+            };
+            let after = self.transfer(&state, seen, refs.as_deref_mut());
+            if let Some(target) = jump_to(seen) {
+                if let Some(label) = labels.get_mut(&target) {
+                    let merged = label.jumped.map_or(after, |known| known.meet(&after));
+                    if label.jumped != Some(merged) {
+                        label.jumped = Some(merged);
+                        // A label at or before the jump has already been
+                        // passed with what was known until now.
+                        changed |= target <= index && !label.outside;
+                    }
+                }
+            }
+            falling = (!matches!(
+                seen.step.flow,
+                Flow::Return | Flow::Jump { conditional: false }
+            ))
+            .then_some(after);
+        }
+        changed
+    }
+
+    /// The state after an instruction executed in `state`. With `refs`,
+    /// also reports what the instruction refers to.
+    fn transfer(&self, state: &State, seen: &Seen, refs: Option<&mut Xrefs>) -> State {
+        let step = &seen.step;
+        let address = seen.address;
+        let next = address.wrapping_add(u64::from(seen.len));
         let source = self.source;
-        let ref_raw = self.raw_base.wrapping_add(offset);
+        let ref_raw = self.raw_base.wrapping_add(address.wrapping_sub(self.base));
+        let mut found: Vec<(u64, RefKind)> = Vec::new();
+        // Address 0 is null, except where a relocation names the symbol
+        // that an object file defines there.
+        let zero_is_real = seen.patched;
         let mut add = |target: u64, kind: RefKind| {
-            if target != 0 {
-                refs.add(
-                    target,
-                    RefItem {
-                        source,
-                        kind,
-                        ref_raw,
-                        ref_vm: address,
-                    },
-                );
+            if target != 0 || zero_is_real {
+                found.push((target, kind));
             }
         };
 
         // Data: the address of the memory operand.
         let mem = step
             .mem
-            .and_then(|(mem, usage)| Some((mem, usage, self.address_of(mem)?)));
+            .and_then(|(mem, usage)| Some((mem, usage, Self::address_of(state, mem)?)));
         if let Some((_, usage, at)) = mem.filter(|(_, _, at)| at.address) {
             add(
                 at.value,
@@ -788,15 +1329,15 @@ impl Sweep<'_> {
                     address: true,
                 })
             }
-            Def::Add { src, imm } => self.reg(src).map(|v| {
+            Def::Add { src, imm } => state.reg(src).map(|v| {
                 let value = v.value.wrapping_add(imm);
                 if v.address {
                     add(value, RefKind::Address);
                 }
                 Value { value, ..v }
             }),
-            Def::Copy { src } => self.reg(src),
-            Def::MovK { imm16, shift } => step.dst.and_then(|dst| self.reg(dst)).map(|v| {
+            Def::Copy { src } => state.reg(src),
+            Def::MovK { imm16, shift } => step.dst.and_then(|dst| state.reg(dst)).map(|v| {
                 let mask = 0xffffu64.checked_shl(shift).unwrap_or(0);
                 Value {
                     value: (v.value & !mask) | (imm16.checked_shl(shift).unwrap_or(0) & mask),
@@ -825,7 +1366,7 @@ impl Sweep<'_> {
                     })
                 }
             }),
-            Def::Pop => self.pushed_pc.map(|value| Value {
+            Def::Pop => state.pushed_pc.map(|value| Value {
                 value,
                 address: true,
             }),
@@ -841,7 +1382,7 @@ impl Sweep<'_> {
                 Target::None => {}
                 Target::Address(target) => add(target, pick(RefKind::Call, RefKind::Jump)),
                 Target::Reg(reg) => {
-                    if let Some(v) = self.reg(reg) {
+                    if let Some(v) = state.reg(reg) {
                         add(v.value, pick(RefKind::CallReg, RefKind::JumpReg));
                     }
                 }
@@ -860,21 +1401,35 @@ impl Sweep<'_> {
                 }
             }
         }
+        if let Some(refs) = refs {
+            for (target, kind) in found {
+                refs.add(
+                    target,
+                    RefItem {
+                        source,
+                        kind,
+                        ref_raw,
+                        ref_vm: address,
+                    },
+                );
+            }
+        }
 
         // The registers after the instruction.
-        self.pushed_pc = pushes_pc.then_some(next);
+        let mut after = *state;
+        after.pushed_pc = pushes_pc.then_some(next);
         let mut lost = step.writes;
         if call && !pushes_pc {
             lost |= self.arch.caller_saved();
         }
-        for (reg, slot) in self.regs.iter_mut().enumerate() {
+        for (reg, slot) in after.regs.iter_mut().enumerate() {
             if lost & bit(reg as Reg) != 0 {
                 *slot = None;
             }
         }
         if let (Some(v), Some(slot)) = (
             value,
-            step.dst.and_then(|dst| self.regs.get_mut(dst as usize)),
+            step.dst.and_then(|dst| after.regs.get_mut(dst as usize)),
         ) {
             *slot = Some(Value {
                 value: if step.narrow {
@@ -885,11 +1440,20 @@ impl Sweep<'_> {
                 ..v
             });
         }
-        // Nothing falls through to what follows.
-        if matches!(step.flow, Flow::Return | Flow::Jump { conditional: false }) {
-            self.forget();
-        }
+        after
     }
+}
+
+/// An instruction of a run that a jump or call goes to.
+#[derive(Debug, Clone, Copy, Default)]
+struct Label {
+    /// Jumps of the run to it whose target the instruction bytes give.
+    inside: usize,
+    /// Also reached from outside the run, or in a way that is not
+    /// followed: nothing is known on arrival.
+    outside: bool,
+    /// What holds after every jump to it seen so far.
+    jumped: Option<State>,
 }
 
 #[cfg(test)]
@@ -1188,7 +1752,7 @@ mod tests {
         let code = arm64(&[
             0x1000_0008, // 1108 adr x8, 0x1108
             0x1000_0013, // 110c adr x19, 0x110c
-            0x9400_0001, // 1110 bl  0x1114
+            0x9400_03bc, // 1110 bl  0x2000
             0xd63f_0100, // 1114 blr x8
             0xd63f_0260, // 1118 blr x19
             0xd65f_03c0, // 111c ret
@@ -1200,7 +1764,7 @@ mod tests {
                 (0x1108, "addr", 0x1108),
                 (0x110c, "addr", 0x110c),
                 (0x110c, "call-reg", 0x1118),
-                (0x1114, "call", 0x1110),
+                (0x2000, "call", 0x1110),
             ]
         );
         // Instructions whose register writes Capstone does not report
@@ -1335,25 +1899,358 @@ mod tests {
         assert_eq!(t(0x7777, 0x1234), Pointer::Target(0x1234));
     }
 
-    #[test]
-    fn relocated_instructions_are_not_resolved() {
-        let (mh, _) = tiny_macho(CPU_TYPE_ARM64, &[], 0);
-        let memory = Memory::new(&mh);
-        let sweep = Sweep {
-            memory: &memory,
-            arch: Arch::Arm64,
+    fn empty_sweep<'a>(memory: &'a Memory<'a>, arch: Arch) -> Sweep<'a> {
+        Sweep {
+            memory,
+            arch,
             source: 0,
             base: 0,
             raw_base: 0,
-            relocated: vec![4, 0x11],
-            regs: [None; 32],
-            pushed_pc: None,
+            patches: Vec::new(),
+            targets: Vec::new(),
+            run: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn patches_are_found_by_instruction() {
+        let (mh, _) = tiny_macho(CPU_TYPE_ARM64, &[], 0);
+        let memory = Memory::new(&mh);
+        let mut sweep = empty_sweep(&memory, Arch::Arm64);
+        sweep.patches = vec![
+            (4, Patch::Keep),
+            (0x11, Patch::A64 { kind: 2, target: 9 }),
+            (0x20, Patch::Keep),
+            (0x22, Patch::Keep),
+        ];
+        assert_eq!(sweep.patch(0, 4), None);
+        assert_eq!(sweep.patch(4, 4), Some(Patch::Keep));
+        assert_eq!(sweep.patch(8, 4), None);
+        assert_eq!(
+            sweep.patch(0x10, 5),
+            Some(Patch::A64 { kind: 2, target: 9 })
+        );
+        assert_eq!(sweep.patch(0x12, 5), None);
+        // Two entries in one instruction: not resolved.
+        assert_eq!(sweep.patch(0x20, 4), Some(Patch::Drop));
+        assert_eq!(sweep.patch(0x24, 4), None);
+    }
+
+    #[test]
+    fn patches_redirect_operands() {
+        let rip = |offset| Mem { base: None, offset };
+        let apply = |mut step: Step, patch| {
+            let changed = Sweep::apply_patch(&mut step, patch);
+            (changed, step)
         };
-        assert!(!sweep.is_relocated(0, 4));
-        assert!(sweep.is_relocated(4, 4));
-        assert!(!sweep.is_relocated(8, 4));
-        assert!(sweep.is_relocated(0x10, 5));
-        assert!(!sweep.is_relocated(0x12, 5));
+        // x86-64 `call _f` at 0x100: the displacement field ends at 0x105
+        // and holds the addend.
+        let call = Step {
+            flow: Flow::Call,
+            target: Target::Address(0x105),
+            ..Step::default()
+        };
+        let to = |got| Patch::X64 {
+            symbol: 0x2000,
+            bias: 0x105,
+            got,
+        };
+        assert_eq!(apply(call, to(false)).1.target, Target::Address(0x2000));
+        let call_plus_4 = Step {
+            target: Target::Address(0x109),
+            ..call
+        };
+        assert_eq!(
+            apply(call_plus_4, to(false)).1.target,
+            Target::Address(0x2004)
+        );
+        // `mov eax, [rip + _v]` reads the symbol; with an immediate after
+        // the displacement the decoded address is further along.
+        let load = Step {
+            mem: Some((rip(0x106), MemUse::Load)),
+            def: Def::Load {
+                size: 4,
+                signed: false,
+            },
+            ..Step::default()
+        };
+        let (changed, step) = apply(load, to(false));
+        assert!(changed);
+        assert_eq!(step.mem, Some((rip(0x2001), MemUse::Load)));
+        assert_eq!(step.def, load.def);
+        // Through the GOT: the load yields the address itself, and a call
+        // through the slot calls the symbol.
+        let got_load = Step {
+            mem: Some((rip(0x105), MemUse::Load)),
+            def: Def::Load {
+                size: 8,
+                signed: false,
+            },
+            ..Step::default()
+        };
+        let step = apply(got_load, to(true)).1;
+        assert_eq!((step.mem, step.def), (None, Def::Address(0x2000)));
+        let got_call = Step {
+            flow: Flow::Call,
+            target: Target::Mem,
+            mem: Some((rip(0x105), MemUse::Load)),
+            ..Step::default()
+        };
+        let step = apply(got_call, to(true)).1;
+        assert_eq!((step.target, step.mem), (Target::Address(0x2000), None));
+        // A register-relative operand is not what the entry describes.
+        let odd = Step {
+            mem: Some((
+                Mem {
+                    base: Some(3),
+                    offset: 8,
+                },
+                MemUse::Load,
+            )),
+            ..Step::default()
+        };
+        assert_eq!(apply(odd, to(false)).1.mem, None);
+
+        // arm64: adrp + add, adrp + ldr, bl, and a GOT load.
+        let a64 = |kind| Patch::A64 {
+            kind,
+            target: 0x4567,
+        };
+        let adrp = Step {
+            def: Def::Page(0),
+            dst: Some(8),
+            ..Step::default()
+        };
+        assert_eq!(
+            apply(adrp, a64(reloc::ARM64_RELOC_PAGE21)).1.def,
+            Def::Page(0x4000)
+        );
+        let add = Step {
+            def: Def::Add { src: 8, imm: 0 },
+            dst: Some(8),
+            ..Step::default()
+        };
+        assert_eq!(
+            apply(add, a64(reloc::ARM64_RELOC_PAGEOFF12)).1.def,
+            Def::Add { src: 8, imm: 0x567 }
+        );
+        let ldr = Step {
+            mem: Some((
+                Mem {
+                    base: Some(8),
+                    offset: 0,
+                },
+                MemUse::Load,
+            )),
+            def: Def::Load {
+                size: 8,
+                signed: false,
+            },
+            dst: Some(0),
+            ..Step::default()
+        };
+        assert_eq!(
+            apply(ldr, a64(reloc::ARM64_RELOC_PAGEOFF12)).1.mem,
+            Some((
+                Mem {
+                    base: Some(8),
+                    offset: 0x567
+                },
+                MemUse::Load
+            ))
+        );
+        let step = apply(ldr, a64(reloc::ARM64_RELOC_GOT_LOAD_PAGEOFF12)).1;
+        assert_eq!((step.mem, step.def), (None, Def::Address(0x4567)));
+        let bl = Step {
+            flow: Flow::Call,
+            target: Target::Address(0x100),
+            ..Step::default()
+        };
+        assert_eq!(
+            apply(bl, a64(reloc::ARM64_RELOC_BRANCH26)).1.target,
+            Target::Address(0x4567)
+        );
+        // An entry that does not fit the instruction, and the two plain
+        // kinds.
+        let (changed, step) = apply(bl, a64(reloc::ARM64_RELOC_PAGE21));
+        assert!(changed);
+        assert_eq!(step.target, Target::None);
+        assert_eq!(apply(bl, Patch::Keep), (false, bl));
+        assert_eq!(apply(bl, Patch::Drop).1.target, Target::None);
+    }
+
+    #[test]
+    fn labels_join_the_paths_that_reach_them() {
+        // Two different values meet at a label: nothing is known there.
+        let code = arm64(&[
+            0x1000_0008, // 1108 adr x8, 0x1108
+            0xb400_0040, // 110c cbz x0, 0x1114
+            0x1000_0008, // 1110 adr x8, 0x1110
+            0xd61f_0100, // 1114 br  x8
+        ]);
+        assert_eq!(
+            code_refs(CPU_TYPE_ARM64, &code, 0),
+            [
+                (0x1108, "addr", 0x1108),
+                (0x1110, "addr", 0x1110),
+                (0x1114, "jump", 0x110c),
+            ]
+        );
+        // The same value on both paths is kept.
+        let code = arm64(&[
+            0x1000_0008, // 1108 adr x8, 0x1108
+            0xb400_0040, // 110c cbz x0, 0x1114
+            0xd503_201f, // 1110 nop
+            0xd61f_0100, // 1114 br  x8
+        ]);
+        assert_eq!(
+            code_refs(CPU_TYPE_ARM64, &code, 0),
+            [
+                (0x1108, "addr", 0x1108),
+                (0x1108, "jump-reg", 0x1114),
+                (0x1114, "jump", 0x110c),
+            ]
+        );
+        // A label reached only by a jump takes what the jump brings, also
+        // when a return precedes it.
+        let code = arm64(&[
+            0x1000_0008, // 1108 adr x8, 0x1108
+            0xb400_0060, // 110c cbz x0, 0x1118
+            0xd280_0008, // 1110 mov x8, #0
+            0xd65f_03c0, // 1114 ret
+            0xd61f_0100, // 1118 br  x8
+            0xd61f_0100, // 111c br  x8   (no jump leads here)
+        ]);
+        assert_eq!(
+            code_refs(CPU_TYPE_ARM64, &code, 0),
+            [
+                (0x1108, "addr", 0x1108),
+                (0x1108, "jump-reg", 0x1118),
+                (0x1118, "jump", 0x110c),
+            ]
+        );
+        // x86-64: lea ; jz ; lea ; jmp rax.
+        let code = [
+            0x48, 0x8d, 0x05, 0x00, 0x00, 0x00, 0x00, // 1108 lea rax, [rip]  -> 0x110f
+            0x74, 0x07, // 110f jz 0x1118
+            0x48, 0x8d, 0x05, 0x00, 0x00, 0x00, 0x00, // 1111 lea rax, [rip]  -> 0x1118
+            0xff, 0xe0, // 1118 jmp rax
+        ];
+        assert_eq!(
+            code_refs(CPU_TYPE_X86_64, &code, 0),
+            [
+                (0x110f, "addr", 0x1108),
+                (0x1118, "jump", 0x110f),
+                (0x1118, "addr", 0x1111),
+            ]
+        );
+    }
+
+    #[test]
+    fn loops_lose_what_their_body_changes() {
+        // x8 is advanced inside the loop, so it is not known at the head
+        // (nor after the loop); x9 is set once before it and stays known.
+        let code = arm64(&[
+            0x1000_0008, // 1108 adr  x8, 0x1108
+            0x1000_0009, // 110c adr  x9, 0x110c
+            0x9100_1108, // 1110 add  x8, x8, #4      <- loop head
+            0xb5ff_ffe0, // 1114 cbnz x0, 0x1110
+            0xd63f_0120, // 1118 blr  x9
+            0xd61f_0100, // 111c br   x8
+        ]);
+        assert_eq!(
+            code_refs(CPU_TYPE_ARM64, &code, 0),
+            [
+                (0x1108, "addr", 0x1108),
+                (0x110c, "addr", 0x110c),
+                (0x110c, "call-reg", 0x1118),
+                (0x1110, "jump", 0x1114),
+            ]
+        );
+        // A loop that leaves the register alone keeps it.
+        let code = arm64(&[
+            0x1000_0008, // 1108 adr  x8, 0x1108
+            0xd503_201f, // 110c nop                  <- loop head
+            0xb5ff_ffe0, // 1110 cbnz x0, 0x110c
+            0xd61f_0100, // 1114 br   x8
+        ]);
+        assert_eq!(
+            code_refs(CPU_TYPE_ARM64, &code, 0),
+            [
+                (0x1108, "addr", 0x1108),
+                (0x1108, "jump-reg", 0x1114),
+                (0x110c, "jump", 0x1110),
+            ]
+        );
+    }
+
+    #[test]
+    fn labels_reached_from_elsewhere_start_unknown() {
+        // The label is jumped to and also called: whoever calls it brings
+        // its own registers.
+        let code = arm64(&[
+            0x1000_0013, // 1108 adr x19, 0x1108
+            0xb400_0040, // 110c cbz x0, 0x1114
+            0x9400_0001, // 1110 bl  0x1114
+            0xd61f_0260, // 1114 br  x19
+        ]);
+        assert_eq!(
+            code_refs(CPU_TYPE_ARM64, &code, 0),
+            [
+                (0x1108, "addr", 0x1108),
+                (0x1114, "jump", 0x110c),
+                (0x1114, "call", 0x1110),
+            ]
+        );
+        // Without the call it is known.
+        let code = arm64(&[
+            0x1000_0013, // 1108 adr x19, 0x1108
+            0xb400_0040, // 110c cbz x0, 0x1114
+            0xd503_201f, // 1110 nop
+            0xd61f_0260, // 1114 br  x19
+        ]);
+        assert!(code_refs(CPU_TYPE_ARM64, &code, 0).contains(&(0x1108, "jump-reg", 0x1114)));
+    }
+
+    #[test]
+    fn branch_targets_are_collected() {
+        let code = arm64(&[
+            0x1400_0002, // 1108 b    0x1110
+            0x9400_0001, // 110c bl   0x1110
+            0x5400_0040, // 1110 b.eq 0x1118
+            0xb5ff_ffe0, // 1114 cbnz x0, 0x1110
+            0x3600_0040, // 1118 tbz  w0, #0, 0x1120
+            0xd61f_0100, // 111c br   x8
+            0xd65f_03c0, // 1120 ret
+        ]);
+        let (mh, _) = tiny_macho(CPU_TYPE_ARM64, &code, 0);
+        let region = disasm::Region {
+            start: 0,
+            end: code.len(),
+            kind: disasm::RegionKind::Code { thumb: false },
+        };
+        assert_eq!(
+            branch_targets(&mh, Arch::Arm64, &code, 0x1108, &[region]),
+            [0x1110, 0x1110, 0x1110, 0x1118, 0x1120]
+        );
+        // x86-64: call, jz, loop, jmp; indirect ones name no target.
+        let code = [
+            0xe8, 0x00, 0x00, 0x00, 0x00, // 1108 call 0x110d
+            0x74, 0x02, // 110d jz 0x1111
+            0xe2, 0xfc, // 110f loop 0x110d
+            0xeb, 0x02, // 1111 jmp 0x1115
+            0xff, 0xe0, // 1113 jmp rax
+            0xc3, // 1115 ret
+        ];
+        let (mh, _) = tiny_macho(CPU_TYPE_X86_64, &code, 0);
+        let region = disasm::Region {
+            end: code.len(),
+            ..region
+        };
+        assert_eq!(
+            branch_targets(&mh, Arch::X64, &code, 0x1108, &[region]),
+            [0x110d, 0x110d, 0x1111, 0x1115]
+        );
     }
 
     #[test]
