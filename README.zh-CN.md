@@ -19,7 +19,7 @@ MachOExplorer 把一个晦涩的 Mach-O 文件变成可导航的树。打开一�
 load command、section、符号、反汇编，以及 Apple 特有的元数据（Objective-C、Swift、代码签名）——
 在一个窗口里完成，也可以完全用命令行脚本化。
 
-当前发布版本：`v3.0.1`（[发布页](https://github.com/everettjf/MachOExplorer/releases/tag/v3.0.1)）。
+当前发布版本：`v3.0.2`（[发布页](https://github.com/everettjf/MachOExplorer/releases/tag/v3.0.2)）。
 3.x 版本使用 Rust 重写，界面基于 [GPUI](https://www.gpui.rs/)，取代了 2.x 的 C++/Qt 实现。
 如果你用过 2.x 的命令行工具，请看[从 2.x 迁移](#从-2x-迁移)。
 

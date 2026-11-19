@@ -4340,7 +4340,7 @@ dependencies = [
 
 [[package]]
 name = "moex-app"
-version = "3.0.1"
+version = "3.0.2"
 dependencies = [
  "dirs 6.0.0",
  "gpui-kit",
@@ -4356,7 +4356,7 @@ dependencies = [
 
 [[package]]
 name = "moex-cli"
-version = "3.0.1"
+version = "3.0.2"
 dependencies = [
  "clap",
  "moex-core",
@@ -4364,7 +4364,7 @@ dependencies = [
 
 [[package]]
 name = "moex-core"
-version = "3.0.1"
+version = "3.0.2"
 dependencies = [
  "capstone",
  "cc",
