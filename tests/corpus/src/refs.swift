@@ -1,8 +1,11 @@
 // Field types whose mangled names hold symbolic references of every kind
 // the reflection metadata uses.
 //
-//   swiftc -Onone -target arm64-apple-macos12 -module-name Refs \
+//   swiftc -Onone -target arm64-apple-macos13 -module-name Refs \
 //       refs.swift -o ../bin/swiftrefs_arm64
+//
+// macOS 13, so that no back-deployment library is linked in: those bring
+// C++ symbols, whose demangled text differs between platforms.
 import Foundation
 
 protocol Shape {

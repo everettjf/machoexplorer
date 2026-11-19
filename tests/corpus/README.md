@@ -10,7 +10,7 @@ sources and notes on how each was built.
 | `hello_signed_arm64` | `hello_arm64` re-signed ad hoc with `src/ent.plist` (hardened runtime, entitlements) |
 | `objc_*` | `src/objc.m` |
 | `swift_arm64` | `src/app.swift` |
-| `swiftrefs_arm64` | `src/refs.swift` (`swiftc -Onone -target arm64-apple-macos12 -module-name Refs`): field types whose mangled names hold symbolic references in every position |
+| `swiftrefs_arm64` | `src/refs.swift` (`swiftc -Onone -target arm64-apple-macos13 -module-name Refs`): field types whose mangled names hold symbolic references in every position |
 | `cxx_arm64` | `src/cxx.cpp` |
 | `dyld_classic_x86_64.dylib` | `src/dyld/` with `-Wl,-no_fixup_chains` (weak/lazy binds, re-exports, classic opcodes) |
 | `dyld_chained_x86_64.dylib` | `src/dyld/` with chained fixups (re-export terminals) |

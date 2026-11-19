@@ -3268,6 +3268,10 @@ mod tests {
         );
         let plain = plan_extraction(&cache, &image, &options, None).unwrap();
         assert_eq!(plain.linkedit.local_symbols_added, 0);
+        // The symbols file is rewritten below, which Windows refuses while
+        // it is mapped.
+        drop(plan);
+        drop(locals);
 
         let unused = |why: &str| {
             let e = LocalSymbols::open(&cache, Some(&main_path)).err().unwrap();
@@ -3297,10 +3301,12 @@ mod tests {
         unused("cannot be read");
 
         // A cache whose header names no symbols file needs none.
+        // (Written as another file: the first one is still mapped.)
         main[0x190..0x1a0].fill(0);
-        std::fs::write(&main_path, &main).unwrap();
-        let cache = open_cache(&main_path).unwrap();
-        assert!(LocalSymbols::open(&cache, Some(&main_path))
+        let second_path = dir.join("second");
+        std::fs::write(&second_path, &main).unwrap();
+        let second = open_cache(&second_path).unwrap();
+        assert!(LocalSymbols::open(&second, Some(&second_path))
             .unwrap()
             .is_none());
         let _ = std::fs::remove_dir_all(&dir);
