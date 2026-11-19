@@ -151,6 +151,40 @@ mutate symtab_strsize_max     708 "ffffffff"
 mutate nlist_strx_outside    1024 "$(le32 8)"
 mutate nlist_strx_max        1024 "ffffffff"
 
+# The same cache with local symbols info (dyld_cache_local_symbols_info) at
+# 0xa00, named by the header fields at 72 / 80: six u32 fields, one nlist_64
+# at 2584, 8 bytes of strings at 2600 and one entry (dylibOffset,
+# nlistStartIndex, nlistCount) at 2608. cache-extract merges the image's
+# symbols from it.
+locals_cache="${IN_DIR}/dyld_locals_valid.cache"
+cp "${good_cache}" "${locals_cache}"
+patch_hex "${locals_cache}" 2560 "$(le32 24)$(le32 1)$(le32 40)$(le32 8)$(le32 48)$(le32 1)"
+patch_hex "${locals_cache}" 2584 "$(le32 1)0e010000$(le64 0x10210)$(hexstr '' 1)$(hexstr '_local' 7)"
+patch_hex "${locals_cache}" 2608 "$(le32 0x200)$(le32 0)$(le32 1)"
+patch_hex "${locals_cache}" 72 "$(le64 2560)$(le64 60)"
+mutate_locals() { # mutate_locals <name> <offset> <hex>
+  cp "${locals_cache}" "${IN_DIR}/dyld_locals_$1.cache"
+  patch_hex "${IN_DIR}/dyld_locals_$1.cache" "$2" "$3"
+}
+mutate_locals info_offset_max       72 "ffffffffffffffff"
+mutate_locals info_offset_last_byte 72 "$(le64 4095)"
+mutate_locals info_size_max         80 "ffffffffffffffff"
+mutate_locals info_size_short       80 "$(le64 8)"
+mutate_locals info_size_no_entries  80 "$(le64 24)"
+mutate_locals nlist_offset_max    2560 "ffffffff"
+mutate_locals nlist_count_max     2564 "ffffffff"
+mutate_locals nlist_count_zero    2564 "00000000"
+mutate_locals strings_offset_max  2568 "ffffffff"
+mutate_locals strings_size_max    2572 "ffffffff"
+mutate_locals strings_size_zero   2572 "00000000"
+mutate_locals entries_offset_max  2576 "ffffffff"
+mutate_locals entries_count_max   2580 "ffffffff"
+mutate_locals nlist_strx_outside  2584 "$(le32 8)"
+mutate_locals nlist_strx_max      2584 "ffffffff"
+mutate_locals nlist_indirect_max  2588 "0a000000ffffffffffffffff"
+mutate_locals entry_start_max     2612 "ffffffff"
+mutate_locals entry_count_max     2616 "ffffffff"
+
 # Cache without an image table but with a hostile sibling .map file.
 cp "${good_cache}" "${IN_DIR}/dyld_map_fallback.cache"
 patch_hex "${IN_DIR}/dyld_map_fallback.cache" 24 "0000000000000000"
@@ -233,7 +267,7 @@ rm -rf "${OUT_DIR}"
 echo "[ok] ${TOTAL} malformed inputs exercised (runs=${RUNS} rejected=${REJECTED} accepted=${ACCEPTED})"
 
 # Sanity: inputs that are well-formed must be accepted.
-for valid in valid_fat64.bin ar_valid.a dyld_valid.cache dyld_map_fallback.cache; do
+for valid in valid_fat64.bin ar_valid.a dyld_valid.cache dyld_map_fallback.cache dyld_locals_valid.cache; do
   set +e
   "${MOEX_BIN}" parse "${IN_DIR}/${valid}" >/dev/null 2>&1
   valid_rc=$?

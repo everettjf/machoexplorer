@@ -1,8 +1,8 @@
 //! AArch64 instructions as the sweep sees them.
 
-use super::{bit, Def, Flow, Groups, Mem, MemUse, Reg, RegSet, Step, Target};
+use super::{bit, Cond, Def, Flow, Groups, Mem, MemUse, Reg, RegSet, Step, Target};
 use capstone::arch::arm64::{
-    Arm64CC, Arm64Insn, Arm64Operand, Arm64OperandType, Arm64Reg, Arm64Shift,
+    Arm64CC, Arm64Extender, Arm64Insn, Arm64Operand, Arm64OperandType, Arm64Reg, Arm64Shift,
 };
 use capstone::arch::{ArchDetail, DetailsArchInsn};
 use capstone::{Insn, InsnDetail, RegId};
@@ -62,6 +62,17 @@ fn load_size(id: u32, narrow: bool) -> Option<(u8, bool)> {
     })
 }
 
+/// The unsigned comparison a condition code tests.
+fn unsigned(cc: Arm64CC) -> Option<Cond> {
+    match cc {
+        Arm64CC::ARM64_CC_HI => Some(Cond::Above),
+        Arm64CC::ARM64_CC_LS => Some(Cond::NotAbove),
+        Arm64CC::ARM64_CC_HS => Some(Cond::NotBelow),
+        Arm64CC::ARM64_CC_LO => Some(Cond::Below),
+        _ => None,
+    }
+}
+
 pub(super) fn step(insn: &Insn<'_>, detail: &InsnDetail<'_>) -> Step {
     let mut step = Step::default();
     let ArchDetail::Arm64Detail(arch) = detail.arch_detail() else {
@@ -75,8 +86,14 @@ pub(super) fn step(insn: &Insn<'_>, detail: &InsnDetail<'_>) -> Step {
     // at; whatever they write is unknown afterwards.
     if is(Arm64Insn::ARM64_INS_MRS) || is(Arm64Insn::ARM64_INS_MSR) {
         step.writes = RegSet::MAX;
+        step.flags = true;
         return step;
     }
+    step.flags = arch.update_flags()
+        || detail
+            .regs_write()
+            .iter()
+            .any(|reg| reg.0 as u32 == Arm64Reg::ARM64_REG_NZCV);
     let ops: Vec<Arm64Operand> = arch.operands().collect();
     let reg_at = |i: usize| match ops.get(i).map(|op| &op.op_type) {
         Some(Arm64OperandType::Reg(r)) => gpr(*r),
@@ -88,12 +105,31 @@ pub(super) fn step(insn: &Insn<'_>, detail: &InsnDetail<'_>) -> Step {
     };
 
     // The memory operand: `[base, #disp]`, or a literal's address.
+    // `indexed`: `[base, index, lsl #shift]` instead.
     let mut stores = false;
+    let mut indexed: Option<(Reg, Reg, u32)> = None;
     for op in &ops {
         if let Arm64OperandType::Mem(mem) = &op.op_type {
             let writable = op.access.is_some_and(|a| a.is_writable());
             stores |= writable;
-            if mem.index().0 == 0 {
+            if mem.index().0 != 0 {
+                // The index as it is, or the zero-extended 32-bit form.
+                let shift = match op.shift {
+                    Arm64Shift::Invalid => Some(0),
+                    Arm64Shift::Lsl(n) => Some(n),
+                    _ => None,
+                };
+                let index = match (gpr(mem.index()), op.ext) {
+                    (Some((index, false)), Arm64Extender::ARM64_EXT_INVALID) => Some(index),
+                    (Some((index, true)), Arm64Extender::ARM64_EXT_UXTW) => Some(index),
+                    _ => None,
+                };
+                if let (Some((base, false)), Some(index), Some(shift), 0) =
+                    (gpr(mem.base()), index, shift, mem.disp())
+                {
+                    indexed = Some((base, index, shift));
+                }
+            } else {
                 if let Some((base, false)) = gpr(mem.base()) {
                     let usage = if writable {
                         MemUse::Store
@@ -168,6 +204,15 @@ pub(super) fn step(insn: &Insn<'_>, detail: &InsnDetail<'_>) -> Step {
     .any(is)
     {
         step.writes = 0;
+        step.flags = true;
+        if let (true, 2, Some((reg, _)), Some(imm)) = (
+            is(Arm64Insn::ARM64_INS_CMP),
+            ops.len(),
+            reg_at(0),
+            ops.get(1).and_then(shifted),
+        ) {
+            step.compare = Some((reg, imm));
+        }
         return step;
     }
 
@@ -180,6 +225,10 @@ pub(super) fn step(insn: &Insn<'_>, detail: &InsnDetail<'_>) -> Step {
             _ => Target::None,
         };
         step.mem = None;
+        // `b.hi` and the like; `cbz` and `tbz` do not look at the flags.
+        if !compare_branch {
+            step.cond = unsigned(arch.cc());
+        }
         return step;
     }
 
@@ -193,6 +242,22 @@ pub(super) fn step(insn: &Insn<'_>, detail: &InsnDetail<'_>) -> Step {
     } else if is(Arm64Insn::ARM64_INS_ADR) {
         imm_at(1).map_or(Def::None, Def::Address)
     } else if is(Arm64Insn::ARM64_INS_ADD) || is(Arm64Insn::ARM64_INS_SUB) {
+        // `add x10, x10, x11, lsl #2`: the second register as it is or
+        // shifted left.
+        let shifted_reg = ops.get(2).and_then(|op| {
+            let shift = match (op.shift, op.ext) {
+                (Arm64Shift::Invalid, Arm64Extender::ARM64_EXT_INVALID) => 0,
+                (Arm64Shift::Lsl(n), Arm64Extender::ARM64_EXT_INVALID) if n < 8 => n as u8,
+                _ => return None,
+            };
+            match op.op_type {
+                Arm64OperandType::Reg(r) => match gpr(r) {
+                    Some((reg, false)) => Some((reg, shift)),
+                    _ => None,
+                },
+                _ => None,
+            }
+        });
         match (ops.len(), reg_at(1), ops.get(2).and_then(shifted)) {
             (3, Some((src, _)), Some(imm)) => Def::Add {
                 src,
@@ -202,7 +267,33 @@ pub(super) fn step(insn: &Insn<'_>, detail: &InsnDetail<'_>) -> Step {
                     imm
                 },
             },
+            (3, Some((a, false)), None) if !narrow && is(Arm64Insn::ARM64_INS_ADD) => {
+                match shifted_reg {
+                    Some((b, shift)) => Def::AddReg { a, b, shift },
+                    None => Def::None,
+                }
+            }
             _ => Def::None,
+        }
+    } else if is(Arm64Insn::ARM64_INS_CSEL) || is(Arm64Insn::ARM64_INS_CSNEG) {
+        // `csel x16, x16, xzr, ls`: the register when it is in range,
+        // otherwise zero. `csneg` gives minus zero.
+        let zero = matches!(
+            ops.get(2).map(|op| &op.op_type),
+            Some(Arm64OperandType::Reg(r))
+                if [Arm64Reg::ARM64_REG_XZR, Arm64Reg::ARM64_REG_WZR].contains(&(r.0 as u32))
+        );
+        step.cond = match arch.cc() {
+            Arm64CC::ARM64_CC_LS => Some(Cond::NotAbove),
+            Arm64CC::ARM64_CC_LO => Some(Cond::Below),
+            _ => None,
+        };
+        match (ops.len(), reg_at(1), zero && step.cond.is_some()) {
+            (3, Some((src, _)), true) => Def::Clamp { src },
+            _ => {
+                step.cond = None;
+                Def::None
+            }
         }
     } else if is(Arm64Insn::ARM64_INS_MOV) || is(Arm64Insn::ARM64_INS_MOVZ) {
         // `mov` with an immediate is the alias of movz/movn/orr and comes
@@ -245,10 +336,18 @@ pub(super) fn step(insn: &Insn<'_>, detail: &InsnDetail<'_>) -> Step {
         }
         // A sign-extending load fills the whole register.
         step.narrow = narrow && !signed;
-        if step.mem.is_some() {
-            Def::Load { size, signed }
-        } else {
-            Def::None
+        match indexed {
+            _ if step.mem.is_some() => Def::Load { size, signed },
+            // An entry of a table of such values.
+            Some((base, index, shift)) if 1u32.checked_shl(shift) == Some(u32::from(size)) => {
+                Def::LoadIndex {
+                    base,
+                    index,
+                    size,
+                    signed,
+                }
+            }
+            _ => Def::None,
         }
     } else {
         Def::None

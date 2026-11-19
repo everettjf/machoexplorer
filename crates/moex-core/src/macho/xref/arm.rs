@@ -1,8 +1,9 @@
 //! 32-bit ARM and Thumb instructions as the sweep sees them: direct
 //! branches and calls only. Registers are not followed (addresses are
 //! built with `movw`/`movt` or literal pools plus `add pc`, which the
-//! sweep does not model), so there are no data references and no indirect
-//! branch targets for these slices.
+//! sweep does not model), so the only data references are those the
+//! relocation entries of an object file spell out, and there are no
+//! indirect branch targets.
 
 use super::{Flow, Step, Target};
 use capstone::arch::arm::{ArmCC, ArmInsn, ArmOperandType};

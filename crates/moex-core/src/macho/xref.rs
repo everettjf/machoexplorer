@@ -5,7 +5,7 @@
 //! The code is decoded by Capstone (see [`super::disasm`]) region by region:
 //! decoding restarts at every symbol and function start and steps over
 //! data-in-code ranges and undecodable bytes. Per instruction the
-//! architecture modules ([`arm64`], [`x86`], [`arm`], [`ppc`]) turn Capstone's
+//! architecture modules ([`arm64`], [`x86`], [`arm`]) turn Capstone's
 //! groups, operands and register access lists into a [`Step`]; the sweep
 //! follows the values of the general registers through straight-line code
 //! to complete addresses that take more than one instruction (`adrp` +
@@ -18,17 +18,29 @@
 //! known at the start of a run, at a label that is also reached from
 //! elsewhere, across calls (caller-saved registers) and whenever an
 //! instruction writes a register in a way the sweep does not model.
-//! Indirect jumps (jump tables) are not followed: the code after an
-//! unconditional jump or a return starts with nothing known unless a
-//! direct jump leads there.
+//!
+//! A jump through a jump table goes to every case of the table, and what
+//! is known at the jump is known in the cases. The shapes clang gives a
+//! `switch` on arm64 and x86-64 are recognised: the address of the table,
+//! an entry loaded at an index (32-bit offsets, or bytes and halfwords
+//! counted in instructions), added to the table's address or to another
+//! address of the function, and a jump to the sum. The number of entries
+//! is what the range check of the index allows (`cmp` and an unsigned
+//! conditional jump, or the `csel` that clamps the index); without one the
+//! table ends where something else is known to start. A table counts only
+//! when every entry leads to an instruction of the same run. Other
+//! indirect jumps are not followed: code reached only through one starts
+//! with nothing known.
 //!
 //! In an object file the operands of an instruction a relocation patches
 //! are placeholders; the relocation entry supplies the symbol, and with it
-//! the address when the symbol is defined in the file.
+//! the address when the symbol is defined in the file. On 32-bit x86 and
+//! ARM that covers branches, absolute operands, the two halves of an
+//! address (`movw` / `movt`) and the differences that
+//! position-independent code adds to the program counter.
 
 mod arm;
 mod arm64;
-mod ppc;
 mod x86;
 
 use super::chained_fixups::{
@@ -43,11 +55,11 @@ use super::ptr::{Pointer as Decoded, PointerDecoder};
 use super::reloc;
 use super::segment::Section;
 use crate::consts::{
-    CPU_TYPE_ARM, CPU_TYPE_ARM64, CPU_TYPE_ARM64_32, CPU_TYPE_I386, CPU_TYPE_POWERPC,
-    CPU_TYPE_POWERPC64, CPU_TYPE_X86_64, LC_DYLD_CHAINED_FIXUPS, MH_OBJECT,
+    CPU_TYPE_ARM, CPU_TYPE_ARM64, CPU_TYPE_ARM64_32, CPU_TYPE_I386, CPU_TYPE_X86_64,
+    LC_DYLD_CHAINED_FIXUPS, MH_OBJECT,
 };
 use capstone::{Capstone, Insn, InsnGroupType};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 const SECTION_TYPE: u32 = 0x0000_00ff;
 const S_CSTRING_LITERALS: u32 = 0x2;
@@ -142,6 +154,49 @@ enum Def {
     /// The return address pushed by a preceding call to the next
     /// instruction (the 32-bit x86 way of reading the program counter).
     Pop,
+    /// The `size` bytes at `base + index * size`: an entry of a table.
+    LoadIndex {
+        base: Reg,
+        index: Reg,
+        size: u8,
+        signed: bool,
+    },
+    /// `a + (b << shift)`.
+    AddReg {
+        a: Reg,
+        b: Reg,
+        shift: u8,
+    },
+    /// `src` when the comparison before it found it within the bound
+    /// (`Step::cond`), otherwise zero (`csel x16, x16, xzr, ls`).
+    Clamp {
+        src: Reg,
+    },
+}
+
+/// An unsigned condition on the flags a comparison `reg ? imm` left.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Cond {
+    /// `reg > imm`
+    Above,
+    /// `reg <= imm`
+    NotAbove,
+    /// `reg >= imm`
+    NotBelow,
+    /// `reg < imm`
+    Below,
+}
+
+impl Cond {
+    /// The greatest value of the register when the condition holds
+    /// (`holds`) or does not, if that bounds it.
+    fn max(self, imm: u64, holds: bool) -> Option<u64> {
+        match (self, holds) {
+            (Cond::NotAbove, true) | (Cond::Above, false) => Some(imm),
+            (Cond::Below, true) | (Cond::NotBelow, false) => imm.checked_sub(1),
+            _ => None,
+        }
+    }
 }
 
 /// What the sweep needs to know about one instruction.
@@ -159,6 +214,13 @@ struct Step {
     narrow: bool,
     /// Every general register the instruction may change.
     writes: RegSet,
+    /// A comparison of a register with a number (`cmp w8, #5`).
+    compare: Option<(Reg, u64)>,
+    /// The instruction changes the condition flags.
+    flags: bool,
+    /// The condition a conditional jump is taken on, or a `Def::Clamp`
+    /// selects on, when it is an unsigned comparison.
+    cond: Option<Cond>,
 }
 
 /// Capstone's architecture-independent groups an instruction belongs to.
@@ -190,7 +252,6 @@ enum Arch {
     X64,
     Arm64,
     Arm,
-    Ppc,
 }
 
 impl Arch {
@@ -200,7 +261,6 @@ impl Arch {
             CPU_TYPE_X86_64 => Some(Arch::X64),
             CPU_TYPE_ARM64 | CPU_TYPE_ARM64_32 => Some(Arch::Arm64),
             CPU_TYPE_ARM => Some(Arch::Arm),
-            CPU_TYPE_POWERPC | CPU_TYPE_POWERPC64 => Some(Arch::Ppc),
             _ => None,
         }
     }
@@ -211,7 +271,6 @@ impl Arch {
             Arch::Arm64 => arm64::step(insn, &detail),
             Arch::X64 | Arch::X86 => x86::step(insn, &detail),
             Arch::Arm => arm::step(insn, &detail),
-            Arch::Ppc => ppc::step(insn, &detail),
         })
     }
 
@@ -224,7 +283,7 @@ impl Arch {
             Arch::X64 => 0x0fc7,
             // eax, ecx, edx.
             Arch::X86 => 0x0007,
-            Arch::Arm | Arch::Ppc => 0,
+            Arch::Arm => 0,
         }
     }
 }
@@ -251,6 +310,8 @@ pub enum RefKind {
     /// The memory at the address is read or written.
     Load,
     Store,
+    /// One of the targets of a jump through a jump table.
+    JumpTable,
 }
 
 impl RefKind {
@@ -265,6 +326,7 @@ impl RefKind {
             RefKind::JumpRegMem => "jump-regmem",
             RefKind::CallReg => "call-reg",
             RefKind::JumpReg => "jump-reg",
+            RefKind::JumpTable => "jump-table",
             RefKind::Address => "addr",
             RefKind::Load => "load",
             RefKind::Store => "store",
@@ -432,6 +494,15 @@ struct Memory<'a> {
     chained: Vec<Option<u16>>,
     /// For the slots of object-file relocations and threaded binds.
     decoder: PointerDecoder<'a>,
+    /// Addresses of the symbols defined in the file, sorted; read when the
+    /// first jump table without a visible bound is met.
+    symbols: std::cell::OnceCell<Vec<u64>>,
+    /// Address and length of what the relocation entries of an object
+    /// file patch, sorted; read when the first jump table is met.
+    relocated: std::cell::OnceCell<Vec<(u64, u8)>>,
+    /// Address ranges of the sections, sorted; read when the first jump
+    /// table without a visible bound is met.
+    sections: std::cell::OnceCell<Vec<(u64, u64)>>,
 }
 
 impl<'a> Memory<'a> {
@@ -442,7 +513,86 @@ impl<'a> Memory<'a> {
             image_base: mh.base_address(),
             chained: chained_formats(mh),
             decoder: PointerDecoder::new(mh),
+            symbols: std::cell::OnceCell::new(),
+            relocated: std::cell::OnceCell::new(),
+            sections: std::cell::OnceCell::new(),
         }
+    }
+
+    /// Where the section that holds `address` ends.
+    fn section_end(&self, address: u64) -> Option<u64> {
+        let sections = self.sections.get_or_init(|| {
+            let mut out: Vec<(u64, u64)> = self
+                .mh
+                .sections()
+                .map(|s| (s.addr, s.addr.saturating_add(s.size)))
+                .collect();
+            out.sort_unstable();
+            out
+        });
+        // The last section that starts at or before the address.
+        let (_, end) = *sections.get(
+            sections
+                .partition_point(|s| s.0 <= address)
+                .checked_sub(1)?,
+        )?;
+        (address < end).then_some(end)
+    }
+
+    /// True when a relocation entry of an object file patches one of the
+    /// `size` bytes at `vmaddr`, so that they do not hold their final
+    /// value.
+    fn is_relocated(&self, vmaddr: u64, size: u64) -> bool {
+        if self.mh.filetype != MH_OBJECT {
+            return false;
+        }
+        let relocated = self.relocated.get_or_init(|| {
+            // No more entries than fit in the file.
+            let mut left = self.mh.image.len() / reloc::ENTRY_SIZE;
+            let mut out = Vec::new();
+            for sect in self.mh.sections() {
+                let entries = reloc::section_relocs(self.mh, sect, left);
+                left -= entries.len() as u64;
+                out.extend(
+                    entries
+                        .iter()
+                        .map(|r| (sect.addr.wrapping_add(u64::from(r.address)), 1 << r.length)),
+                );
+            }
+            out.sort_unstable();
+            out
+        });
+        // An entry patches at most eight bytes from its address on.
+        let from = relocated.partition_point(|r| r.0 < vmaddr.saturating_sub(7));
+        relocated
+            .get(from..)
+            .unwrap_or(&[])
+            .iter()
+            .take_while(|r| r.0 < vmaddr.saturating_add(size))
+            .any(|r| r.0.saturating_add(u64::from(r.1)) > vmaddr)
+    }
+
+    /// The address of the first symbol defined after `address`.
+    fn next_symbol(&self, address: u64) -> Option<u64> {
+        let symbols = self.symbols.get_or_init(|| {
+            let mut out: Vec<u64> = self
+                .mh
+                .symtab()
+                .map(|symtab| {
+                    symtab
+                        .symbols()
+                        .filter(|s| s.n_type & 0xe0 == 0 && s.n_type & 0x0e == 0x0e)
+                        .map(|s| s.n_value)
+                        .collect()
+                })
+                .unwrap_or_default();
+            out.sort_unstable();
+            out.dedup();
+            out
+        });
+        symbols
+            .get(symbols.partition_point(|s| *s <= address))
+            .copied()
     }
 
     /// True when `vmaddr` lies in a segment the program can access (not
@@ -573,11 +723,61 @@ enum Patch {
     /// arm64 entry of type `kind` whose target (symbol plus addend) is
     /// `target`.
     A64 { kind: u8, target: u64 },
+    /// 32-bit x86 and ARM: a pc-relative branch to a symbol
+    /// defined at `symbol`. The decoded target is the addend.
+    Branch { symbol: u64 },
+    /// 32-bit x86: an absolute operand naming a symbol defined at
+    /// `symbol`. The decoded operand is the addend.
+    Absolute { symbol: u64 },
+    /// 32-bit x86: an absolute operand that already holds the address
+    /// (a section-relative entry). An immediate is therefore an address
+    /// (`mov eax, offset L`), not just a number.
+    Immediate,
+    /// 32-bit ARM: one of the two instructions that build the address
+    /// `target` from its halves (`movw` / `movt`).
+    /// `low`: the one with the low half, where the address is reported.
+    Half { target: u64, low: bool },
 }
 
-/// The patches of a code section, sorted by the section offset they apply
-/// to. Charges `budget` 8 bytes per entry read.
-fn code_patches(mh: &MachHeader, sect: &Section, budget: &mut u64) -> Vec<(u32, Patch)> {
+/// The 16-bit immediate of the 32-bit ARM `movw` / `movt` at `offset`.
+fn arm_imm16(code: &[u8], offset: u32, thumb: bool) -> Option<u64> {
+    let at = offset as usize;
+    let bytes = code.get(at..at.checked_add(4)?)?;
+    Some(if thumb {
+        let first = u64::from(u16::from_le_bytes([bytes[0], bytes[1]]));
+        let second = u64::from(u16::from_le_bytes([bytes[2], bytes[3]]));
+        (first & 0xf) << 12 | (first >> 10 & 1) << 11 | (second >> 12 & 7) << 8 | (second & 0xff)
+    } else {
+        let word = u64::from(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]));
+        (word >> 16 & 0xf) << 12 | (word & 0xfff)
+    })
+}
+
+/// How far ahead of the 32-bit ARM instruction at `offset` the program
+/// counter reads, when that instruction adds a register to it: `add rN, pc`
+/// (Thumb), `add rN, pc, rM` or `ldr rN, [pc, rM]` (ARM).
+fn arm_pc_ahead(code: &[u8], offset: u64, thumb: bool) -> Option<u64> {
+    let at = usize::try_from(offset).ok()?;
+    if thumb {
+        let bytes = code.get(at..at.checked_add(2)?)?;
+        let half = u16::from_le_bytes([bytes[0], bytes[1]]);
+        (half & 0xff78 == 0x4478).then_some(4)
+    } else {
+        let bytes = code.get(at..at.checked_add(4)?)?;
+        let word = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        // `add rN, pc, rM`, or a load or store at `[pc, rM]`.
+        (word & 0x0fef_0ff0 == 0x008f_0000 || word & 0x0f2f_0ff0 == 0x070f_0000).then_some(8)
+    }
+}
+
+/// The patches of a code section whose contents are `code`, sorted by the
+/// section offset they apply to. Charges `budget` 8 bytes per entry read.
+fn code_patches(
+    mh: &MachHeader,
+    sect: &Section,
+    code: &[u8],
+    budget: &mut u64,
+) -> Vec<(u32, Patch)> {
     use reloc::*;
     let entries = section_relocs(mh, sect, *budget / ENTRY_SIZE);
     *budget -= entries.len() as u64 * ENTRY_SIZE;
@@ -588,11 +788,128 @@ fn code_patches(mh: &MachHeader, sect: &Section, budget: &mut u64) -> Vec<(u32, 
         let here = symbol.n_type & 0xe0 == 0 && matches!(symbol.n_type & 0x0e, 0x0e | 0x02);
         here.then_some(symbol.n_value)
     };
+    // Addresses of the Thumb functions of a 32-bit ARM file: a pointer to
+    // one has its low bit set, which is not part of the address.
+    let thumb_functions: HashSet<u64> = match (mh.cputype, symtab.as_ref()) {
+        (CPU_TYPE_ARM, Some(symtab)) if !entries.is_empty() => symtab
+            .symbols()
+            .filter(|s| s.n_type & 0xe0 == 0 && s.n_type & 0x0e == 0x0e && s.n_desc & 0x8 != 0)
+            .map(|s| s.n_value)
+            .collect(),
+        _ => HashSet::new(),
+    };
     let mut out: Vec<(u32, Patch)> = Vec::with_capacity(entries.len());
     // `ARM64_RELOC_ADDEND` applies to the entry after it.
     let mut addend: Option<(u32, i64)> = None;
-    for r in entries {
+    // A branch of the 32-bit architectures: a section-relative or scattered
+    // entry leaves the displacement in the instruction, an external one
+    // leaves the addend there.
+    let branch = |r: &Reloc| {
+        if r.scattered || !r.external {
+            Patch::Keep
+        } else {
+            defined(r.symbolnum).map_or(Patch::Drop, |symbol| Patch::Branch { symbol })
+        }
+    };
+    // What a `*_SECTDIFF` or half entry and its `PAIR` say about the
+    // address `value` the instruction (and the pair) holds: for a
+    // difference it counts from the address the pair names, for a symbol
+    // from the symbol.
+    let half = |r: &Reloc, pair: Option<Reloc>, difference: bool, value: u64, low: bool| {
+        let base = match pair {
+            Some(pair) if difference && r.scattered && pair.scattered => {
+                Some(u64::from(pair.value))
+            }
+            Some(_) if difference => None,
+            Some(_) if r.external && !r.scattered => defined(r.symbolnum),
+            Some(_) => Some(0),
+            None => None,
+        };
+        base.map_or(Patch::Drop, |base| Patch::Half {
+            target: base.wrapping_add(value) & 0xffff_ffff,
+            low,
+        })
+    };
+    let mut entries = entries.into_iter().peekable();
+    while let Some(r) = entries.next() {
+        // The second entry of a pair, wherever the first needs one. Its
+        // address field is not an address.
+        let mut pair = || entries.next_if(|next| next.kind == RELOC_PAIR);
         let patch = match mh.cputype {
+            CPU_TYPE_I386 => match r.kind {
+                RELOC_PAIR => continue,
+                // The difference of two addresses in the file, which the
+                // operand holds: position-independent code adds it to the
+                // address it counts from.
+                GENERIC_RELOC_SECTDIFF | GENERIC_RELOC_LOCAL_SECTDIFF => {
+                    pair();
+                    Patch::Keep
+                }
+                RELOC_UNSIGNED if (r.scattered || !r.external) && !r.pcrel && r.length == 2 => {
+                    Patch::Immediate
+                }
+                RELOC_UNSIGNED if r.scattered || !r.external => Patch::Keep,
+                RELOC_UNSIGNED if r.length == 2 => match (defined(r.symbolnum), r.pcrel) {
+                    (Some(symbol), true) => Patch::Branch { symbol },
+                    (Some(symbol), false) => Patch::Absolute { symbol },
+                    (None, _) => Patch::Drop,
+                },
+                _ => Patch::Drop,
+            },
+            CPU_TYPE_ARM => match r.kind {
+                RELOC_PAIR => continue,
+                RELOC_UNSIGNED if r.scattered || !r.external => Patch::Keep,
+                ARM_RELOC_BR24 | ARM_THUMB_RELOC_BR22 => branch(&r),
+                ARM_RELOC_HALF | ARM_RELOC_HALF_SECTDIFF => {
+                    // The length field says which half the instruction
+                    // holds and whether it is a Thumb instruction; the
+                    // pair's address field holds the other half.
+                    let (high, thumb) = (r.length & 1 != 0, r.length & 2 != 0);
+                    let pair = pair();
+                    let other = pair.map_or(0, |p| u64::from(p.address) & 0xffff);
+                    let difference = r.kind == ARM_RELOC_HALF_SECTDIFF;
+                    // A difference counts from the `add rN, pc` that turns
+                    // it into an address, where the program counter reads
+                    // 4 (Thumb) or 8 bytes ahead.
+                    let ahead = match pair {
+                        Some(pair) if difference => u64::from(pair.value)
+                            .checked_sub(sect.addr)
+                            .and_then(|offset| arm_pc_ahead(code, offset, thumb)),
+                        _ => Some(0),
+                    };
+                    let patch = match (arm_imm16(code, r.address, thumb), ahead) {
+                        (Some(imm), Some(ahead)) => half(
+                            &r,
+                            pair,
+                            difference,
+                            if high {
+                                imm << 16 | other
+                            } else {
+                                other << 16 | imm
+                            }
+                            .wrapping_add(ahead),
+                            !high,
+                        ),
+                        _ => Patch::Drop,
+                    };
+                    match patch {
+                        Patch::Half { target, low }
+                            if target & 1 != 0 && thumb_functions.contains(&(target - 1)) =>
+                        {
+                            Patch::Half {
+                                target: target - 1,
+                                low,
+                            }
+                        }
+                        other => other,
+                    }
+                }
+                ARM_RELOC_SECTDIFF | ARM_RELOC_LOCAL_SECTDIFF => {
+                    pair();
+                    Patch::Drop
+                }
+                _ => Patch::Drop,
+            },
             _ if r.scattered => {
                 // The entry names the target's address, which the operand
                 // holds too; section differences are not addresses.
@@ -666,9 +983,8 @@ fn code_patches(mh: &MachHeader, sect: &Section, budget: &mut u64) -> Vec<(u32, 
                     _ => Patch::Drop,
                 }
             }
-            // 32-bit x86 and ARM: a section-relative entry leaves the
-            // address in the instruction; what an external one leaves
-            // there depends on the instruction form and is not followed.
+            // Other architectures: a section-relative entry leaves the
+            // address in the instruction.
             _ => {
                 if !r.external && r.kind == RELOC_UNSIGNED {
                     Patch::Keep
@@ -684,18 +1000,58 @@ fn code_patches(mh: &MachHeader, sect: &Section, budget: &mut u64) -> Vec<(u32, 
     out
 }
 
+/// The patch of the instruction of `len` bytes at section offset `offset`,
+/// from the sorted `patches` of the section; `Drop` when several entries
+/// patch it.
+fn patch_at(patches: &[(u32, Patch)], offset: u64, len: u64) -> Option<Patch> {
+    let i = patches.partition_point(|p| u64::from(p.0) < offset);
+    let end = offset.saturating_add(len);
+    let mut inside = patches
+        .get(i..)
+        .unwrap_or(&[])
+        .iter()
+        .take_while(|p| u64::from(p.0) < end);
+    let first = inside.next()?.1;
+    Some(if inside.next().is_some() {
+        Patch::Drop
+    } else {
+        first
+    })
+}
+
 /// Targets of the direct jumps and calls of a code section, sorted, one
 /// entry per instruction. The sweep uses them to know every way a label is
 /// reached; calls are included so that a label that is called is never
-/// taken for one that is only fallen into.
+/// taken for one that is only fallen into. Where a relocation of an object
+/// file supplies the target (`patches`), the target is the symbol's
+/// address, or none when the symbol is not defined in the file: the
+/// operand is a placeholder then.
 fn branch_targets(
     mh: &MachHeader,
     arch: Arch,
     code: &[u8],
     base: u64,
     regions: &[disasm::Region],
+    patches: &[(u32, Patch)],
 ) -> Vec<u64> {
     let mut out = Vec::new();
+    // The target of the branch of `len` bytes at `at` whose operand reads
+    // `decoded`.
+    let patched =
+        |at: u64, len: u64, decoded: u64| match patch_at(patches, at.wrapping_sub(base), len) {
+            None | Some(Patch::Keep | Patch::Immediate) => Some(decoded),
+            Some(Patch::A64 {
+                kind: reloc::ARM64_RELOC_BRANCH26,
+                target,
+            }) => Some(target),
+            Some(Patch::X64 {
+                symbol,
+                bias,
+                got: false,
+            }) => Some(symbol.wrapping_add(decoded.wrapping_sub(bias))),
+            Some(Patch::Branch { symbol }) => Some(symbol.wrapping_add(decoded) & 0xffff_ffff),
+            Some(_) => None,
+        };
     match arch {
         // Fixed-width instructions: the branch encodings are recognised
         // directly. A word Capstone would not decode can add a label, which
@@ -729,7 +1085,7 @@ fn branch_targets(
                         continue;
                     };
                     let at = base.wrapping_add((region.start + 4 * i) as u64);
-                    out.push(at.wrapping_add(offset as u64));
+                    out.extend(patched(at, 4, at.wrapping_add(offset as u64)));
                 }
             }
         }
@@ -758,16 +1114,77 @@ fn branch_targets(
                     let next = insn.address().wrapping_add(insn.len() as u64);
                     let reads_pc = arch == Arch::X86 && mnemonic == "call" && target == Some(next);
                     if let Some(target) = target.filter(|_| !reads_pc) {
-                        out.push(target);
+                        out.extend(patched(insn.address(), insn.len() as u64, target));
                     }
                 });
             }
         }
-        // No registers are followed for 32-bit ARM and PowerPC, so labels
-        // do not matter.
-        Arch::Arm | Arch::Ppc => {}
+        // No registers are followed for 32-bit ARM, so labels do not
+        // matter.
+        Arch::Arm => {}
     }
     out.sort_unstable();
+    out
+}
+
+/// Addresses that `adrp` and the instruction after it compute together
+/// (`adrp` + `add`, `adrp` + a load or store), sorted: places where
+/// something starts, as far as that can be told without following the
+/// code. A jump table whose length the code does not show ends at the
+/// next one at the latest. Only for linked arm64 images: in an object file
+/// the operands are placeholders and the symbols do this job, and x86-64
+/// jump tables lie in the code section, marked as data.
+fn computed_addresses(
+    mh: &MachHeader,
+    arch: Arch,
+    code: &[u8],
+    base: u64,
+    regions: &[disasm::Region],
+) -> Vec<u64> {
+    let mut out = Vec::new();
+    if arch != Arch::Arm64 || mh.filetype == MH_OBJECT {
+        return out;
+    }
+    for region in regions {
+        if !matches!(region.kind, disasm::RegionKind::Code { .. }) {
+            continue;
+        }
+        let Some(chunk) = code.get(region.start..region.end) else {
+            continue;
+        };
+        let word = |i: usize| {
+            let bytes = chunk.get(4 * i..4 * i + 4)?;
+            Some(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+        };
+        for i in 0..chunk.len() / 4 {
+            let (Some(first), Some(second)) = (word(i), word(i + 1)) else {
+                continue;
+            };
+            if first & 0x9f00_0000 != 0x9000_0000 || (second >> 5) & 31 != first & 31 {
+                continue;
+            }
+            // adrp: a signed 21-bit number of pages from this one.
+            let pages = ((first >> 5) & 0x7_ffff) << 2 | (first >> 29) & 3;
+            let pages = i64::from((pages << 11) as i32 >> 11);
+            let at = base.wrapping_add((region.start + 4 * i) as u64);
+            let page = (at & !0xfff).wrapping_add((pages << 12) as u64);
+            let imm12 = u64::from((second >> 10) & 0xfff);
+            let offset = if second & 0xffc0_0000 == 0x9100_0000 {
+                // add xN, xN, #imm12
+                imm12
+            } else if second & 0x3b00_0000 == 0x3900_0000 {
+                // A load or store of 1 << size bytes at [xN, #imm12 * size];
+                // 16 bytes for the 128-bit form of the vector registers.
+                let vector16 = second & 0x0480_0000 == 0x0480_0000;
+                imm12 << if vector16 { 4 } else { second >> 30 }
+            } else {
+                continue;
+            };
+            out.push(page.wrapping_add(offset));
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
     out
 }
 
@@ -857,14 +1274,23 @@ pub fn collect(mh: &MachHeader) -> Xrefs {
                 // from repeating it for each.
                 budget = (budget - code.len() as u64).saturating_sub(mh.image.len() / 4);
                 let regions = disasm::regions(mh, sect, code.len());
+                let patches = code_patches(mh, sect, code, &mut budget);
                 let mut sweep = Sweep {
                     memory: &memory,
                     arch,
                     source: refs.source(format!("{}/{}", sect.segname, sect.sectname)),
                     base: sect.addr,
+                    end: sect.addr.saturating_add(code.len() as u64),
                     raw_base: sect.data_offset,
-                    patches: code_patches(mh, sect, &mut budget),
-                    targets: branch_targets(mh, arch, code, sect.addr, &regions),
+                    targets: branch_targets(mh, arch, code, sect.addr, &regions, &patches),
+                    patches,
+                    starts: regions
+                        .iter()
+                        .map(|r| sect.addr.wrapping_add(r.start as u64))
+                        .collect(),
+                    tables: BTreeSet::new(),
+                    addresses: computed_addresses(mh, arch, code, sect.addr, &regions),
+                    table_budget: code.len() as u64,
                     run: Vec::new(),
                 };
                 // An engine failure only loses the rest of this section.
@@ -911,23 +1337,70 @@ struct Value {
     address: bool,
 }
 
+/// A jump table as the code reads it: entry `i` is the `size` bytes at
+/// `base + i * size` and leads to `anchor + (entry << shift)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Table {
+    base: u64,
+    anchor: u64,
+    /// Number of entries, from the range check of the index; 0 when none
+    /// was seen.
+    count: u32,
+    size: u8,
+    signed: bool,
+    shift: u8,
+}
+
+/// What is known about a register.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Slot {
+    Unknown,
+    Known(Value),
+    /// Some number that is not greater than this one: an index after its
+    /// range check.
+    Max(u64),
+    /// An entry of a jump table (`Table::anchor` and `shift` not yet set).
+    Entry(Table),
+    /// The address one of the entries of a jump table leads to.
+    Case(Table),
+}
+
 /// What is known at one point of the code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct State {
-    regs: [Option<Value>; 32],
+    regs: [Slot; 32],
     /// Return address pushed by a call to the next instruction.
     pushed_pc: Option<u64>,
+    /// The comparison the condition flags come from: a register, unchanged
+    /// since, with a number.
+    compare: Option<(Reg, u64)>,
+    /// Two registers that hold the same number: the last copy, neither
+    /// side changed since (`mov w19, w0` before `cmp w0, #30`).
+    same: Option<(Reg, Reg)>,
 }
 
 impl State {
     /// Nothing is known.
     const UNKNOWN: State = State {
-        regs: [None; 32],
+        regs: [Slot::Unknown; 32],
         pushed_pc: None,
+        compare: None,
+        same: None,
     };
 
+    fn slot(&self, reg: Reg) -> Slot {
+        self.regs
+            .get(reg as usize)
+            .copied()
+            .unwrap_or(Slot::Unknown)
+    }
+
+    /// The value of a register, when it is known.
     fn reg(&self, reg: Reg) -> Option<Value> {
-        self.regs.get(reg as usize).copied().flatten()
+        match self.slot(reg) {
+            Slot::Known(value) => Some(value),
+            _ => None,
+        }
     }
 
     /// What holds whichever of the two states the code came from.
@@ -941,7 +1414,32 @@ impl State {
         if self.pushed_pc == other.pushed_pc {
             out.pushed_pc = self.pushed_pc;
         }
+        if self.compare == other.compare {
+            out.compare = self.compare;
+        }
+        if self.same == other.same {
+            out.same = self.same;
+        }
         out
+    }
+
+    /// Notes that `reg` is at most `max`, and so is the register that
+    /// holds the same number, where nothing more precise is known.
+    fn bound(&mut self, reg: Reg, max: u64) {
+        let other = match self.same {
+            Some((a, b)) if a == reg => Some(b),
+            Some((a, b)) if b == reg => Some(a),
+            _ => None,
+        };
+        for reg in [Some(reg), other].into_iter().flatten() {
+            if let Some(slot) = self.regs.get_mut(reg as usize) {
+                match *slot {
+                    Slot::Unknown => *slot = Slot::Max(max),
+                    Slot::Max(known) => *slot = Slot::Max(known.min(max)),
+                    _ => {}
+                }
+            }
+        }
     }
 }
 
@@ -961,8 +1459,17 @@ struct Seen {
 const MAX_RUN: usize = 1 << 16;
 
 /// Passes over a run before giving up on loops: each pass can only lose
-/// knowledge at a label, and there are 32 registers to lose.
+/// knowledge at a label, and there are 32 registers to lose. Half of them
+/// go to each of the two ways a run is gone over (see [`Sweep::flush`]);
+/// one more pass reports.
 const MAX_PASSES: usize = 40;
+
+/// Most entries read from one jump table.
+const MAX_TABLE: u32 = 1 << 16;
+
+/// A jump table is padded with fewer bytes than this before whatever
+/// follows it.
+const MAX_PADDING: u64 = 16;
 
 /// Sweep over one code section, one run at a time. A run is the code
 /// between two places where decoding restarts (symbols, function starts,
@@ -979,12 +1486,23 @@ struct Sweep<'a> {
     source: u32,
     /// Address of the first byte.
     base: u64,
+    /// Address after the last byte.
+    end: u64,
     /// File offset of the first byte.
     raw_base: u64,
     /// What relocations do, by section offset, sorted.
     patches: Vec<(u32, Patch)>,
     /// Every direct jump and call target of the section, sorted.
     targets: Vec<u64>,
+    /// Addresses where the regions of the section start, sorted.
+    starts: Vec<u64>,
+    /// Addresses of the jump tables found so far.
+    tables: BTreeSet<u64>,
+    /// Addresses the code of the section computes, sorted.
+    addresses: Vec<u64>,
+    /// Jump table entries that may still be read for this section: one per
+    /// byte of code.
+    table_budget: u64,
     /// The instructions of the current run.
     run: Vec<Seen>,
 }
@@ -1007,20 +1525,7 @@ impl Sweep<'_> {
     /// The patch of the instruction at section offset `offset`; `Drop` when
     /// several entries patch it.
     fn patch(&self, offset: u64, len: u64) -> Option<Patch> {
-        let i = self.patches.partition_point(|p| u64::from(p.0) < offset);
-        let end = offset.saturating_add(len);
-        let mut inside = self
-            .patches
-            .get(i..)
-            .unwrap_or(&[])
-            .iter()
-            .take_while(|p| u64::from(p.0) < end);
-        let first = inside.next()?.1;
-        Some(if inside.next().is_some() {
-            Patch::Drop
-        } else {
-            first
-        })
+        patch_at(&self.patches, offset, len)
     }
 
     /// Applies a relocation to what was decoded. True when the step now
@@ -1105,6 +1610,51 @@ impl Sweep<'_> {
                 }
                 _ => drop(step),
             },
+            Patch::Branch { symbol } => match (step.flow, step.target) {
+                (Flow::Call | Flow::Jump { .. }, Target::Address(addend)) => {
+                    step.target = Target::Address(symbol.wrapping_add(addend) & 0xffff_ffff);
+                }
+                _ => drop(step),
+            },
+            Patch::Immediate => match (step.def, step.mem, step.flow) {
+                (Def::Const(address), None, Flow::None) => step.def = Def::Address(address),
+                _ => return false,
+            },
+            Patch::Absolute { symbol } => match (step.def, step.mem) {
+                // `mov eax, offset symbol`
+                (Def::Const(addend), None) if step.flow == Flow::None => {
+                    step.def = Def::Address(symbol.wrapping_add(addend) & 0xffff_ffff);
+                }
+                (_, Some((mem, usage))) if mem.base.is_none() => {
+                    step.mem = Some((
+                        Mem {
+                            base: None,
+                            offset: symbol.wrapping_add(mem.offset) & 0xffff_ffff,
+                        },
+                        usage,
+                    ));
+                }
+                _ => drop(step),
+            },
+            Patch::Half { target, low } => {
+                let usage = step.mem.map(|(_, usage)| usage);
+                let flow = step.flow;
+                drop(step);
+                match (low && flow == Flow::None, usage) {
+                    (false, _) => {}
+                    // `lwz r3, lo16(symbol)(r3)` reads the symbol.
+                    (true, Some(usage)) => {
+                        step.mem = Some((
+                            Mem {
+                                base: None,
+                                offset: target,
+                            },
+                            usage,
+                        ));
+                    }
+                    (true, None) => step.def = Def::Address(target),
+                }
+            }
         }
         true
     }
@@ -1148,6 +1698,7 @@ impl Sweep<'_> {
                 Flow::None
             },
             writes: insn.writes.map_or(0, bit),
+            flags: true,
             ..Step::default()
         };
         self.push(
@@ -1214,10 +1765,48 @@ impl Sweep<'_> {
         // Passes until what is known at the labels no longer changes. The
         // first pass takes a loop's head as reached from above only; the
         // jump back then takes away whatever the loop body changes.
+        //
+        // Code that nothing seen so far leads to (it follows a return or
+        // an unconditional jump, and no jump met yet goes there) is left
+        // out until something does: a jump further down, or a jump table.
+        // What is still not reached when the labels have settled is
+        // reached in a way the sweep does not see, so nothing is known
+        // where it starts, and the passes go on from there.
+        //
+        // Reaching code only by jumps back can take a pass per jump. When
+        // half the passes are used up, the run is done again the plain
+        // way: code that direct jumps and falling through lead to is taken
+        // as reached from the first pass on, with nothing known where no
+        // way in has been seen yet.
+        let direct = Self::directly_reached(&run, &labels, &jump_to);
+        let initial = labels;
+        let mut labels = HashMap::new();
+        let mut cases: HashMap<usize, (Table, Vec<u32>)> = HashMap::new();
+        let mut unreached: Vec<usize> = Vec::new();
         let mut settled = false;
-        for _ in 0..MAX_PASSES {
-            if !self.pass(&run, &mut labels, &jump_to, None) {
-                settled = true;
+        for direct in [None, Some(&direct[..])] {
+            labels = initial.clone();
+            cases.clear();
+            for _ in 0..MAX_PASSES / 2 {
+                let mut pass = Pass {
+                    labels: &mut labels,
+                    cases: &mut cases,
+                    direct,
+                    unreached: &mut unreached,
+                    report: false,
+                };
+                if self.pass(&run, &mut pass, &jump_to, refs) {
+                    continue;
+                }
+                if unreached.is_empty() {
+                    settled = true;
+                    break;
+                }
+                for index in unreached.drain(..) {
+                    labels.entry(index).or_default().outside = true;
+                }
+            }
+            if settled {
                 break;
             }
         }
@@ -1226,41 +1815,221 @@ impl Sweep<'_> {
                 label.outside = true;
             }
         }
-        self.pass(&run, &mut labels, &jump_to, Some(refs));
+        let mut pass = Pass {
+            labels: &mut labels,
+            cases: &mut cases,
+            direct: None,
+            unreached: &mut unreached,
+            report: true,
+        };
+        self.pass(&run, &mut pass, &jump_to, refs);
+    }
+
+    /// Which instructions of `run` are reached from its start, or from a
+    /// label that is reached from elsewhere, by falling through and by
+    /// direct jumps.
+    fn directly_reached(
+        run: &[Seen],
+        labels: &HashMap<usize, Label>,
+        jump_to: &impl Fn(&Seen) -> Option<usize>,
+    ) -> Vec<bool> {
+        let mut reached = vec![false; run.len()];
+        let mut pending: Vec<usize> = labels
+            .iter()
+            .filter(|(_, label)| label.outside)
+            .map(|(index, _)| *index)
+            .collect();
+        pending.push(0);
+        while let Some(start) = pending.pop() {
+            for (index, seen) in run.iter().enumerate().skip(start) {
+                if std::mem::replace(&mut reached[index], true) {
+                    break;
+                }
+                pending.extend(jump_to(seen));
+                if matches!(
+                    seen.step.flow,
+                    Flow::Return | Flow::Jump { conditional: false }
+                ) {
+                    break;
+                }
+            }
+        }
+        reached
+    }
+
+    /// Where a jump table whose index has no visible bound must end at the
+    /// latest: where something else is known to start. That is the end of
+    /// its section, the next place decoding restarts when the table lies
+    /// in the code section, the next symbol, the next jump table found so
+    /// far, the next address the code of the section computes (see
+    /// [`computed_addresses`]) and the next address anything seen so far
+    /// refers to.
+    fn table_end(&self, base: u64, refs: &Xrefs) -> u64 {
+        let after = base.saturating_add(1);
+        let mut end = u64::MAX;
+        if base >= self.base && base < self.end {
+            let next = self.starts.partition_point(|start| *start <= base);
+            end = self.starts.get(next).copied().unwrap_or(self.end);
+        }
+        let next = self.addresses.partition_point(|address| *address <= base);
+        let known = [
+            self.memory.section_end(base),
+            self.tables.range(after..).next().copied(),
+            self.memory.next_symbol(base),
+            self.addresses.get(next).copied(),
+            refs.targets
+                .range(after..)
+                .next()
+                .map(|(target, _)| *target),
+        ];
+        known.into_iter().flatten().fold(end, u64::min)
+    }
+
+    /// The instructions of `run` the entries of `table` lead to, as sorted
+    /// indices. The table counts only when every entry leads to an
+    /// instruction of the run: all the entries the range check of the
+    /// index allows or, when no check was seen, all up to where something
+    /// else starts ([`Self::table_end`]), less the zero bytes that pad the
+    /// table to that place. Empty when it is not a jump table of this run.
+    fn cases(&mut self, run: &[Seen], table: Table, refs: &Xrefs) -> Vec<u32> {
+        let size = u64::from(table.size);
+        let bounded = table.count != 0;
+        let count = if bounded {
+            u64::from(table.count)
+        } else {
+            self.table_end(table.base, refs).saturating_sub(table.base) / size
+        };
+        if count == 0 || count > u64::from(MAX_TABLE) || count > self.table_budget {
+            return Vec::new();
+        }
+        self.table_budget -= count;
+        let mut out = Vec::new();
+        for i in 0..count {
+            let at = table.base.wrapping_add(i * size);
+            let entry = self.table_entry(at, table);
+            let target = entry.and_then(|entry| {
+                let target = table
+                    .anchor
+                    .wrapping_add(entry.checked_shl(u32::from(table.shift))?);
+                run.binary_search_by_key(&target, |s| s.address).ok()
+            });
+            match target {
+                Some(index) => out.push(index as u32),
+                // Padding before whatever comes next.
+                None if !bounded
+                    && (count - i) * size < MAX_PADDING
+                    && (i..count).all(|rest| {
+                        self.memory
+                            .read(table.base.wrapping_add(rest * size), table.size)
+                            == Some(0)
+                    }) =>
+                {
+                    break
+                }
+                None => return Vec::new(),
+            }
+        }
+        if !out.is_empty() {
+            self.tables.insert(table.base);
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    /// The entry of `table` stored at `at`, sign-extended when the code
+    /// reads it so. `None` when it is not in the file or a relocation
+    /// changes it.
+    fn table_entry(&self, at: u64, table: Table) -> Option<u64> {
+        if self.memory.is_relocated(at, u64::from(table.size)) {
+            return None;
+        }
+        let raw = self.memory.read(at, table.size)?;
+        let bits = 8 * u32::from(table.size);
+        Some(if table.signed && bits < 64 && raw >> (bits - 1) != 0 {
+            raw | u64::MAX << bits
+        } else {
+            raw
+        })
     }
 
     /// One pass over a run in address order. Returns whether a jump back
     /// lowered what is known at its label, so that another pass is needed.
     /// With `refs`, reports the references instead.
     fn pass(
-        &self,
+        &mut self,
         run: &[Seen],
-        labels: &mut HashMap<usize, Label>,
+        pass: &mut Pass<'_>,
         jump_to: &impl Fn(&Seen) -> Option<usize>,
-        mut refs: Option<&mut Xrefs>,
+        refs: &mut Xrefs,
     ) -> bool {
+        let Pass {
+            labels,
+            cases,
+            direct,
+            unreached,
+            report,
+        } = pass;
+        let report = *report;
+        unreached.clear();
         let mut changed = false;
         // The state falling into the next instruction; `None` after a
         // return or an unconditional jump.
         let mut falling: Option<State> = Some(State::UNKNOWN);
+        // Whether an instruction that is not reached starts a stretch of
+        // such instructions.
+        let mut entry = true;
         for (index, seen) in run.iter().enumerate() {
             let state = match labels.get(&index) {
-                Some(label) if label.outside => State::UNKNOWN,
+                Some(label) if label.outside => Some(State::UNKNOWN),
                 Some(label) => match (falling, label.jumped) {
-                    (Some(a), Some(b)) => a.meet(&b),
-                    (Some(a), None) => a,
-                    (None, Some(b)) => b,
-                    // Only reached by jumps that come later.
-                    (None, None) => State::UNKNOWN,
+                    (Some(a), Some(b)) => Some(a.meet(&b)),
+                    (a, b) => a.or(b),
                 },
-                // Not a label: reached from above, or (after a return or a
-                // jump) by a way the sweep does not see.
-                None => falling.unwrap_or(State::UNKNOWN),
+                // Not a label: reached from above or, after a return or a
+                // jump, not by anything seen so far.
+                None => falling,
             };
-            let after = self.transfer(&state, seen, refs.as_deref_mut());
+            let state = match state {
+                Some(state) => state,
+                // Only reached by direct jumps that come later.
+                None if direct.is_some_and(|direct| direct.get(index) == Some(&true)) => {
+                    State::UNKNOWN
+                }
+                // When reporting, every way of getting here that the
+                // passes found has been followed.
+                None if report => State::UNKNOWN,
+                None => {
+                    // The first of a stretch: what is before it is
+                    // reached, or does not lead to it.
+                    if entry {
+                        unreached.push(index);
+                    }
+                    entry = matches!(
+                        seen.step.flow,
+                        Flow::Return | Flow::Jump { conditional: false }
+                    );
+                    continue;
+                }
+            };
+            entry = true;
+            let after = self.transfer(&state, seen, report.then_some(&mut *refs));
+            // A conditional jump on an unsigned comparison bounds the
+            // compared register on one of its two ways out.
+            let (mut taken, mut fall) = (after, after);
+            if let (Flow::Jump { conditional: true }, Some(cond), Some((reg, imm))) =
+                (seen.step.flow, seen.step.cond, state.compare)
+            {
+                if let Some(max) = cond.max(imm, true) {
+                    taken.bound(reg, max);
+                }
+                if let Some(max) = cond.max(imm, false) {
+                    fall.bound(reg, max);
+                }
+            }
             if let Some(target) = jump_to(seen) {
                 if let Some(label) = labels.get_mut(&target) {
-                    let merged = label.jumped.map_or(after, |known| known.meet(&after));
+                    let merged = label.jumped.map_or(taken, |known| known.meet(&taken));
                     if label.jumped != Some(merged) {
                         label.jumped = Some(merged);
                         // A label at or before the jump has already been
@@ -1269,11 +2038,65 @@ impl Sweep<'_> {
                     }
                 }
             }
+            if let (Flow::Jump { conditional: false }, Target::Reg(reg)) =
+                (seen.step.flow, seen.step.target)
+            {
+                // A jump through a jump table goes to each of its cases.
+                let table = match state.slot(reg) {
+                    Slot::Case(table) => Some(table),
+                    _ => None,
+                };
+                if cases.get(&index).map(|known| known.0) != table {
+                    // What an earlier pass took for the cases here no
+                    // longer holds: nothing is assumed at them.
+                    if let Some((_, old)) = cases.remove(&index) {
+                        for target in old {
+                            if let Some(label) = labels.get_mut(&(target as usize)) {
+                                label.outside = true;
+                            }
+                        }
+                        changed = true;
+                    }
+                    // Kept even when it is not a jump table, so that it
+                    // is read once.
+                    if let Some(table) = table {
+                        let found = self.cases(run, table, refs);
+                        cases.insert(index, (table, found));
+                    }
+                }
+                let ref_raw = self
+                    .raw_base
+                    .wrapping_add(seen.address.wrapping_sub(self.base));
+                for target in cases.get(&index).map_or(&[][..], |known| &known.1) {
+                    let target = *target as usize;
+                    if let (true, Some(case)) = (report, run.get(target)) {
+                        refs.add(
+                            case.address,
+                            RefItem {
+                                source: self.source,
+                                kind: RefKind::JumpTable,
+                                ref_raw,
+                                ref_vm: seen.address,
+                            },
+                        );
+                    }
+                    let new = !labels.contains_key(&target);
+                    let label = labels.entry(target).or_default();
+                    // The first instruction of a run is reached from
+                    // elsewhere too.
+                    label.outside |= target == 0;
+                    let merged = label.jumped.map_or(after, |known| known.meet(&after));
+                    if new || label.jumped != Some(merged) {
+                        label.jumped = Some(merged);
+                        changed |= target <= index && !label.outside;
+                    }
+                }
+            }
             falling = (!matches!(
                 seen.step.flow,
                 Flow::Return | Flow::Jump { conditional: false }
             ))
-            .then_some(after);
+            .then_some(fall);
         }
         changed
     }
@@ -1313,7 +2136,7 @@ impl Sweep<'_> {
 
         // The new value of the destination register.
         let value = match step.def {
-            Def::None => None,
+            Def::None | Def::LoadIndex { .. } | Def::AddReg { .. } | Def::Clamp { .. } => None,
             Def::Const(value) => Some(Value {
                 value,
                 address: false,
@@ -1372,6 +2195,51 @@ impl Sweep<'_> {
             }),
         };
 
+        // The other things known about a register.
+        let slot = match step.def {
+            Def::Copy { src } => state.slot(src),
+            Def::LoadIndex {
+                base,
+                index,
+                size,
+                signed,
+            } => match state.reg(base) {
+                Some(base) if base.address => Slot::Entry(Table {
+                    base: base.value,
+                    anchor: 0,
+                    count: match state.slot(index) {
+                        Slot::Max(max) if max < u64::from(MAX_TABLE) => max as u32 + 1,
+                        _ => 0,
+                    },
+                    size,
+                    signed,
+                    shift: 0,
+                }),
+                _ => Slot::Unknown,
+            },
+            Def::AddReg { a, b, shift } => match (state.slot(a), state.slot(b)) {
+                (Slot::Known(anchor), Slot::Entry(table)) if anchor.address => Slot::Case(Table {
+                    anchor: anchor.value,
+                    shift,
+                    ..table
+                }),
+                (Slot::Entry(table), Slot::Known(anchor)) if anchor.address && shift == 0 => {
+                    Slot::Case(Table {
+                        anchor: anchor.value,
+                        ..table
+                    })
+                }
+                _ => Slot::Unknown,
+            },
+            Def::Clamp { src } => match (state.compare, step.cond) {
+                (Some((reg, imm)), Some(cond)) if reg == src => {
+                    cond.max(imm, true).map_or(Slot::Unknown, Slot::Max)
+                }
+                _ => Slot::Unknown,
+            },
+            _ => value.map_or(Slot::Unknown, Slot::Known),
+        };
+
         // Calls and jumps.
         let call = step.flow == Flow::Call;
         let pick = |c: RefKind, j: RefKind| if call { c } else { j };
@@ -1424,24 +2292,54 @@ impl Sweep<'_> {
         }
         for (reg, slot) in after.regs.iter_mut().enumerate() {
             if lost & bit(reg as Reg) != 0 {
-                *slot = None;
+                *slot = Slot::Unknown;
             }
         }
-        if let (Some(v), Some(slot)) = (
-            value,
+        // The flags still come from the comparison when nothing changed
+        // them or the register compared.
+        after.compare = step.compare.or(state
+            .compare
+            .filter(|(reg, _)| !step.flags && !call && lost & bit(*reg) == 0));
+        after.same = match (step.def, step.dst) {
+            (Def::Copy { src }, Some(dst)) if src != dst => Some((dst, src)),
+            _ => state.same.filter(|(a, b)| lost & (bit(*a) | bit(*b)) == 0),
+        };
+        // The 32-bit form of the destination keeps the low half of the
+        // value, zero-extended.
+        let slot = match slot {
+            Slot::Known(v) if step.narrow => Slot::Known(Value {
+                value: v.value & 0xffff_ffff,
+                ..v
+            }),
+            Slot::Entry(table) if step.narrow && table.signed => Slot::Unknown,
+            Slot::Case(_) if step.narrow => Slot::Unknown,
+            other => other,
+        };
+        if let (true, Some(dst)) = (
+            slot != Slot::Unknown,
             step.dst.and_then(|dst| after.regs.get_mut(dst as usize)),
         ) {
-            *slot = Some(Value {
-                value: if step.narrow {
-                    v.value & 0xffff_ffff
-                } else {
-                    v.value
-                },
-                ..v
-            });
+            *dst = slot;
         }
         after
     }
+}
+
+/// What the passes over a run keep between them.
+struct Pass<'a> {
+    labels: &'a mut HashMap<usize, Label>,
+    /// The cases of the jump tables found, by the index of the indirect
+    /// jump, with the table as it was read.
+    cases: &'a mut HashMap<usize, (Table, Vec<u32>)>,
+    /// Whether an instruction is reached by falling through and direct
+    /// jumps alone; given when such code is to be taken as reached before
+    /// a way in has been seen.
+    direct: Option<&'a [bool]>,
+    /// First instructions of the stretches the pass did not reach: one
+    /// per stretch that ends with a return or an unconditional jump.
+    unreached: &'a mut Vec<usize>,
+    /// Report the references instead of looking for changes.
+    report: bool,
 }
 
 /// An instruction of a run that a jump or call goes to.
@@ -1557,6 +2455,660 @@ mod tests {
 
     // The code of the 64-bit test images starts at 0x1108 and their pointer
     // slot is at the next 8-byte boundary after it.
+
+    /// x86-64 code that switches on `edi` through the table in the
+    /// pointer slot of the test image (two 32-bit offsets from the table).
+    /// `check`: with the range check; `second`: where the second entry
+    /// leads.
+    fn x86_64_switch(check: bool, second: u64) -> Vec<(u64, &'static str, u64)> {
+        let mut code = vec![
+            0x48, 0x8d, 0x15, 0xf1, 0x1e, 0x00,
+            0x00, // 1108 lea rdx, [rip + 0x1ef1] -> 0x3000
+            0x83, 0xff, 0x01, // 110f cmp edi, 1
+            0x77, 0x19, // 1112 ja 0x112d
+            0x89, 0xf8, // 1114 mov eax, edi
+            0x48, 0x8d, 0x0d, 0x13, 0x00, 0x00, 0x00, // 1116 lea rcx, [rip + 0x13] -> 0x1130
+            0x48, 0x63, 0x04, 0x81, // 111d movsxd rax, dword ptr [rcx + rax*4]
+            0x48, 0x01, 0xc8, // 1121 add rax, rcx
+            0xff, 0xe0, // 1124 jmp rax
+            0x8b, 0x02, // 1126 mov eax, [rdx]       case 0
+            0xc3, // 1128 ret
+            0x89, 0x42, 0x04, // 1129 mov [rdx + 4], eax   case 1
+            0xc3, // 112c ret
+            0xc3, // 112d ret                  default
+        ];
+        if !check {
+            code[7..12].fill(0x90);
+        }
+        let entry = |target: u64| target.wrapping_sub(0x1130) & 0xffff_ffff;
+        code_refs(CPU_TYPE_X86_64, &code, entry(0x1126) | entry(second) << 32)
+    }
+
+    #[test]
+    fn jump_tables_x86_64() {
+        // The jump goes to both cases, and what `rdx` holds before the
+        // switch is known in them.
+        assert_eq!(
+            x86_64_switch(true, 0x1129),
+            [
+                (0x1126, "jump-table", 0x1124),
+                (0x1129, "jump-table", 0x1124),
+                (0x112d, "jump", 0x1112),
+                (0x1130, "addr", 0x1116),
+                (0x3000, "addr", 0x1108),
+                (0x3000, "load", 0x1126),
+                (0x3004, "store", 0x1129),
+            ]
+        );
+        // Without the range check the table ends where its section does.
+        assert_eq!(
+            x86_64_switch(false, 0x1129),
+            [
+                (0x1126, "jump-table", 0x1124),
+                (0x1129, "jump-table", 0x1124),
+                (0x1130, "addr", 0x1116),
+                (0x3000, "addr", 0x1108),
+                (0x3000, "load", 0x1126),
+                (0x3004, "store", 0x1129),
+            ]
+        );
+        // An entry that leads into the middle of an instruction, or out
+        // of the function: not a jump table, and the code after the jump
+        // starts with nothing known.
+        for second in [0x112a, 0x2000] {
+            for check in [true, false] {
+                let refs = x86_64_switch(check, second);
+                assert!(refs.iter().all(|r| r.1 != "jump-table"), "{refs:x?}");
+                assert!(refs.iter().all(|r| r.1 != "load" && r.1 != "store"));
+                assert!(refs.contains(&(0x3000, "addr", 0x1108)));
+            }
+        }
+    }
+
+    /// arm64 code that switches on `w0` through a table of bytes in the
+    /// pointer slot of the test image (instructions counted from the
+    /// first case).
+    fn arm64_switch(check: bool, table: [u8; 8]) -> Vec<(u64, &'static str, u64)> {
+        let mut code = [
+            0x1000_07cc, // 1108 adr  x12, 0x1200
+            0x7100_081f, // 110c cmp  w0, #2
+            0x5400_0168, // 1110 b.hi 0x113c
+            0x2a00_03e8, // 1114 mov  w8, w0
+            0x9000_0009, // 1118 adrp x9, 0x1000
+            0x9105_0129, // 111c add  x9, x9, #0x140
+            0x1000_008a, // 1120 adr  x10, 0x1130
+            0x3868_692b, // 1124 ldrb w11, [x9, x8]
+            0x8b0b_094a, // 1128 add  x10, x10, x11, lsl #2
+            0xd61f_0140, // 112c br   x10
+            0xb940_0180, // 1130 ldr  w0, [x12]        case 0
+            0xd65f_03c0, // 1134 ret
+            0xb900_0580, // 1138 str  w0, [x12, #4]    cases 1 and 2
+            0xd65f_03c0, // 113c ret                   default
+        ];
+        if !check {
+            code[1] = 0xd503_201f;
+            code[2] = 0xd503_201f;
+        }
+        code_refs(CPU_TYPE_ARM64, &arm64(&code), u64::from_le_bytes(table))
+    }
+
+    #[test]
+    fn jump_tables_arm64() {
+        let cases = [
+            (0x1130, "addr", 0x1120),
+            (0x1130, "jump-table", 0x112c),
+            (0x1138, "jump-table", 0x112c),
+        ];
+        let rest = [
+            (0x1140, "addr", 0x111c),
+            (0x1200, "addr", 0x1108),
+            (0x1200, "load", 0x1130),
+            (0x1204, "store", 0x1138),
+        ];
+        // Three entries are read: what follows them does not matter.
+        let mut expected = cases.to_vec();
+        expected.push((0x113c, "jump", 0x1110));
+        expected.extend(rest);
+        assert_eq!(
+            arm64_switch(true, [0, 2, 2, 0xff, 0xff, 0xff, 0xff, 0xff]),
+            expected
+        );
+        // No range check: every byte up to the end of the section must be
+        // an entry (zero leads to the first case, as padding does).
+        let mut expected = cases.to_vec();
+        expected.extend(rest);
+        assert_eq!(arm64_switch(false, [0, 2, 2, 0, 0, 0, 0, 0]), expected);
+        // An entry past the function: not a jump table.
+        for (check, table) in [
+            (true, [0, 2, 9, 0, 0, 0, 0, 0]),
+            (false, [0, 2, 2, 0, 0, 0, 0, 9]),
+        ] {
+            let refs = arm64_switch(check, table);
+            assert!(refs.iter().all(|r| r.1 != "jump-table"), "{refs:x?}");
+            assert!(refs.iter().all(|r| r.1 != "load" && r.1 != "store"));
+        }
+    }
+
+    #[test]
+    fn jump_tables_arm64e() {
+        // The sequence of the pointer-authentication ABI: the index is
+        // forced into range, the entries count from the `adr`.
+        for clamp in [
+            0x9a9f_9210u32, // csel  x16, x16, xzr, ls
+            0xda9f_9610,    // csneg x16, x16, xzr, ls
+        ] {
+            let code = arm64(&[
+                0xf100_061f, // 1108 cmp   x16, #1
+                clamp,       // 110c
+                0x9000_0011, // 1110 adrp  x17, 0x1000
+                0x9104_e231, // 1114 add   x17, x17, #0x138
+                0xb8b0_7a30, // 1118 ldrsw x16, [x17, x16, lsl #2]
+                0x1000_0011, // 111c adr   x17, 0x111c
+                0x8b10_0230, // 1120 add   x16, x17, x16
+                0xd61f_0200, // 1124 br    x16
+                0xd65f_03c0, // 1128 ret                 case 0
+                0xd503_201f, // 112c nop                 case 1
+                0xd65f_03c0, // 1130 ret
+            ]);
+            assert_eq!(
+                code_refs(CPU_TYPE_ARM64, &code, 0x10_0000_000c),
+                [
+                    (0x111c, "addr", 0x111c),
+                    (0x1128, "jump-table", 0x1124),
+                    (0x112c, "jump-table", 0x1124),
+                    (0x1138, "addr", 0x1114),
+                ]
+            );
+        }
+    }
+
+    /// The steps of the instructions of `code`.
+    fn steps(cputype: u32, code: &[u8]) -> Vec<Step> {
+        let arch = Arch::of(cputype).unwrap();
+        let disassembler = Disassembler::new(cputype, 0, true).unwrap();
+        let region = disasm::Region {
+            start: 0,
+            end: code.len(),
+            kind: disasm::RegionKind::Code { thumb: false },
+        };
+        let mut out = Vec::new();
+        disassembler
+            .run(code, 0x1000, &[region], |item| {
+                if let Item::Code { cs, insn, .. } = item {
+                    out.push(arch.step(cs, insn).unwrap());
+                }
+            })
+            .unwrap();
+        out
+    }
+
+    #[test]
+    fn comparisons_and_flags() {
+        // arm64: what sets the flags, and the comparisons with a number.
+        let s = steps(
+            CPU_TYPE_ARM64,
+            &arm64(&[
+                0x7100_141f, // cmp   w0, #5
+                0xf100_7e1f, // cmp   x16, #0x1f
+                0x6b01_001f, // cmp   w0, w1
+                0x3100_0400, // adds  w0, w0, #1
+                0x6a01_0000, // ands  w0, w0, w1
+                0x7200_001f, // tst   w0, #1
+                0x7a41_0800, // ccmp  w0, #1, #0, eq
+                0x1e21_2000, // fcmp  s0, s1
+                0x1100_0400, // add   w0, w0, #1
+                0x2a01_03e0, // mov   w0, w1
+                0x5400_0048, // b.hi  0x1030
+                0x5400_0029, // b.ls  0x1030
+                0x5400_0002, // b.hs  0x102c
+                0x5400_0003, // b.lo  0x1030
+                0x5400_0000, // b.eq  0x1034
+                0x3400_0000, // cbz   w0, 0x1038
+            ]),
+        );
+        let compares: Vec<_> = s.iter().map(|s| s.compare).collect();
+        assert_eq!(compares[..3], [Some((0, 5)), Some((16, 0x1f)), None]);
+        assert!(compares[3..].iter().all(Option::is_none));
+        let flags: Vec<_> = s.iter().map(|s| s.flags).collect();
+        assert_eq!(flags[..8], [true; 8]);
+        assert_eq!(flags[8..], [false; 8]);
+        let conds: Vec<_> = s[10..].iter().map(|s| s.cond).collect();
+        assert_eq!(
+            conds,
+            [
+                Some(Cond::Above),
+                Some(Cond::NotAbove),
+                Some(Cond::NotBelow),
+                Some(Cond::Below),
+                None,
+                None
+            ]
+        );
+        // x86-64.
+        let s = steps(
+            CPU_TYPE_X86_64,
+            &[
+                0x83, 0xff, 0x05, // cmp  edi, 5
+                0x48, 0x83, 0xf8, 0x07, // cmp  rax, 7
+                0x39, 0xc7, // cmp  edi, eax
+                0x80, 0xfa, 0x09, // cmp  dl, 9
+                0x85, 0xc0, // test eax, eax
+                0x83, 0xc0, 0x01, // add  eax, 1
+                0xff, 0xc0, // inc  eax
+                0x31, 0xc0, // xor  eax, eax
+                0x83, 0xe1, 0x07, // and  ecx, 7
+                0xc1, 0xe8, 0x02, // shr  eax, 2
+                0x89, 0xf8, // mov  eax, edi
+                0x48, 0x8d, 0x04, 0x88, // lea  rax, [rax + rcx*4]
+                0x48, 0x63, 0x04, 0x81, // movsxd rax, dword ptr [rcx + rax*4]
+                0x77, 0x00, // ja
+                0x76, 0x00, // jbe
+                0x73, 0x00, // jae
+                0x72, 0x00, // jb
+                0x74, 0x00, // je
+            ],
+        );
+        let compares: Vec<_> = s.iter().map(|s| s.compare).collect();
+        assert_eq!(compares[..4], [Some((7, 5)), Some((0, 7)), None, None]);
+        assert!(compares[4..].iter().all(Option::is_none));
+        let flags: Vec<_> = s.iter().map(|s| s.flags).collect();
+        assert_eq!(flags[..10], [true; 10]);
+        assert_eq!(flags[10..], [false; 8]);
+        let conds: Vec<_> = s[13..].iter().map(|s| s.cond).collect();
+        assert_eq!(
+            conds,
+            [
+                Some(Cond::Above),
+                Some(Cond::NotAbove),
+                Some(Cond::NotBelow),
+                Some(Cond::Below),
+                None
+            ]
+        );
+        assert_eq!(
+            s[12].def,
+            Def::LoadIndex {
+                base: 1,
+                index: 0,
+                size: 4,
+                signed: true
+            }
+        );
+    }
+
+    #[test]
+    fn range_checks_bound_the_index() {
+        let c = |cond: Cond, holds| cond.max(5, holds);
+        assert_eq!(c(Cond::Above, false), Some(5));
+        assert_eq!(c(Cond::Above, true), None);
+        assert_eq!(c(Cond::NotAbove, true), Some(5));
+        assert_eq!(c(Cond::NotBelow, false), Some(4));
+        assert_eq!(c(Cond::Below, true), Some(4));
+        assert_eq!(c(Cond::Below, false), None);
+        assert_eq!(Cond::Below.max(0, true), None);
+        // The bound also holds for the register the compared one was
+        // copied to or from, and never replaces a known value.
+        let mut state = State::UNKNOWN;
+        state.same = Some((19, 0));
+        state.regs[3] = Slot::Known(Value {
+            value: 7,
+            address: false,
+        });
+        state.bound(0, 30);
+        state.bound(3, 30);
+        assert_eq!(
+            (state.slot(0), state.slot(19)),
+            (Slot::Max(30), Slot::Max(30))
+        );
+        assert_eq!(state.reg(3).map(|v| v.value), Some(7));
+        state.bound(19, 9);
+        assert_eq!(
+            (state.slot(0), state.slot(19)),
+            (Slot::Max(9), Slot::Max(9))
+        );
+    }
+
+    #[test]
+    fn computed_addresses_are_collected() {
+        let code = arm64(&[
+            0x9000_0009, // 1108 adrp x9, 0x1000
+            0x9105_0129, // 110c add  x9, x9, #0x140
+            0xb000_0008, // 1110 adrp x8, 0x2000
+            0xf940_0908, // 1114 ldr  x8, [x8, #0x10]
+            0x9000_0009, // 1118 adrp x9, 0x1000
+            0x9105_0108, // 111c add  x8, x8, #0x140   (another register)
+        ]);
+        let (mh, _) = tiny_macho(CPU_TYPE_ARM64, &code, 0);
+        let region = disasm::Region {
+            start: 0,
+            end: code.len(),
+            kind: disasm::RegionKind::Code { thumb: false },
+        };
+        assert_eq!(
+            computed_addresses(&mh, Arch::Arm64, &code, 0x1108, &[region]),
+            [0x1140, 0x2010]
+        );
+        assert!(computed_addresses(&mh, Arch::X64, &code, 0x1108, &[region]).is_empty());
+    }
+
+    #[test]
+    fn instruction_halves() {
+        // movw r0, #0x1234 / movt r0, #0x1234 in ARM and Thumb.
+        assert_eq!(
+            arm_imm16(&0xe301_0234u32.to_le_bytes(), 0, false),
+            Some(0x1234)
+        );
+        assert_eq!(
+            arm_imm16(&0xe341_0234u32.to_le_bytes(), 0, false),
+            Some(0x1234)
+        );
+        assert_eq!(arm_imm16(&[0x41, 0xf2, 0x34, 0x20], 0, true), Some(0x1234));
+        assert_eq!(arm_imm16(&[0xc1, 0xf2, 0x34, 0x20], 0, true), Some(0x1234));
+        assert_eq!(arm_imm16(&[0x41, 0xf2, 0x34], 0, true), None);
+        // add r0, pc (Thumb); add r0, pc, r0 and ldr r0, [pc, r0] (ARM).
+        assert_eq!(arm_pc_ahead(&[0x78, 0x44], 0, true), Some(4));
+        assert_eq!(arm_pc_ahead(&[0x08, 0x44], 0, true), None);
+        assert_eq!(
+            arm_pc_ahead(&0xe08f_0000u32.to_le_bytes(), 0, false),
+            Some(8)
+        );
+        assert_eq!(
+            arm_pc_ahead(&0xe79f_0000u32.to_le_bytes(), 0, false),
+            Some(8)
+        );
+        assert_eq!(arm_pc_ahead(&0xe080_0000u32.to_le_bytes(), 0, false), None);
+        assert_eq!(arm_pc_ahead(&[0x78, 0x44], 2, true), None);
+    }
+
+    #[test]
+    fn patches_of_32_bit_code() {
+        let apply = |mut step: Step, patch| {
+            let changed = Sweep::apply_patch(&mut step, patch);
+            (changed, step)
+        };
+        // A branch to a symbol: the decoded target is the addend.
+        let call = Step {
+            flow: Flow::Call,
+            target: Target::Address(0),
+            ..Step::default()
+        };
+        let to = Patch::Branch { symbol: 0x2000 };
+        assert_eq!(
+            apply(call, to),
+            (
+                true,
+                Step {
+                    target: Target::Address(0x2000),
+                    ..call
+                }
+            )
+        );
+        let plus_8 = Step {
+            target: Target::Address(8),
+            ..call
+        };
+        assert_eq!(apply(plus_8, to).1.target, Target::Address(0x2008));
+        // Not a branch: nothing is assumed.
+        let other = Step {
+            def: Def::Const(1),
+            dst: Some(0),
+            ..Step::default()
+        };
+        assert_eq!(apply(other, to).1.def, Def::None);
+
+        // 32-bit x86 absolute operands: `mov eax, [symbol + 4]` and
+        // `mov eax, offset symbol`.
+        let at = |offset| Mem { base: None, offset };
+        let abs = Patch::Absolute { symbol: 0x3000 };
+        let load = Step {
+            mem: Some((at(4), MemUse::Load)),
+            def: Def::Load {
+                size: 4,
+                signed: false,
+            },
+            dst: Some(0),
+            ..Step::default()
+        };
+        assert_eq!(apply(load, abs).1.mem, Some((at(0x3004), MemUse::Load)));
+        let offset = Step {
+            def: Def::Const(0),
+            dst: Some(0),
+            ..Step::default()
+        };
+        assert_eq!(apply(offset, abs).1.def, Def::Address(0x3000));
+        let indexed = Step {
+            mem: Some((
+                Mem {
+                    base: Some(3),
+                    offset: 0,
+                },
+                MemUse::Load,
+            )),
+            ..Step::default()
+        };
+        assert_eq!(apply(indexed, abs).1.mem, None);
+        // A section-relative entry: the operand is the address already,
+        // and an immediate is one.
+        assert_eq!(apply(load, Patch::Immediate), (false, load));
+        let local = Step {
+            def: Def::Const(0x110),
+            dst: Some(0),
+            ..Step::default()
+        };
+        let (changed, step) = apply(local, Patch::Immediate);
+        assert!(changed);
+        assert_eq!(step.def, Def::Address(0x110));
+
+        // The halves of an address: reported once, at the low half, as an
+        // address or as the memory the instruction reads or writes.
+        let half = |low| Patch::Half {
+            target: 0x4568,
+            low,
+        };
+        let movw = Step::default();
+        assert_eq!(apply(movw, half(true)).1.def, Def::Address(0x4568));
+        assert_eq!(apply(movw, half(false)), (true, Step::default()));
+        let lwz = Step {
+            mem: Some((
+                Mem {
+                    base: Some(3),
+                    offset: 0x4568,
+                },
+                MemUse::Load,
+            )),
+            ..Step::default()
+        };
+        let step = apply(lwz, half(true)).1;
+        assert_eq!(step.mem, Some((at(0x4568), MemUse::Load)));
+        assert_eq!(step.def, Def::None);
+    }
+
+    /// A 32-bit object file: `code` in `__text` at address 0 with the
+    /// relocation entries `relocs` (pairs of words), a second section of
+    /// 16 bytes at 0x100 and the symbols `(name, section, address)`,
+    /// section 0 meaning undefined.
+    fn object_32(
+        cputype: u32,
+        big_endian: bool,
+        code: &[u8],
+        relocs: &[(u32, u32)],
+        symbols: &[(&str, u8, u32)],
+    ) -> MachHeader {
+        let word = |f: &mut Vec<u8>, v: u32| {
+            f.extend_from_slice(&if big_endian {
+                v.to_be_bytes()
+            } else {
+                v.to_le_bytes()
+            })
+        };
+        let name = |f: &mut Vec<u8>, n: &str| {
+            let mut b = [0u8; 16];
+            b[..n.len()].copy_from_slice(n.as_bytes());
+            f.extend_from_slice(&b);
+        };
+        let sizeofcmds = 56 + 2 * 68 + 24;
+        let text_off = 28 + sizeofcmds;
+        let data_off = text_off + 0x100;
+        let reloc_off = data_off + 16;
+        let symoff = reloc_off + 8 * relocs.len() as u32;
+        let stroff = symoff + 12 * symbols.len() as u32;
+        let mut strings = vec![0u8];
+        let mut f = Vec::new();
+        for v in [MH_MAGIC, cputype, 0, MH_OBJECT, 2, sizeofcmds, 0] {
+            word(&mut f, v);
+        }
+        word(&mut f, 1);
+        word(&mut f, 56 + 2 * 68);
+        name(&mut f, "");
+        for v in [0, 0x110, text_off, 0x110, 7, 7, 2, 0] {
+            word(&mut f, v);
+        }
+        for (sect, seg, addr, size, off, reloff, nreloc, flags) in [
+            (
+                "__text",
+                "__TEXT",
+                0,
+                code.len() as u32,
+                text_off,
+                reloc_off,
+                relocs.len() as u32,
+                0x8000_0400u32,
+            ),
+            ("__data", "__DATA", 0x100, 16, data_off, 0, 0, 0),
+        ] {
+            name(&mut f, sect);
+            name(&mut f, seg);
+            for v in [addr, size, off, 0, reloff, nreloc, flags, 0, 0] {
+                word(&mut f, v);
+            }
+        }
+        let mut nlists = Vec::new();
+        for (symbol, sect, value) in symbols {
+            word(&mut nlists, strings.len() as u32);
+            nlists.extend_from_slice(&[if *sect == 0 { 0x01 } else { 0x0f }, *sect, 0, 0]);
+            word(&mut nlists, *value);
+            strings.extend_from_slice(symbol.as_bytes());
+            strings.push(0);
+        }
+        for v in [
+            2,
+            24,
+            symoff,
+            symbols.len() as u32,
+            stroff,
+            strings.len() as u32,
+        ] {
+            word(&mut f, v);
+        }
+        assert_eq!(f.len() as u32, text_off);
+        f.extend_from_slice(code);
+        f.resize(reloc_off as usize, 0);
+        for (word0, word1) in relocs {
+            word(&mut f, *word0);
+            word(&mut f, *word1);
+        }
+        f.extend_from_slice(&nlists);
+        f.extend_from_slice(&strings);
+        let image = std::sync::Arc::new(crate::image::Image::from_vec(f).unwrap());
+        MachHeader::parse(&image, 0).unwrap()
+    }
+
+    /// The second word of a little-endian `relocation_info`.
+    fn info(symbolnum: u32, pcrel: bool, length: u32, external: bool, kind: u8) -> u32 {
+        symbolnum
+            | (pcrel as u32) << 24
+            | length << 25
+            | (external as u32) << 27
+            | (kind as u32) << 28
+    }
+
+    /// The first word of a `scattered_relocation_info`.
+    fn scattered(address: u32, length: u32, kind: u8) -> u32 {
+        0x8000_0000 | length << 28 | (kind as u32) << 24 | address
+    }
+
+    fn object_refs(mh: &MachHeader) -> Vec<(u64, &'static str, u64)> {
+        summary(&collect(mh))
+            .into_iter()
+            .map(|(t, k, _, vm)| (t, k, vm))
+            .collect()
+    }
+
+    #[test]
+    fn relocations_of_i386_objects() {
+        use reloc::*;
+        let code = [
+            0xe8, 0xfb, 0xff, 0xff, 0xff, // 00 call _f (the addend 0, less 5)
+            0xe8, 0xf6, 0xff, 0xff, 0xff, // 05 call _undefined
+            0xa1, 0x04, 0x00, 0x00, 0x00, // 0a mov eax, [_v + 4]
+            0xb8, 0x08, 0x01, 0x00, 0x00, // 0f mov eax, 0x108   (section-relative)
+            0xe8, 0x00, 0x00, 0x00, 0x00, // 14 call 0x19        (reads the pc)
+            0x58, // 19 pop eax
+            0x8b, 0x88, 0xeb, 0x00, 0x00, 0x00, // 1a mov ecx, [eax + 0xeb] -> 0x104
+            0xc3, // 20 ret
+            0xc3, // 21 _f: ret
+        ];
+        let relocs = [
+            (0x01, info(0, true, 2, true, RELOC_UNSIGNED)),
+            (0x06, info(2, true, 2, true, RELOC_UNSIGNED)),
+            (0x0b, info(1, false, 2, true, RELOC_UNSIGNED)),
+            (0x10, info(2, false, 2, false, RELOC_UNSIGNED)),
+            (scattered(0x1c, 2, GENERIC_RELOC_LOCAL_SECTDIFF), 0x104),
+            (scattered(0, 2, RELOC_PAIR), 0x19),
+        ];
+        let symbols = [("_f", 1, 0x21), ("_v", 2, 0x100), ("_undefined", 0, 0)];
+        let mh = object_32(CPU_TYPE_I386, false, &code, &relocs, &symbols);
+        assert_eq!(
+            object_refs(&mh),
+            [
+                (0x21, "call", 0x00),
+                (0x104, "load", 0x0a),
+                (0x104, "load", 0x1a),
+                (0x108, "addr", 0x0f),
+            ]
+        );
+    }
+
+    #[test]
+    fn relocations_of_arm_objects() {
+        use reloc::*;
+        // ARM code: the program counter reads 8 bytes ahead.
+        let words: [u32; 9] = [
+            0xebff_fffe, // 00 bl   _f           (the addend 0, less 8)
+            0xebff_fffe, // 04 bl   _undefined
+            0xe300_0004, // 08 movw r0, #4       _v + 4, low half
+            0xe340_0000, // 0c movt r0, #0       high half
+            0xe300_10e8, // 10 movw r1, #0xe8    0x108 - (0x18 + 8), low half
+            0xe340_1000, // 14 movt r1, #0
+            0xe08f_1001, // 18 add  r1, pc, r1
+            0xe12f_ff1e, // 1c bx   lr
+            0xe12f_ff1e, // 20 _f: bx lr
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let relocs = [
+            (0x00, info(0, true, 2, true, ARM_RELOC_BR24)),
+            (0x04, info(2, true, 2, true, ARM_RELOC_BR24)),
+            (0x08, info(1, false, 0, true, ARM_RELOC_HALF)),
+            (0x0000, info(0xff_ffff, false, 0, false, RELOC_PAIR)),
+            (0x0c, info(1, false, 1, true, ARM_RELOC_HALF)),
+            (0x0004, info(0xff_ffff, false, 1, false, RELOC_PAIR)),
+            (scattered(0x10, 0, ARM_RELOC_HALF_SECTDIFF), 0x108),
+            (scattered(0x0000, 0, RELOC_PAIR), 0x18),
+            (scattered(0x14, 1, ARM_RELOC_HALF_SECTDIFF), 0x108),
+            (scattered(0x00e8, 1, RELOC_PAIR), 0x18),
+        ];
+        let symbols = [("_f", 1, 0x20), ("_v", 2, 0x100), ("_undefined", 0, 0)];
+        // CPU_SUBTYPE_ARM_V7 would default to Thumb: v6 decodes as ARM.
+        let mh = object_32(CPU_TYPE_ARM, false, &code, &relocs, &symbols);
+        assert_eq!(
+            object_refs(&mh),
+            [
+                (0x20, "call", 0x00),
+                (0x104, "addr", 0x08),
+                (0x108, "addr", 0x10),
+            ]
+        );
+    }
 
     #[test]
     fn sweep_x86_64() {
@@ -1905,9 +3457,14 @@ mod tests {
             arch,
             source: 0,
             base: 0,
+            end: 0,
             raw_base: 0,
             patches: Vec::new(),
             targets: Vec::new(),
+            starts: Vec::new(),
+            tables: BTreeSet::new(),
+            addresses: Vec::new(),
+            table_budget: 0,
             run: Vec::new(),
         }
     }
@@ -2230,7 +3787,7 @@ mod tests {
             kind: disasm::RegionKind::Code { thumb: false },
         };
         assert_eq!(
-            branch_targets(&mh, Arch::Arm64, &code, 0x1108, &[region]),
+            branch_targets(&mh, Arch::Arm64, &code, 0x1108, &[region], &[]),
             [0x1110, 0x1110, 0x1110, 0x1118, 0x1120]
         );
         // x86-64: call, jz, loop, jmp; indirect ones name no target.
@@ -2248,7 +3805,7 @@ mod tests {
             ..region
         };
         assert_eq!(
-            branch_targets(&mh, Arch::X64, &code, 0x1108, &[region]),
+            branch_targets(&mh, Arch::X64, &code, 0x1108, &[region], &[]),
             [0x110d, 0x110d, 0x1111, 0x1115]
         );
     }

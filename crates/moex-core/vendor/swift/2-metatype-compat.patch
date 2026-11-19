@@ -1,0 +1,21 @@
+commit 444bc9275ef9876c9b8404e4c2e8982868376bb6
+Author: David Herberth <david.herberth@sentry.io>
+Date:   Mon May 18 19:07:06 2026 +0200
+
+    apply patch
+
+diff --git a/symbolic-demangle/vendor/swift/lib/Demangling/Demangler.cpp b/symbolic-demangle/vendor/swift/lib/Demangling/Demangler.cpp
+index 4f7bbbcb..d88fda74 100644
+--- a/symbolic-demangle/vendor/swift/lib/Demangling/Demangler.cpp
++++ b/symbolic-demangle/vendor/swift/lib/Demangling/Demangler.cpp
+@@ -3619,6 +3619,10 @@ NodePointer Demangler::addFuncSpecParamNumber(NodePointer Param,
+ }
+
+ NodePointer Demangler::demangleSpecAttributes(Node::Kind SpecKind) {
++  // Swift used 'm' for `MetatypeParamsRemoved`, with the 6.3 update it was removed.
++  // To keep old mangled strings compatible with `symbolic` we skip `m` here.
++  (void) nextIf('m');
++
+   bool isSerialized = nextIf('q');
+   bool asyncRemoved = nextIf('a');
+   bool representationChanged = nextIf('r');

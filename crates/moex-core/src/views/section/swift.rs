@@ -17,7 +17,7 @@ const REL32: u32 = 4;
 pub(super) fn metadata(mh: &MachHeader, section: &Section) -> Table {
     let mut t = Table::new();
     t.set_headers(&["Index", "Offset", "Kind", "Value", "Decoded"]);
-    t.set_widths(&[80, 140, 220, 260, 420]);
+    t.set_widths(&[60, 100, 140, 220, 600]);
     let reader = SliceReader::new(mh, Segments::Only64(section.is64));
     let names = TypeNames::new(reader);
     match section.sectname.as_str() {
@@ -28,6 +28,7 @@ pub(super) fn metadata(mh: &MachHeader, section: &Section) -> Table {
         "__swift5_capture" => captures(&mut t, mh, section, &names),
         "__swift5_builtin" => builtin_types(&mut t, mh, section, &names),
         "__swift5_mpenum" => multi_payload_enums(&mut t, mh, section, &names),
+        "__swift5_acfuncs" => accessible_functions(&mut t, mh, section, &names),
         _ => relative_section(&mut t, mh, section, &names),
     }
     t
@@ -220,7 +221,8 @@ fn builtin_types(t: &mut Table, mh: &MachHeader, section: &Section, names: &Type
 
 /// `__swift5_mpenum`: multi-payload enum descriptors.
 fn multi_payload_enums(t: &mut Table, mh: &MachHeader, section: &Section, names: &TypeNames<'_>) {
-    let walk = swift::multi_payload_enum_records(section.data(&mh.image));
+    let data = section.data(&mh.image);
+    let walk = swift::multi_payload_enum_records(data);
     for (index, (delta, desc)) in walk.items.iter().enumerate() {
         let offset = section.data_offset + delta;
         let vmaddr = section.addr.wrapping_add(*delta);
@@ -233,14 +235,27 @@ fn multi_payload_enums(t: &mut Table, mh: &MachHeader, section: &Section, names:
                 "mpenum/descriptor".to_string(),
                 as_address(vmaddr),
                 format!(
-                    "type={} {}",
+                    "type={} {}{}",
                     names.relative_text(vmaddr, desc.type_name),
-                    desc.layout_text()
+                    desc.layout_text(),
+                    spare_bits_text(desc, data.get(*delta as usize..).unwrap_or(&[]))
                 ),
             ],
         );
     }
     error_row(t, "mpenum", walk.error);
+}
+
+/// ` spare_bits_offset=N spare_bits_mask=HEX` for a descriptor that has a
+/// spare bit mask (bytes as stored, least significant first); empty
+/// otherwise. `record` starts at the descriptor.
+fn spare_bits_text(desc: &swift::MultiPayloadEnumDescriptor, record: &[u8]) -> String {
+    let (Some(offset), Some(mask)) = (desc.spare_bit_mask_offset(), desc.spare_bit_mask(record))
+    else {
+        return String::new();
+    };
+    let mask: String = mask.iter().map(|byte| format!("{byte:02x}")).collect();
+    format!(" spare_bits_offset={offset} spare_bits_mask={mask}")
 }
 
 /// One 32-bit relative pointer of a section.
@@ -317,13 +332,29 @@ fn relative_section(t: &mut Table, mh: &MachHeader, section: &Section, names: &T
         let mapped = e.target_offset.is_some();
         let cstring = || read_printable_cstring(reader, target, 512);
         let (kind, decoded) = match section.sectname.as_str() {
-            "__swift5_types" | "__swift5_protos" => {
+            "__swift5_types" | "__swift5_types2" | "__swift5_protos" => {
                 if mapped {
                     decode_context_descriptor(reader, names, target)
                 } else {
                     ("rel32".to_string(), unmapped())
                 }
             }
+            // Protocol conformance descriptors.
+            "__swift5_proto" => {
+                let part = |part: Option<String>| part.unwrap_or_else(|| "?".to_string());
+                let decoded = match names.conformance(target) {
+                    Some((conforming, protocol)) => {
+                        format!("{}: {}", part(conforming), part(protocol))
+                    }
+                    None => unmapped(),
+                };
+                ("conformance".to_string(), decoded)
+            }
+            // The one entry is the program's `main`.
+            "__swift5_entry" => (
+                "entry".to_string(),
+                if mapped { "entry point" } else { "unmapped" }.to_string(),
+            ),
             _ => {
                 let decoded = mapped.then(cstring).filter(|s| !s.is_empty());
                 (
@@ -346,6 +377,60 @@ fn relative_section(t: &mut Table, mh: &MachHeader, section: &Section, names: &T
             Some(offset) => t.add_data(offset, 0, cells),
             None => t.add(cells),
         }
+    }
+}
+
+/// `__swift5_acfuncs`: accessible function records (distributed actor
+/// methods and the like, found by name at run time), 20 bytes each:
+/// relative pointers to the mangled name of the function, to its generic
+/// environment, to the mangled name of its type and to the function, then
+/// flags.
+fn accessible_functions(t: &mut Table, mh: &MachHeader, section: &Section, names: &TypeNames<'_>) {
+    const SIZE: u64 = 20;
+    let data = section.data(&mh.image);
+    let word = |at: u64| -> Option<u32> {
+        let bytes = data.get(at as usize..)?.get(..4)?;
+        Some(u32::from_le_bytes(bytes.try_into().ok()?))
+    };
+    let count = (data.len() as u64 / SIZE).min(swift::MAX_RECORDS as u64);
+    for index in 0..count {
+        let delta = index * SIZE;
+        let vmaddr = section.addr.wrapping_add(delta);
+        let (Some(name), Some(_), Some(function_type), Some(function), Some(flags)) = (
+            word(delta),
+            word(delta + 4),
+            word(delta + 8),
+            word(delta + 12),
+            word(delta + 16),
+        ) else {
+            break;
+        };
+        // The name is a symbol name.
+        let symbol = names
+            .relative_cstring(vmaddr, name as i32)
+            .map(|name| swift::demangle(name.as_bytes()).unwrap_or(name))
+            .unwrap_or_else(|| "-".to_string());
+        let function = match function as i32 {
+            0 => "-".to_string(),
+            rel => as_address(relative_target(vmaddr.wrapping_add(12), rel)),
+        };
+        t.add_data(
+            section.data_offset + delta,
+            SIZE,
+            [
+                as_string(index),
+                as_address(section.data_offset + delta),
+                "acfuncs/record".to_string(),
+                as_address(vmaddr),
+                format!(
+                    "{symbol} type={} function={function} flags=0x{flags:x}",
+                    names.relative_text(vmaddr.wrapping_add(8), function_type as i32)
+                ),
+            ],
+        );
+    }
+    if data.len() as u64 % SIZE != 0 {
+        error_row(t, "acfuncs", Some("truncated accessible function record"));
     }
 }
 

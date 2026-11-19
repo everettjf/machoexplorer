@@ -1024,3 +1024,80 @@ async fn table_context_menu_copies_cell(cx: &mut TestAppContext) {
     let copied = cx.read_from_clipboard().and_then(|c| c.text()).unwrap();
     assert_eq!(copied, table.rows[2].cells[1]);
 }
+
+/// Opens `section` of the document shown in `ui`, selects its child view
+/// `view` and returns the cells of the table the window shows for it.
+/// The rows may be below the visible part of the tree, so they are
+/// toggled and selected through the window rather than clicked.
+async fn section_view(
+    ui: &Ui,
+    cx: &mut TestAppContext,
+    section: &str,
+    view: &str,
+) -> Vec<Vec<String>> {
+    for parent in ["Sections", section] {
+        let ix = ui.row_named(cx, parent);
+        let id = ui.update(cx, |w, _, _| w.tree.model.rows()[ix].node.id());
+        if ui.update(cx, |w, _, _| w.tree.model.is_expanded(id)) {
+            continue;
+        }
+        let before = ui.names(cx).len();
+        ui.update(cx, |w, window, cx| w.toggle_tree_row(ix, window, cx));
+        ui.wait(cx, "expanded", move |w| w.tree.model.rows().len() > before)
+            .await;
+    }
+    // The view is the row right below its section.
+    let below = ui.row_named(cx, section) + 1;
+    let names = ui.names(cx);
+    assert_eq!(names[below].trim_start(), view, "{names:#?}");
+    let node = ui.update(cx, |w, window, cx| {
+        w.select_tree_row(below, window, cx);
+        w.tree.model.rows()[below].node.clone()
+    });
+    let id = node.id();
+    ui.wait(cx, "view shown", move |w| w.table.node_id() == Some(id))
+        .await;
+    ui.window(cx, |window, cx| window.render_frame(cx));
+    cx.run_until_parked();
+    ui.window(cx, |_, _| {});
+    ui.update(cx, |w, _, _| {
+        // The selected row was scrolled into view.
+        assert_eq!(w.tree.selected_index(), Some(below));
+        let table = w.table.table().expect("table");
+        assert_eq!(w.table.total_len(), table.rows.len());
+        assert!(w.table.rendered_rows > 0, "{section} / {view}");
+        table.rows.iter().map(|row| row.cells.clone()).collect()
+    })
+}
+
+/// The views of code sections other than `__text`, of the Swift
+/// reflection sections and of a big-endian file, in the window.
+#[gpui_kit::test]
+async fn code_swift_and_big_endian_views(cx: &mut TestAppContext) {
+    let has = |rows: &[Vec<String>], text: &str| {
+        rows.iter().any(|row| row.iter().any(|cell| cell.contains(text)))
+    };
+
+    let ui = open_window(cx, Some(repo("tests/corpus/bin/swiftrefs_arm64")), None);
+    ui.wait_document(cx).await;
+    let rows = section_view(&ui, cx, "Section(__TEXT,__stubs)", "Symbol Stubs").await;
+    assert!(!rows.is_empty());
+    let rows = section_view(&ui, cx, "Section(__TEXT,__swift5_typeref)", "Swift Metadata").await;
+    // A back-reference after the head of a generic type, and a type
+    // declared in an extension made in another module.
+    assert!(has(&rows, "(Refs.Wrap<A>, Refs.Wrap<A>)"), "{rows:#?}");
+    assert!(
+        has(&rows, "(extension in Refs):Swift.Array<Swift.Int>.Tag"),
+        "{rows:#?}"
+    );
+    let rows = section_view(&ui, cx, "Section(__TEXT,__swift5_proto)", "Swift Metadata").await;
+    assert!(has(&rows, "Refs.Square: Refs.Shape"), "{rows:#?}");
+    let rows = section_view(&ui, cx, "Section(__TEXT,__swift5_fieldmd)", "Swift Metadata").await;
+    assert!(has(&rows, "Refs.Wrap<Swift.Int>.Inner"), "{rows:#?}");
+
+    let ui = open_window(cx, Some(repo("tests/corpus/bin/hello_ppc.o")), None);
+    ui.wait_document(cx).await;
+    assert_eq!(ui.names(cx)[1], "  Mach Header (ppc)");
+    let rows = section_view(&ui, cx, "Section(__TEXT,__cstring)", "C String Literals").await;
+    assert!(has(&rows, "ppc"), "{rows:#?}");
+}

@@ -225,6 +225,8 @@ pub struct ExtractOutcome {
     /// Size in bytes of the output file.
     pub size: u64,
     pub segments: usize,
+    /// Local symbols merged in from the cache's local symbols data.
+    pub local_symbols_added: u32,
 }
 
 impl ExtractOutcome {
@@ -240,8 +242,18 @@ impl ExtractOutcome {
         }
     }
 
+    /// ` local-symbols=N` when symbols were merged in, otherwise empty.
+    fn local_symbols_text(&self) -> String {
+        match self.local_symbols_added {
+            0 => String::new(),
+            n => format!(" local-symbols={n}"),
+        }
+    }
+
     /// Human-readable report: one `plan:` line for a dry run, otherwise the
-    /// `extracted:` / `mode:` / `output:` lines. Newline terminated.
+    /// `extracted:` / `mode:` / `output:` lines. Newline terminated. The
+    /// last line ends with ` local-symbols=N` when N symbols were merged in
+    /// from the cache's local symbols data.
     pub fn text(&self) -> Vec<u8> {
         let mut out = Vec::new();
         if self.dry_run {
@@ -251,10 +263,11 @@ impl ExtractOutcome {
             out.extend_from_slice(&self.output_bytes());
             out.extend_from_slice(
                 format!(
-                    " mode={} size={} bytes segments={}\n",
+                    " mode={} size={} bytes segments={}{}\n",
                     self.mode_name(),
                     self.size,
-                    self.segments
+                    self.segments,
+                    self.local_symbols_text()
                 )
                 .as_bytes(),
             );
@@ -264,13 +277,20 @@ impl ExtractOutcome {
             out.extend_from_slice(format!("\nmode: {}\noutput: ", self.mode_name()).as_bytes());
             out.extend_from_slice(&self.output_bytes());
             out.extend_from_slice(
-                format!(" size={} bytes segments={}\n", self.size, self.segments).as_bytes(),
+                format!(
+                    " size={} bytes segments={}{}\n",
+                    self.size,
+                    self.segments,
+                    self.local_symbols_text()
+                )
+                .as_bytes(),
             );
         }
         out
     }
 
-    /// The same report as one JSON line.
+    /// The same report as one JSON line (`"local_symbols":N` only when
+    /// symbols were merged in).
     pub fn json(&self) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(if self.dry_run {
@@ -284,13 +304,19 @@ impl ExtractOutcome {
         out.extend_from_slice(&json_escape(&self.output_bytes()));
         out.extend_from_slice(
             format!(
-                "\",\"mode\":\"{}\",\"size\":{},\"segments\":{}}}\n",
+                "\",\"mode\":\"{}\",\"size\":{},\"segments\":{}",
                 self.mode_name(),
                 self.size,
                 self.segments
             )
             .as_bytes(),
         );
+        if self.local_symbols_added != 0 {
+            out.extend_from_slice(
+                format!(",\"local_symbols\":{}", self.local_symbols_added).as_bytes(),
+            );
+        }
+        out.extend_from_slice(b"}\n");
         out
     }
 }
@@ -358,7 +384,10 @@ const S_GB_ZEROFILL: u32 = 0xc;
 const S_THREAD_LOCAL_ZEROFILL: u32 = 0x12;
 const N_STAB: u8 = 0xe0;
 const N_TYPE: u8 = 0x0e;
+const N_SECT: u8 = 0x0e;
 const N_INDR: u8 = 0x0a;
+/// Segment flag: the segment is made read-only after fixups are applied.
+const SG_READ_ONLY: u32 = 0x10;
 const INDIRECT_SYMBOL_LOCAL: u32 = 0x8000_0000;
 const INDIRECT_SYMBOL_ABS: u32 = 0x4000_0000;
 
@@ -412,10 +441,270 @@ pub struct RebuiltLinkedit {
     /// (`data` is then empty).
     pub segment: Option<usize>,
     pub data: Vec<u8>,
+    /// Local symbols taken from the cache's local symbols data (see
+    /// [`LocalSymbols`]) and put at the start of the symbol table.
+    pub local_symbols_added: u32,
+    /// `<redacted>` placeholder symbols left out because those took their
+    /// place.
+    pub placeholders_dropped: u32,
     /// For each file-offset field of a load command that points into the
     /// segment: (offset of the `u32` field in the load commands, position
     /// in `data` it must point at).
     fixups: Vec<(usize, u32)>,
+}
+
+/// Changes to an image's symbol table that do not come from its own
+/// `__LINKEDIT`.
+#[derive(Debug, Clone, Copy, Default)]
+struct SymbolChanges<'a> {
+    /// `nlist` entries (of the image's width) of the local symbols the cache
+    /// builder moved out of the image, and the string pool their `n_strx`
+    /// point into.
+    locals: &'a [u8],
+    local_strings: &'a [u8],
+    /// New section ordinal for each old one (index: old `n_sect`). Empty
+    /// when the sections keep their numbers.
+    sections: &'a [u8],
+}
+
+/// Name the cache builder gives the one local symbol it leaves in an image
+/// whose local symbols it moved to the local symbols data.
+const REDACTED: &[u8] = b"<redacted>";
+
+/// `dyld_cache_header.symbolFileUUID`.
+const OFF_SYMBOL_FILE_UUID: u64 = 0x190;
+const OFF_LOCAL_SYMBOLS_OFFSET: u64 = crate::macho::dyld_cache::OFF_LOCAL_SYMBOLS_OFFSET;
+const OFF_LOCAL_SYMBOLS_SIZE: u64 = crate::macho::dyld_cache::OFF_LOCAL_SYMBOLS_SIZE;
+const OFF_CACHE_UUID: u64 = crate::macho::dyld_cache::OFF_UUID;
+/// `sizeof(dyld_cache_local_symbols_info)`: nlistOffset, nlistCount,
+/// stringsOffset, stringsSize, entriesOffset, entriesCount.
+const LOCAL_SYMBOLS_INFO_SIZE: u64 = 24;
+/// `sizeof(dyld_cache_local_symbols_entry)`: dylibOffset (u32, file offset
+/// of the image's header), nlistStartIndex, nlistCount.
+const LOCAL_SYMBOLS_ENTRY_SIZE: u64 = 12;
+/// `sizeof(dyld_cache_local_symbols_entry_64)`: dylibOffset (u64, offset of
+/// the image's header from the cache's base address), nlistStartIndex,
+/// nlistCount.
+const LOCAL_SYMBOLS_ENTRY_64_SIZE: u64 = 16;
+
+/// The local symbols a cache builder took out of the images ("unmapped
+/// local symbols"): a `dyld_cache_local_symbols_info` with one shared
+/// `nlist` array, one string pool and an entry per image saying which part
+/// of the array is that image's. Old caches have it in the main cache file
+/// (`localSymbolsOffset` / `localSymbolsSize` of the header); current ones
+/// in a separate `<cache>.symbols` file that the main header names by
+/// `symbolFileUUID`. macOS caches have neither: their images keep their
+/// local symbols.
+///
+/// Nothing is copied or validated up front beyond the fixed-size info
+/// header; every read is checked against the file when an image is looked
+/// up.
+#[derive(Clone)]
+pub struct LocalSymbols {
+    file: Arc<Image>,
+    /// File offset and size of the info chunk; the offsets below are
+    /// relative to its start.
+    info_off: u64,
+    info_size: u64,
+    nlist_off: u32,
+    nlist_count: u32,
+    strings_off: u32,
+    strings_size: u32,
+    entries_off: u32,
+    entries_count: u32,
+    /// The entries are `dyld_cache_local_symbols_entry_64`.
+    entry64: bool,
+}
+
+/// One image's part of [`LocalSymbols`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImageLocalSymbols<'a> {
+    /// `nlist` / `nlist_64` entries.
+    pub nlists: &'a [u8],
+    /// The string pool of the whole local symbols data.
+    pub strings: &'a [u8],
+}
+
+impl LocalSymbols {
+    /// The local symbols info of the cache file `file` (the main file or a
+    /// `.symbols` file). `Ok(None)` when its header has none.
+    pub fn parse(file: &Arc<Image>) -> Result<Option<LocalSymbols>, &'static str> {
+        let mapping_offset = file.u32(16).unwrap_or(0) as u64;
+        // A header field exists only when it lies below `mappingOffset`.
+        if mapping_offset < OFF_LOCAL_SYMBOLS_SIZE + 8 {
+            return Ok(None);
+        }
+        let info_off = file.u64(OFF_LOCAL_SYMBOLS_OFFSET).unwrap_or(0);
+        let info_size = file.u64(OFF_LOCAL_SYMBOLS_SIZE).unwrap_or(0);
+        if info_off == 0 || info_size == 0 {
+            return Ok(None);
+        }
+        if !file.in_file(info_off, info_size) {
+            return Err("local symbols info outside the file");
+        }
+        if info_size < LOCAL_SYMBOLS_INFO_SIZE {
+            return Err("local symbols info truncated");
+        }
+        let field = |n: u64| file.u32(info_off + 4 * n).unwrap_or(0);
+        let symbols = LocalSymbols {
+            file: file.clone(),
+            info_off,
+            info_size,
+            nlist_off: field(0),
+            nlist_count: field(1),
+            strings_off: field(2),
+            strings_size: field(3),
+            entries_off: field(4),
+            entries_count: field(5),
+            // Headers that reach `symbolFileUUID` use the 64-bit entries.
+            entry64: mapping_offset >= OFF_SYMBOL_FILE_UUID,
+        };
+        let entry_size = symbols.entry_size();
+        if symbols
+            .part(
+                symbols.entries_off as u64,
+                symbols.entries_count as u64 * entry_size,
+            )
+            .is_none()
+        {
+            return Err("local symbols entries outside the info");
+        }
+        if symbols
+            .part(symbols.strings_off as u64, symbols.strings_size as u64)
+            .is_none()
+        {
+            return Err("local symbols strings outside the info");
+        }
+        Ok(Some(symbols))
+    }
+
+    /// The local symbols data that belongs to `cache`: the one in the main
+    /// file if its header has one, otherwise the `<cache_path>.symbols`
+    /// file when the header names one. `Ok(None)` when the cache has no
+    /// such data (or names a symbols file and `cache_path` is `None`); the
+    /// error is a message for the user saying why data that should exist
+    /// cannot be used. Extraction works without it; the images then lack
+    /// the local symbols.
+    pub fn open(
+        cache: &DyldSharedCache,
+        cache_path: Option<&Path>,
+    ) -> Result<Option<LocalSymbols>, String> {
+        match Self::parse(&cache.image) {
+            Ok(Some(symbols)) => return Ok(Some(symbols)),
+            Ok(None) => {}
+            Err(why) => return Err(format!("local symbols of the cache not used: {why}")),
+        }
+        let wanted = match cache.image.slice(OFF_SYMBOL_FILE_UUID, 16) {
+            Some(uuid)
+                if cache.header.mapping_offset as u64 >= OFF_SYMBOL_FILE_UUID + 16
+                    && uuid.iter().any(|&b| b != 0) =>
+            {
+                uuid
+            }
+            _ => return Ok(None),
+        };
+        let Some(cache_path) = cache_path else {
+            return Ok(None);
+        };
+        let mut path = cache_path.as_os_str().to_os_string();
+        path.push(".symbols");
+        let path = PathBuf::from(path);
+        let unused = |why: &str| {
+            Err(format!(
+                "local symbols file not used ({why}): {}",
+                path.display()
+            ))
+        };
+        let Ok(file) = Image::open(&path) else {
+            return unused("cannot be read");
+        };
+        let file = Arc::new(file);
+        if !crate::macho::dyld_cache::is_shared_cache_magic(file.bytes()) {
+            return unused("not a dyld cache file");
+        }
+        if file.slice(OFF_CACHE_UUID, 16) != Some(wanted) {
+            return unused("its UUID is not the cache's symbolFileUUID");
+        }
+        match Self::parse(&file) {
+            Ok(Some(symbols)) => Ok(Some(symbols)),
+            Ok(None) => unused("it has no local symbols info"),
+            Err(why) => unused(why),
+        }
+    }
+
+    fn entry_size(&self) -> u64 {
+        if self.entry64 {
+            LOCAL_SYMBOLS_ENTRY_64_SIZE
+        } else {
+            LOCAL_SYMBOLS_ENTRY_SIZE
+        }
+    }
+
+    /// `size` bytes at offset `off` of the info chunk.
+    fn part(&self, off: u64, size: u64) -> Option<&[u8]> {
+        let end = off.checked_add(size)?;
+        if end > self.info_size {
+            return None;
+        }
+        self.file.slice(self.info_off.checked_add(off)?, size)
+    }
+
+    /// Number of images the data has an entry for.
+    pub fn image_count(&self) -> u32 {
+        self.entries_count
+    }
+
+    /// The symbols of the image whose entry has `dylib_offset`: the file
+    /// offset of its Mach-O header in the main cache file (old caches) or
+    /// the offset of the header's address from the cache's first mapping.
+    /// `None` when there is no such entry or it is not inside the data.
+    fn lookup(&self, dylib_offset: u64, is64: bool) -> Option<ImageLocalSymbols<'_>> {
+        let entry_size = self.entry_size();
+        let entries = self.part(
+            self.entries_off as u64,
+            self.entries_count as u64 * entry_size,
+        )?;
+        let (start, count) = entries.chunks_exact(entry_size as usize).find_map(|e| {
+            let (offset, rest) = if self.entry64 {
+                (get_u64(e, 0)?, 8)
+            } else {
+                (get_u32(e, 0)? as u64, 4)
+            };
+            if offset != dylib_offset {
+                return None;
+            }
+            Some((get_u32(e, rest)?, get_u32(e, rest + 4)?))
+        })?;
+        if start as u64 + count as u64 > self.nlist_count as u64 {
+            return None;
+        }
+        let nlist_size: u64 = if is64 { 16 } else { 12 };
+        Some(ImageLocalSymbols {
+            nlists: self.part(
+                self.nlist_off as u64 + start as u64 * nlist_size,
+                count as u64 * nlist_size,
+            )?,
+            strings: self.part(self.strings_off as u64, self.strings_size as u64)?,
+        })
+    }
+
+    /// The local symbols of `image` of `cache`, if the data has any.
+    pub fn of_image(
+        &self,
+        cache: &DyldSharedCache,
+        image: &CacheImage,
+        is64: bool,
+    ) -> Option<ImageLocalSymbols<'_>> {
+        let dylib_offset = if self.entry64 {
+            image.address.checked_sub(cache.mappings.first()?.address)?
+        } else {
+            match cache.resolve(image.address)? {
+                (0, off) => off,
+                _ => return None,
+            }
+        };
+        self.lookup(dylib_offset, is64)
+    }
 }
 
 struct LinkeditBuilder<'a> {
@@ -497,13 +786,20 @@ impl<'a> LinkeditBuilder<'a> {
 /// name. The code signature, the two-level hints and the other
 /// `LC_DYSYMTAB` tables are dropped: their offsets and counts become 0.
 ///
+/// `changes.locals` go first in the symbol table, as local symbols. When
+/// there are any, the image's own local symbols named `<redacted>` (the
+/// placeholder the cache builder left for them) are left out, and an
+/// indirect symbol table entry that named one becomes
+/// `INDIRECT_SYMBOL_LOCAL`. `changes.sections` renumbers `n_sect`.
+///
 /// The error says what is wrong with the image's linkedit data.
-fn rebuild_linkedit(
+fn rebuild_linkedit<'a>(
     cmds: &mut [u8],
     commands: &[LoadCommand],
     is64: bool,
-    src: &[u8],
+    src: &'a [u8],
     src_fileoff: u64,
+    changes: &SymbolChanges<'a>,
 ) -> Result<RebuiltLinkedit, &'static str> {
     let mut b = LinkeditBuilder {
         src,
@@ -511,6 +807,8 @@ fn rebuild_linkedit(
         data: Vec::new(),
         limit: src
             .len()
+            .saturating_add(changes.locals.len())
+            .saturating_add(changes.local_strings.len())
             .saturating_add(8 * commands.len())
             .saturating_add(64),
         fixups: Vec::new(),
@@ -552,8 +850,16 @@ fn rebuild_linkedit(
     let dysymtab = find(LC_DYSYMTAB, DYSYMTAB_COMMAND_SIZE);
     let field = |cmds: &[u8], off: usize| get_u32(cmds, off).unwrap_or(0);
 
-    // (first symbol, count) of the symbols to keep, in output order.
+    // (first symbol, count) of the image's symbols to keep, in output
+    // order: locals, defined externals, undefined.
     let mut ranges = [(0u32, 0u32); 3];
+    // New index of each symbol of `ranges[0]`; `INDIRECT_SYMBOL_LOCAL` for
+    // one that is left out. Empty when they all keep their order.
+    let mut local_index: Vec<u32> = Vec::new();
+    // Symbols from `changes.locals`, and the image's locals kept after them.
+    let mut added = 0u32;
+    let mut locals_kept = 0u32;
+    let mut dropped = 0u32;
     // The new string table; offset 0 is the empty name, as usual.
     let mut pool: Vec<u8> = vec![0];
     if let Some(st) = symtab {
@@ -581,7 +887,8 @@ fn rebuild_linkedit(
             }
             None => ranges[0] = (0, nsyms),
         }
-        let mut kept: u64 = 0;
+        // Upper bound of the number of symbols written.
+        let mut kept: u64 = (changes.locals.len() / nlist_size) as u64;
         for range in &mut ranges {
             if range.1 == 0 {
                 range.0 = 0;
@@ -593,24 +900,27 @@ fn rebuild_linkedit(
         if kept.saturating_mul(nlist_size as u64) > b.limit as u64 {
             return Err(TOO_LARGE);
         }
-        let Ok(kept) = u32::try_from(kept) else {
+        if u32::try_from(kept).is_err() {
             return Err(TOO_LARGE);
-        };
+        }
 
         let mut pooled: HashMap<&[u8], u32> = HashMap::new();
         pooled.insert(&[], 0);
         let limit = b.limit;
-        let mut intern = |strx: u64| -> Result<u32, &'static str> {
-            if strx == 0 {
-                return Ok(0);
-            }
+        let name_at = |strings: &'a [u8], strx: u64| -> Result<&'a [u8], &'static str> {
             let rest = usize::try_from(strx)
                 .ok()
                 .and_then(|strx| strings.get(strx..))
                 .filter(|rest| !rest.is_empty())
                 .ok_or("symbol name outside the string table")?;
             let len = rest.iter().position(|&c| c == 0).unwrap_or(rest.len());
-            let name = &rest[..len];
+            Ok(&rest[..len])
+        };
+        let mut intern = |strings: &'a [u8], strx: u64| -> Result<u32, &'static str> {
+            if strx == 0 {
+                return Ok(0);
+            }
+            let name = name_at(strings, strx)?;
             if let Some(&at) = pooled.get(name) {
                 return Ok(at);
             }
@@ -623,36 +933,72 @@ fn rebuild_linkedit(
             pooled.insert(name, at);
             Ok(at)
         };
+        // One symbol table entry of the output, from an entry whose names
+        // are in `strings`.
+        let mut convert = |old: &[u8], strings: &'a [u8]| -> Result<[u8; 16], &'static str> {
+            let mut entry = [0u8; 16];
+            entry[..nlist_size].copy_from_slice(old);
+            let strx = get_u32(&entry, 0).unwrap_or(0);
+            put_u32(&mut entry, 0, intern(strings, strx as u64)?);
+            let n_type = entry[4];
+            if n_type & N_STAB == 0 && n_type & N_TYPE == N_INDR {
+                // The value of an indirect symbol is the string table
+                // offset of the name it stands for.
+                if is64 {
+                    let value = intern(strings, get_u64(&entry, 8).unwrap_or(0))?;
+                    put(&mut entry, 8, &(value as u64).to_le_bytes());
+                } else {
+                    let value = intern(strings, get_u32(&entry, 8).unwrap_or(0) as u64)?;
+                    put_u32(&mut entry, 8, value);
+                }
+            }
+            if n_type & N_STAB != 0 || n_type & N_TYPE == N_SECT {
+                // 0 is NO_SECT; an ordinal the image does not have is kept.
+                let new = changes.sections.get(entry[5] as usize);
+                if let Some(&new) = new.filter(|&&new| new != 0) {
+                    entry[5] = new;
+                }
+            }
+            Ok(entry)
+        };
 
         if kept != 0 || symoff != 0 {
             b.begin(st + 8)?;
         }
-        for &(first, count) in &ranges {
+        for old in changes.locals.chunks_exact(nlist_size) {
+            let entry = convert(old, changes.local_strings)?;
+            b.push(&entry[..nlist_size])?;
+            // No overflow: bounded by `kept`, which fits.
+            added += 1;
+        }
+        for (n, &(first, count)) in ranges.iter().enumerate() {
             // In range: `first + count <= nsyms`, and the table holds
             // `nsyms` entries.
             let start = first as usize * nlist_size;
             let entries = &table[start..start + count as usize * nlist_size];
+            let replace_placeholders = n == 0 && added != 0;
             for old in entries.chunks_exact(nlist_size) {
-                let mut entry = [0u8; 16];
-                entry[..nlist_size].copy_from_slice(old);
-                let strx = get_u32(&entry, 0).unwrap_or(0);
-                put_u32(&mut entry, 0, intern(strx as u64)?);
-                let n_type = entry[4];
-                if n_type & N_STAB == 0 && n_type & N_TYPE == N_INDR {
-                    // The value of an indirect symbol is the string table
-                    // offset of the name it stands for.
-                    if is64 {
-                        let value = intern(get_u64(&entry, 8).unwrap_or(0))?;
-                        put(&mut entry, 8, &(value as u64).to_le_bytes());
-                    } else {
-                        let value = intern(get_u32(&entry, 8).unwrap_or(0) as u64)?;
-                        put_u32(&mut entry, 8, value);
+                if replace_placeholders {
+                    let strx = get_u32(old, 0).unwrap_or(0) as u64;
+                    if strx != 0 && name_at(strings, strx)? == REDACTED {
+                        local_index.push(INDIRECT_SYMBOL_LOCAL);
+                        dropped += 1;
+                        continue;
                     }
+                    local_index.push(added + locals_kept);
                 }
+                let entry = convert(old, strings)?;
                 b.push(&entry[..nlist_size])?;
+                if n == 0 {
+                    locals_kept += 1;
+                }
             }
         }
-        put_u32(cmds, st + 12, kept);
+        put_u32(
+            cmds,
+            st + 12,
+            added + locals_kept + ranges[1].1 + ranges[2].1,
+        );
     }
 
     if let Some(d) = dysymtab {
@@ -667,20 +1013,25 @@ fn rebuild_linkedit(
         if count != 0 || indirect_off != 0 {
             b.begin(d + 56)?;
         }
+        let nlocal = added + locals_kept;
         for entry in table.chunks_exact(4) {
             let index = get_u32(entry, 0).unwrap_or(0);
             let mut new_index = None;
             if index & (INDIRECT_SYMBOL_LOCAL | INDIRECT_SYMBOL_ABS) != 0 {
                 new_index = Some(index);
             } else {
-                let mut base = 0u32;
-                for &(first, count) in &ranges {
+                // New index of the first symbol of the range.
+                let mut base = added;
+                for (n, &(first, count)) in ranges.iter().enumerate() {
                     if index >= first && index - first < count {
-                        new_index = Some(base + (index - first));
+                        new_index = Some(match local_index.get((index - first) as usize) {
+                            Some(&new) if n == 0 => new,
+                            _ => base + (index - first),
+                        });
                         break;
                     }
                     // No overflow: the counts add up to a u32 (`kept`).
-                    base += count;
+                    base = if n == 0 { nlocal } else { base + count };
                 }
             }
             let Some(new_index) = new_index else {
@@ -689,8 +1040,9 @@ fn rebuild_linkedit(
             b.push(&new_index.to_le_bytes())?;
         }
 
-        let (nlocal, nextdef) = (ranges[0].1, ranges[1].1);
+        let nextdef = ranges[1].1;
         put_u32(cmds, d + 8, 0);
+        put_u32(cmds, d + 12, nlocal);
         put_u32(cmds, d + 16, nlocal);
         put_u32(cmds, d + 24, nlocal + nextdef);
         // Table of contents, module table, external references, external
@@ -720,14 +1072,117 @@ fn rebuild_linkedit(
     Ok(RebuiltLinkedit {
         segment: None,
         data: b.data,
+        local_symbols_added: added,
+        placeholders_dropped: dropped,
         fixups: b.fixups,
     })
+}
+
+/// Put the segment commands in ascending `vmaddr` order (commands with the
+/// same address keep their order), which is the order the cache builder
+/// placed the segments in and the one Apple's tools require of a file. The
+/// segment commands trade places among themselves; every other load command
+/// stays where it is.
+///
+/// Returns the new ordinal of each section, indexed by the old one (entry 0
+/// is unused), for the `n_sect` of the symbols; empty when nothing moved.
+///
+/// Nothing moves when the image has data that names segments or sections by
+/// index and that this module does not rewrite: `LC_DYLD_INFO` rebase or
+/// bind opcodes, chained fixups or split-segment info. Images in a cache
+/// normally have none of these.
+fn sort_segment_commands(cmds: &mut [u8], commands: &[LoadCommand], is64: bool) -> Vec<u8> {
+    let (wanted, other, header_size, section_size) = if is64 {
+        (
+            LC_SEGMENT_64,
+            LC_SEGMENT,
+            SEGMENT_COMMAND_64_SIZE as usize,
+            80,
+        )
+    } else {
+        (LC_SEGMENT, LC_SEGMENT_64, SEGMENT_COMMAND_SIZE as usize, 68)
+    };
+    let nonzero = |off: usize| get_u32(cmds, off).unwrap_or(0) != 0;
+    // (vmaddr, offset, cmdsize, sections)
+    let mut segments = Vec::new();
+    for &(cmd, lc, cmdsize) in commands {
+        let indexed = match cmd {
+            LC_DYLD_INFO | LC_DYLD_INFO_ONLY if cmdsize >= DYLD_INFO_COMMAND_SIZE => {
+                // rebase, bind, weak bind, lazy bind sizes
+                [12, 20, 28, 36].iter().any(|&off| nonzero(lc + off))
+            }
+            LC_DYLD_CHAINED_FIXUPS | LC_SEGMENT_SPLIT_INFO
+                if cmdsize >= LINKEDIT_DATA_COMMAND_SIZE =>
+            {
+                nonzero(lc + 12)
+            }
+            _ => false,
+        };
+        if indexed || cmd == other || (cmd == wanted && cmdsize < header_size) {
+            return Vec::new();
+        }
+        if cmd == wanted {
+            let vmaddr = if is64 {
+                get_u64(cmds, lc + 24).unwrap_or(0)
+            } else {
+                get_u32(cmds, lc + 24).unwrap_or(0) as u64
+            };
+            // The section count field is the last but one of the header;
+            // `cmdsize` bounds it.
+            let nsects = get_u32(cmds, lc + header_size - 8).unwrap_or(0) as usize;
+            let nsects = nsects.min((cmdsize - header_size) / section_size);
+            segments.push((vmaddr, lc, cmdsize, nsects));
+        }
+    }
+    let mut sorted = segments.clone();
+    sorted.sort_by_key(|&(vmaddr, ..)| vmaddr);
+    let total: usize = segments.iter().map(|s| s.3).sum();
+    if sorted == segments || total > u8::MAX as usize {
+        return Vec::new();
+    }
+
+    // Old ordinal of the first section of each segment, by command offset.
+    let mut first_ordinal = HashMap::new();
+    let mut next = 1usize;
+    for &(_, lc, _, nsects) in &segments {
+        first_ordinal.insert(lc, next);
+        next += nsects;
+    }
+    let mut ordinals = vec![0u8; total + 1];
+    let mut next = 1usize;
+    for &(_, lc, _, nsects) in &sorted {
+        for n in 0..nsects {
+            // In range: both run over the same `total` sections.
+            ordinals[first_ordinal[&lc] + n] = (next + n) as u8;
+        }
+        next += nsects;
+    }
+
+    // The commands are back to back from offset 0 (`load_commands`), and
+    // the segment commands as a whole keep their total size.
+    let end = commands.last().map_or(0, |&(_, lc, size)| lc + size);
+    let mut out = Vec::with_capacity(end);
+    let mut sorted = sorted.iter();
+    for &(cmd, lc, cmdsize) in commands {
+        let (lc, cmdsize) = match cmd == wanted {
+            true => sorted.next().map_or((lc, cmdsize), |s| (s.1, s.2)),
+            false => (lc, cmdsize),
+        };
+        out.extend_from_slice(&cmds[lc..lc + cmdsize]);
+    }
+    put(cmds, 0, &out);
+    ordinals
 }
 
 /// Set the file offset of the segment command at `lc` to `target` and move
 /// the file offsets of its sections along. `vmaddr` and `image_fileoff` are
 /// what the command records in the cache. False when an offset does not fit
 /// in its field.
+///
+/// Two things the cache builder changed are put back the way a file has
+/// them: `__DATA_CONST` gets its `SG_READ_ONLY` flag, and a section whose
+/// address is not a multiple of its alignment (the builder moves sections
+/// without regard to it) gets the largest alignment its address has.
 fn patch_segment_command(
     cmds: &mut [u8],
     lc: usize,
@@ -752,6 +1207,10 @@ fn patch_segment_command(
     };
     let nsects = get_u32(cmds, sections - 8).unwrap_or(0) as usize;
     let cmdsize = get_u32(cmds, lc + 4).unwrap_or(0) as usize;
+    if cmds.get(lc + 8..lc + 24) == Some(b"__DATA_CONST\0\0\0\0") {
+        let flags = get_u32(cmds, sections - 4).unwrap_or(0);
+        put_u32(cmds, sections - 4, flags | SG_READ_ONLY);
+    }
     // `cmdsize` bounds the number of sections looked at.
     for n in 0..nsects.min(cmdsize / section_size) {
         let section = sections + n * section_size;
@@ -787,6 +1246,12 @@ fn patch_segment_command(
             };
             put_u32(cmds, section + offset_field, new);
         }
+        let align = get_u32(cmds, section + offset_field + 4).unwrap_or(0);
+        if let Some(addr) = addr.filter(|&addr| addr != 0) {
+            if align > addr.trailing_zeros() {
+                put_u32(cmds, section + offset_field + 4, addr.trailing_zeros());
+            }
+        }
         // reloff, nreloc: relocation entries are not copied.
         put(cmds, section + offset_field + 8, &[0u8; 8]);
     }
@@ -819,10 +1284,15 @@ fn raw_layout_fits(
 
 /// Work out which byte ranges of the cache make up `image`, where they go
 /// in the output file, and the load commands and `__LINKEDIT` of that file.
+///
+/// `locals` is the cache's local symbols data ([`LocalSymbols::open`]), if
+/// it has one: the image's symbols in it are merged into the output's
+/// symbol table.
 pub fn plan_extraction(
     cache: &DyldSharedCache,
     image: &CacheImage,
     options: &ExtractOptions,
+    locals: Option<&LocalSymbols>,
 ) -> Result<ExtractPlan, ExtractError> {
     let fail = |prefix: &str| Err(ExtractError::new(prefix, &image.path));
 
@@ -864,7 +1334,14 @@ pub fn plan_extraction(
     let mut header = header.to_vec();
     let (mach_header, cmds) = header.split_at_mut(mh_size as usize);
     // `ncmds` is capped at 65535, which bounds these lists.
-    let commands = load_commands(cmds, ncmds);
+    let mut commands = load_commands(cmds, ncmds);
+    // The addresses stay the ones the image has in the cache, where the
+    // cache builder placed the segments in another order than the load
+    // commands list them.
+    let section_ordinals = sort_segment_commands(cmds, &commands, is64);
+    if !section_ordinals.is_empty() {
+        commands = load_commands(cmds, ncmds);
+    }
 
     let segment_error = |prefix: &str, name: &[u8]| {
         let mut detail = name.to_vec();
@@ -945,8 +1422,21 @@ pub fn plan_extraction(
         }
         None => (&[], 0),
     };
-    let mut linkedit = match rebuild_linkedit(cmds, &commands, is64, linkedit_src, linkedit_fileoff)
-    {
+    let image_locals = locals.and_then(|l| l.of_image(cache, image, is64));
+    let changes = SymbolChanges {
+        locals: image_locals.map_or(&[], |l| l.nlists),
+        local_strings: image_locals.map_or(&[], |l| l.strings),
+        sections: &section_ordinals,
+    };
+    let rebuilt = rebuild_linkedit(
+        cmds,
+        &commands,
+        is64,
+        linkedit_src,
+        linkedit_fileoff,
+        &changes,
+    );
+    let mut linkedit = match rebuilt {
         Ok(linkedit) => linkedit,
         Err(why) => return fail(&format!("cannot rebuild __LINKEDIT ({why}): ")),
     };
@@ -1160,15 +1650,18 @@ impl From<std::io::Error> for WriteError {
 /// `cancel` is polled between 1 MiB chunks; when it becomes true the partial
 /// output file is removed and the error has `cancelled == true`. `progress`
 /// is called after every chunk written.
+///
+/// `locals`: see [`plan_extraction`].
 pub fn extract_image(
     cache: &DyldSharedCache,
     image: &CacheImage,
     output: &Path,
     options: &ExtractOptions,
+    locals: Option<&LocalSymbols>,
     cancel: &AtomicBool,
     progress: &mut dyn FnMut(ExtractProgress<'_>),
 ) -> Result<ExtractOutcome, ExtractError> {
-    let plan = plan_extraction(cache, image, options)?;
+    let plan = plan_extraction(cache, image, options, locals)?;
     let outcome = ExtractOutcome {
         image_path: image.path.clone(),
         output: output.to_path_buf(),
@@ -1176,6 +1669,7 @@ pub fn extract_image(
         dry_run: options.dry_run,
         size: plan.out_size,
         segments: plan.segments.len(),
+        local_symbols_added: plan.linkedit.local_symbols_added,
     };
     if options.dry_run {
         return Ok(outcome);
@@ -1224,6 +1718,10 @@ pub fn extract_from_cache_file(
     log: &mut dyn FnMut(&str),
 ) -> Result<ExtractOutcome, ExtractError> {
     let cache = open_cache(cache_path).map_err(|e| ExtractError::new("", e.0.as_bytes()))?;
+    let locals = LocalSymbols::open(&cache, Some(cache_path)).unwrap_or_else(|why| {
+        log(&format!("warning: {why}"));
+        None
+    });
     let matched = select_images(&cache, selector.as_bytes(), exact);
     let Some(image) = matched.first() else {
         return Err(ExtractError::new("image not found: ", selector.as_bytes()));
@@ -1247,7 +1745,15 @@ pub fn extract_from_cache_file(
             log(&format!("copying {}: {}%", utf8_safe(p.segment), percent));
         }
     };
-    let outcome = extract_image(&cache, image, output, options, cancel, &mut progress)?;
+    let outcome = extract_image(
+        &cache,
+        image,
+        output,
+        options,
+        locals.as_ref(),
+        cancel,
+        &mut progress,
+    )?;
     for line in utf8_safe(&outcome.text()).lines() {
         log(line);
     }
@@ -1331,6 +1837,10 @@ mod tests {
     /// A cache whose only image lives at file offset 0x1000: __TEXT (0x400
     /// bytes, holding the header) and __LINKEDIT (0x100 bytes at 0x3000).
     fn sample_cache() -> DyldSharedCache {
+        parse(sample_cache_bytes()).unwrap()
+    }
+
+    fn sample_cache_bytes() -> Vec<u8> {
         let mapping = CacheMapping {
             address: BASE,
             size: 0x4000,
@@ -1365,7 +1875,7 @@ mod tests {
         }
         data[0x3010..0x3028].copy_from_slice(&SAMPLE_LINKEDIT);
         data[0x2000..0x2004].copy_from_slice(b"junk");
-        parse(data).unwrap()
+        data
     }
 
     /// The one symbol of the sample images (`_foo`, at string offset 1)
@@ -1406,6 +1916,7 @@ mod tests {
             &images[idx],
             out,
             &options,
+            None,
             &AtomicBool::new(false),
             &mut |_| {},
         )
@@ -1726,7 +2237,7 @@ mod tests {
 
         let cache = open_cache(&main_path).unwrap();
         let image = cache.images().next().unwrap();
-        let plan = plan_extraction(&cache, &image, &ExtractOptions::default()).unwrap();
+        let plan = plan_extraction(&cache, &image, &ExtractOptions::default(), None).unwrap();
         let sources: Vec<(usize, u64)> = plan
             .segments
             .iter()
@@ -1754,7 +2265,7 @@ mod tests {
         // Without the sub-cache file the segment cannot be located.
         std::fs::remove_file(dir.join("cache.01")).unwrap();
         let cache = open_cache(&main_path).unwrap();
-        let e = plan_extraction(&cache, &image, &ExtractOptions::default()).unwrap_err();
+        let e = plan_extraction(&cache, &image, &ExtractOptions::default(), None).unwrap_err();
         assert_eq!(
             e.to_string(),
             "segment not in any cache file: __DATA image=/usr/lib/libmodern.dylib"
@@ -1861,9 +2372,15 @@ mod tests {
         (cmds, linkedit)
     }
 
+    const NO_CHANGES: SymbolChanges<'static> = SymbolChanges {
+        locals: &[],
+        local_strings: &[],
+        sections: &[],
+    };
+
     fn rebuild(cmds: &mut [u8], linkedit: &[u8]) -> Result<RebuiltLinkedit, &'static str> {
         let commands = load_commands(cmds, NCMDS);
-        rebuild_linkedit(cmds, &commands, true, linkedit, LE as u64)
+        rebuild_linkedit(cmds, &commands, true, linkedit, LE as u64, &NO_CHANGES)
     }
 
     #[test]
@@ -1969,7 +2486,8 @@ mod tests {
         linkedit[0x20..0x27].copy_from_slice(b"\0_b\0_a\0");
         let mut cmds = words(&[LC_SYMTAB, 24, 0x100, 2, 0x120, 0x20]);
         let commands = load_commands(&cmds, 1);
-        let rebuilt = rebuild_linkedit(&mut cmds, &commands, false, &linkedit, 0x100).unwrap();
+        let rebuilt =
+            rebuild_linkedit(&mut cmds, &commands, false, &linkedit, 0x100, &NO_CHANGES).unwrap();
         assert_eq!(rebuilt.fixups, [(8, 0), (16, 24)]);
         assert_eq!(
             &rebuilt.data[..12],
@@ -1995,7 +2513,7 @@ mod tests {
         let commands = load_commands(&cmds, 4);
         assert_eq!(commands.len(), 4);
         // Not even a __LINKEDIT segment is needed for that.
-        let rebuilt = rebuild_linkedit(&mut cmds, &commands, true, &[], 0).unwrap();
+        let rebuilt = rebuild_linkedit(&mut cmds, &commands, true, &[], 0, &NO_CHANGES).unwrap();
         assert!(rebuilt.data.is_empty() && rebuilt.fixups.is_empty());
         assert_eq!(cmds, before);
 
@@ -2003,7 +2521,7 @@ mod tests {
         put_u32(&mut cmds, 24 + 80 + 48 + 8, 0x10);
         put_u32(&mut cmds, 24 + 80 + 48 + 12, 4);
         assert_eq!(
-            rebuild_linkedit(&mut cmds, &commands, true, &[], 0).unwrap_err(),
+            rebuild_linkedit(&mut cmds, &commands, true, &[], 0, &NO_CHANGES).unwrap_err(),
             "linkedit data outside the segment"
         );
     }
@@ -2111,7 +2629,15 @@ mod tests {
         let commands = load_commands(&cmds, 100);
         assert_eq!(commands.len(), 100);
         assert_eq!(
-            rebuild_linkedit(&mut cmds, &commands, true, &linkedit, LE as u64).unwrap_err(),
+            rebuild_linkedit(
+                &mut cmds,
+                &commands,
+                true,
+                &linkedit,
+                LE as u64,
+                &NO_CHANGES
+            )
+            .unwrap_err(),
             TOO_LARGE
         );
     }
@@ -2348,6 +2874,7 @@ mod tests {
             &images[0],
             &out,
             &ExtractOptions::default(),
+            None,
             &cancel,
             &mut |_| {
                 calls += 1;
@@ -2368,5 +2895,650 @@ mod tests {
         assert_eq!(n.next_name(b"libfoo.dylib"), b"libfoo.dylib.2.macho");
         assert_eq!(n.next_name(b"/dir/"), b"image.macho");
         assert_eq!(n.next_name(b""), b"image.1.macho");
+    }
+
+    fn seg64_sections(
+        name: &str,
+        vmaddr: u64,
+        fileoff: u64,
+        filesize: u64,
+        sections: &[Vec<u8>],
+    ) -> Vec<u8> {
+        let mut v = seg64(name, vmaddr, fileoff, filesize);
+        v[4..8].copy_from_slice(&(72 + 80 * sections.len() as u32).to_le_bytes());
+        v[64..68].copy_from_slice(&(sections.len() as u32).to_le_bytes());
+        v.extend_from_slice(&sections.concat());
+        v
+    }
+
+    fn segment_names(cmds: &[u8], ncmds: u32) -> Vec<String> {
+        load_commands(cmds, ncmds)
+            .iter()
+            .filter(|c| c.0 == LC_SEGMENT_64)
+            .map(|&(_, lc, _)| utf8_safe(&cmds[lc + 8..lc + 24]).replace('\0', ""))
+            .collect()
+    }
+
+    /// Segment commands trade places so that their addresses ascend; the
+    /// other commands stay, and the sections are renumbered.
+    #[test]
+    fn segment_commands_are_sorted_by_address() {
+        let section = |name: &str| section64(name, 0, 0, 0, 0);
+        let uuid = words(&[LC_UUID, 24, 1, 2, 3, 4]);
+        let original = [
+            seg64_sections("__C", 0x3000, 0, 0, &[section("c1")]),
+            uuid.clone(),
+            seg64_sections("__A", 0x1000, 0, 0, &[section("a1"), section("a2")]),
+            seg64("__B", 0x2000, 0, 0),
+        ]
+        .concat();
+        let mut cmds = original.clone();
+        let commands = load_commands(&cmds, 4);
+        let ordinals = sort_segment_commands(&mut cmds, &commands, true);
+        assert_eq!(ordinals, [0, 3, 1, 2]);
+        assert_eq!(segment_names(&cmds, 4), ["__A", "__B", "__C"]);
+        let commands = load_commands(&cmds, 4);
+        let kinds: Vec<(u32, usize)> = commands.iter().map(|c| (c.0, c.2)).collect();
+        assert_eq!(
+            kinds,
+            [
+                (LC_SEGMENT_64, 232),
+                (LC_UUID, 24),
+                (LC_SEGMENT_64, 72),
+                (LC_SEGMENT_64, 152)
+            ]
+        );
+        assert_eq!(&cmds[232..256], &uuid[..]);
+        assert_eq!(&cmds[72..76], b"a1\0\0");
+
+        // Already in order: nothing to do.
+        let sorted = cmds.clone();
+        assert!(sort_segment_commands(&mut cmds, &commands, true).is_empty());
+        assert_eq!(cmds, sorted);
+
+        // Data that names segments by index is not rewritten here, so the
+        // order stays: rebase opcodes, chained fixups, split-segment info.
+        for indexed in [
+            words(&[LC_DYLD_INFO_ONLY, 48, 0x100, 8, 0, 0, 0, 0, 0, 0, 0, 0]),
+            words(&[LC_DYLD_CHAINED_FIXUPS, 16, 0x100, 8]),
+            words(&[LC_SEGMENT_SPLIT_INFO, 16, 0x100, 8]),
+            // a 32-bit segment command in a 64-bit image
+            words(&[LC_SEGMENT, 56, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+        ] {
+            let mut cmds = [original.clone(), indexed].concat();
+            let before = cmds.clone();
+            let commands = load_commands(&cmds, 5);
+            assert_eq!(commands.len(), 5);
+            assert!(sort_segment_commands(&mut cmds, &commands, true).is_empty());
+            assert_eq!(cmds, before);
+        }
+        // An export trie alone (what images in a cache have) does not
+        // prevent it.
+        let export_only = words(&[LC_DYLD_INFO_ONLY, 48, 0, 0, 0, 0, 0, 0, 0, 0, 0x100, 8]);
+        let mut cmds = [original.clone(), export_only].concat();
+        let commands = load_commands(&cmds, 5);
+        assert_eq!(
+            sort_segment_commands(&mut cmds, &commands, true),
+            [0, 3, 1, 2]
+        );
+
+        // A section count larger than the command is cut to what fits.
+        let mut cmds = original.clone();
+        cmds[64..68].copy_from_slice(&u32::MAX.to_le_bytes());
+        let commands = load_commands(&cmds, 4);
+        assert_eq!(
+            sort_segment_commands(&mut cmds, &commands, true),
+            [0, 3, 1, 2]
+        );
+    }
+
+    /// The output lists the segments in address order with ascending file
+    /// offsets, `__DATA_CONST` is read-only again, a section alignment the
+    /// address does not have is lowered, and the symbols follow their
+    /// sections.
+    #[test]
+    fn extraction_orders_segments_and_restores_file_attributes() {
+        let mapping = CacheMapping {
+            address: BASE,
+            size: 0x4000,
+            file_offset: 0,
+            max_prot: 5,
+            init_prot: 5,
+        };
+        let mut data = build_cache(&[mapping], &[(BASE + 0x1000, "/img")], 0x4000);
+        let mut constant = section64("__const", BASE + 0x2004, 8, 0x2004, 0);
+        constant[52..56].copy_from_slice(&3u32.to_le_bytes());
+        let mut aligned = section64("__data", BASE + 0x2800, 8, 0x2800, 0);
+        aligned[52..56].copy_from_slice(&3u32.to_le_bytes());
+        let cmds = [
+            seg64_sections(
+                "__TEXT",
+                BASE + 0x1000,
+                0x1000,
+                0x400,
+                &[section64("__text", BASE + 0x1100, 0x10, 0x1100, 0)],
+            ),
+            seg64_sections("__DATA", BASE + 0x2800, 0x2800, 0x100, &[aligned]),
+            seg64_sections("__DATA_CONST", BASE + 0x2004, 0x2004, 0x100, &[constant]),
+            seg64("__LINKEDIT", BASE + 0x3000, 0x3000, 0x100),
+            words(&[LC_SYMTAB, 24, 0x3010, 2, 0x3030, 8]),
+        ]
+        .concat();
+        let mut header = Vec::new();
+        for w in [MH_MAGIC_64, 0x0100000c, 0, 6, 5, cmds.len() as u32, 0, 0] {
+            header.extend_from_slice(&w.to_le_bytes());
+        }
+        header.extend_from_slice(&cmds);
+        data[0x1000..0x1000 + header.len()].copy_from_slice(&header);
+        data[0x2004..0x2104].fill(0xCC);
+        data[0x2800..0x2900].fill(0xDD);
+        let symbols = [
+            nlist64(1, 0x0f, 2, 0, BASE + 0x2800),
+            nlist64(4, 0x0f, 3, 0, BASE + 0x2004),
+        ]
+        .concat();
+        data[0x3010..0x3030].copy_from_slice(&symbols);
+        data[0x3030..0x3038].copy_from_slice(b"\0_d\0_c\0\0");
+        let cache = parse(data).unwrap();
+
+        let out = tmp("ordered.macho");
+        let options = ExtractOptions {
+            compact: true,
+            dry_run: false,
+        };
+        extract(&cache, 0, &out, options).unwrap();
+        let bytes = std::fs::read(&out).unwrap();
+        let _ = std::fs::remove_file(&out);
+        let cmds = &bytes[32..32 + cmds.len()];
+        assert_eq!(
+            segment_names(cmds, 5),
+            ["__TEXT", "__DATA_CONST", "__DATA", "__LINKEDIT"]
+        );
+        let segments: Vec<usize> = load_commands(cmds, 5)
+            .iter()
+            .filter(|c| c.0 == LC_SEGMENT_64)
+            .map(|c| c.1)
+            .collect();
+        let offsets: Vec<u64> = segments.iter().map(|&lc| u64_at(cmds, lc + 40)).collect();
+        assert_eq!(offsets, [0, 0x1000, 0x2000, 0x3000]);
+        // The addresses are the ones in the cache.
+        let addresses: Vec<u64> = segments.iter().map(|&lc| u64_at(cmds, lc + 24)).collect();
+        assert_eq!(
+            addresses,
+            [BASE + 0x1000, BASE + 0x2004, BASE + 0x2800, BASE + 0x3000]
+        );
+        let flags: Vec<u32> = segments.iter().map(|&lc| u32_at(cmds, lc + 68)).collect();
+        assert_eq!(flags, [0, SG_READ_ONLY, 0, 0]);
+        // __const: at 0x2004 it is 4-byte aligned, not 8; __data keeps 2^3.
+        let constant = segments[1] + 72;
+        assert_eq!(&cmds[constant..constant + 7], b"__const");
+        assert_eq!(
+            (u32_at(cmds, constant + 48), u32_at(cmds, constant + 52)),
+            (0x1000, 2)
+        );
+        assert_eq!(u32_at(cmds, segments[2] + 72 + 52), 3);
+        assert!(bytes[0x1000..0x1100].iter().all(|&b| b == 0xCC));
+        assert!(bytes[0x2000..0x2100].iter().all(|&b| b == 0xDD));
+        // _d is in __DATA,__data: section 2 before, 3 now; _c the reverse.
+        assert_eq!((bytes[0x3000], bytes[0x3005]), (1, 3));
+        assert_eq!((bytes[0x3010], bytes[0x3015]), (4, 2));
+    }
+
+    /// A `dyld_cache_local_symbols_info` chunk: header, `nlists`, `strings`
+    /// and one entry (`dylibOffset`, first nlist, count) per image.
+    fn local_symbols_info(
+        nlists: &[Vec<u8>],
+        strings: &[u8],
+        entries: &[(u64, u32, u32)],
+        entry64: bool,
+    ) -> Vec<u8> {
+        let nlists = nlists.concat();
+        let strings_off = 24 + nlists.len() as u32;
+        let entries_off = strings_off + strings.len() as u32;
+        let mut v = words(&[
+            24,
+            nlists.len() as u32 / 16,
+            strings_off,
+            strings.len() as u32,
+            entries_off,
+            entries.len() as u32,
+        ]);
+        v.extend_from_slice(&nlists);
+        v.extend_from_slice(strings);
+        for &(dylib_offset, start, count) in entries {
+            if entry64 {
+                v.extend_from_slice(&dylib_offset.to_le_bytes());
+            } else {
+                v.extend_from_slice(&(dylib_offset as u32).to_le_bytes());
+            }
+            v.extend_from_slice(&words(&[start, count]));
+        }
+        v
+    }
+
+    /// [`sample_cache_bytes`] with `info` at file offset 0x2800 as the
+    /// header's local symbols info.
+    fn sample_cache_with_local_symbols(info: &[u8], size: u64) -> Vec<u8> {
+        let mut data = sample_cache_bytes();
+        data[0x2800..0x2800 + info.len()].copy_from_slice(info);
+        data[72..80].copy_from_slice(&0x2800u64.to_le_bytes());
+        data[80..88].copy_from_slice(&size.to_le_bytes());
+        data
+    }
+
+    /// An old cache: the local symbols info is in the cache file and its
+    /// 32-bit entries name images by the file offset of their header.
+    #[test]
+    fn local_symbols_in_the_cache_file_are_merged() {
+        let info = local_symbols_info(
+            &[
+                nlist64(1, 0x0e, 1, 0, 0x7000),
+                nlist64(8, 0x0e, 1, 0, BASE + 0x1010),
+                nlist64(18, 0x1e, 1, 0, BASE + 0x1020),
+            ],
+            b"\0_other\0_static_a\0_static_b\0",
+            &[(0x2000, 0, 1), (0x1000, 1, 2)],
+            false,
+        );
+        let cache = parse(sample_cache_with_local_symbols(&info, info.len() as u64)).unwrap();
+        let locals = LocalSymbols::open(&cache, None).unwrap().unwrap();
+        assert_eq!(locals.image_count(), 2);
+        let images: Vec<_> = cache.images().collect();
+        let found = locals.of_image(&cache, &images[0], true).unwrap();
+        assert_eq!(found.nlists, &info[24 + 16..24 + 48]);
+        assert_eq!(found.strings.len(), 28);
+        assert_eq!(
+            locals
+                .of_image(&cache, &images[1], true)
+                .unwrap()
+                .nlists
+                .len(),
+            16
+        );
+        // not in the cache's mappings / no entry
+        assert!(locals.of_image(&cache, &images[2], true).is_none());
+        assert!(locals.lookup(0x1001, true).is_none());
+
+        let out = tmp("locals.macho");
+        let options = ExtractOptions {
+            compact: true,
+            dry_run: false,
+        };
+        let cancel = AtomicBool::new(false);
+        let r = extract_image(
+            &cache,
+            &images[0],
+            &out,
+            &options,
+            Some(&locals),
+            &cancel,
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(r.local_symbols_added, 2);
+        assert!(r.text().ends_with(b" segments=2 local-symbols=2\n"));
+        assert!(r
+            .json()
+            .ends_with(b",\"segments\":2,\"local_symbols\":2}\n"));
+        let bytes = std::fs::read(&out).unwrap();
+        // __TEXT at 0, then __LINKEDIT: three symbols, 32 bytes of strings.
+        assert_eq!(bytes.len(), 0x1000 + 48 + 32);
+        let sym = 32 + 72 * 3;
+        let fields: Vec<u32> = (2..6).map(|n| u32_at(&bytes, sym + 4 * n)).collect();
+        assert_eq!(fields, [0x1000, 3, 0x1030, 32]);
+        assert_eq!(
+            &bytes[0x1030..],
+            b"\0_static_a\0_static_b\0_foo\0\0\0\0\0\0\0"
+        );
+        // The merged symbols come first and keep type, section and value.
+        assert_eq!(
+            &bytes[0x1000..0x1010],
+            &nlist64(1, 0x0e, 1, 0, BASE + 0x1010)[..]
+        );
+        assert_eq!(
+            &bytes[0x1010..0x1020],
+            &nlist64(11, 0x1e, 1, 0, BASE + 0x1020)[..]
+        );
+        assert_eq!(u32_at(&bytes, 0x1020), 21);
+        assert_eq!(&bytes[0x1024..0x1030], &SAMPLE_LINKEDIT[4..16]);
+
+        // Without the data the image has its own symbol only, and the
+        // report does not mention local symbols.
+        let r = extract(&cache, 0, &out, options).unwrap();
+        assert_eq!(r.local_symbols_added, 0);
+        assert!(r.text().ends_with(b" segments=2\n"));
+        assert!(r.json().ends_with(b",\"segments\":2}\n"));
+        assert_eq!(std::fs::read(&out).unwrap().len(), 0x1000 + 24);
+        let _ = std::fs::remove_file(&out);
+    }
+
+    /// A current cache: the header names a `.symbols` file by UUID, whose
+    /// 64-bit entries name images by their offset from the cache's base
+    /// address.
+    #[test]
+    fn local_symbols_file_is_found_by_uuid() {
+        let dir = tmp("symbols-file");
+        std::fs::create_dir_all(&dir).unwrap();
+        let main_path = dir.join("cache");
+        let symbols_path = dir.join("cache.symbols");
+        let mut main = modern_cache(BASE, 1, &[]);
+        main[0x190..0x1a0].fill(9);
+        let cmds = [
+            seg64("__TEXT", BASE + 0x800, 0x800, 0x200),
+            seg64("__LINKEDIT", BASE + 0xc00, 0xc00, 0x40),
+            symtab(0xc10, 0xc20),
+        ]
+        .concat();
+        let mut header = Vec::new();
+        for w in [MH_MAGIC_64, 0x0100000c, 0, 6, 3, cmds.len() as u32, 0, 0] {
+            header.extend_from_slice(&w.to_le_bytes());
+        }
+        header.extend_from_slice(&cmds);
+        main[0x800..0x800 + header.len()].copy_from_slice(&header);
+        main[0xc10..0xc28].copy_from_slice(&SAMPLE_LINKEDIT);
+        std::fs::write(&main_path, &main).unwrap();
+
+        let info = local_symbols_info(
+            &[nlist64(1, 0x0e, 1, 0, BASE + 0x810)],
+            b"\0_hidden\0",
+            &[(0x800, 0, 1)],
+            true,
+        );
+        let mut symbols = modern_cache(0, 9, &[]);
+        symbols[0x400..0x400 + info.len()].copy_from_slice(&info);
+        symbols[72..80].copy_from_slice(&0x400u64.to_le_bytes());
+        symbols[80..88].copy_from_slice(&(info.len() as u64).to_le_bytes());
+        std::fs::write(&symbols_path, &symbols).unwrap();
+
+        let cache = open_cache(&main_path).unwrap();
+        let image = cache.images().next().unwrap();
+        // Without the cache's path the file cannot be looked for.
+        assert!(LocalSymbols::open(&cache, None).unwrap().is_none());
+        let locals = LocalSymbols::open(&cache, Some(&main_path))
+            .unwrap()
+            .unwrap();
+        assert!(locals.entry64);
+        let options = ExtractOptions::default();
+        let plan = plan_extraction(&cache, &image, &options, Some(&locals)).unwrap();
+        assert_eq!(plan.linkedit.local_symbols_added, 1);
+        assert_eq!(
+            &plan.linkedit.data[32..],
+            b"\0_hidden\0_foo\0\0\0",
+            "two symbols, then their names"
+        );
+        let plain = plan_extraction(&cache, &image, &options, None).unwrap();
+        assert_eq!(plain.linkedit.local_symbols_added, 0);
+
+        let unused = |why: &str| {
+            let e = LocalSymbols::open(&cache, Some(&main_path)).err().unwrap();
+            assert!(
+                e.starts_with(&format!("local symbols file not used ({why}): ")),
+                "{e}"
+            );
+            assert!(e.ends_with("cache.symbols"), "{e}");
+        };
+        // A symbols file of another cache.
+        symbols[88..104].fill(8);
+        std::fs::write(&symbols_path, &symbols).unwrap();
+        unused("its UUID is not the cache's symbolFileUUID");
+        // The right file without local symbols info.
+        symbols[88..104].fill(9);
+        symbols[72..88].fill(0);
+        std::fs::write(&symbols_path, &symbols).unwrap();
+        unused("it has no local symbols info");
+        // Info that does not fit in the file.
+        symbols[72..80].copy_from_slice(&0xff0u64.to_le_bytes());
+        symbols[80..88].copy_from_slice(&0x20u64.to_le_bytes());
+        std::fs::write(&symbols_path, &symbols).unwrap();
+        unused("local symbols info outside the file");
+        std::fs::write(&symbols_path, b"not a cache file at all").unwrap();
+        unused("not a dyld cache file");
+        std::fs::remove_file(&symbols_path).unwrap();
+        unused("cannot be read");
+
+        // A cache whose header names no symbols file needs none.
+        main[0x190..0x1a0].fill(0);
+        std::fs::write(&main_path, &main).unwrap();
+        let cache = open_cache(&main_path).unwrap();
+        assert!(LocalSymbols::open(&cache, Some(&main_path))
+            .unwrap()
+            .is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The merged local symbols replace the `<redacted>` placeholder, the
+    /// `LC_DYSYMTAB` ranges and the indirect symbol table follow, and
+    /// section ordinals are renumbered in every symbol.
+    #[test]
+    fn linkedit_rebuild_merges_local_symbols() {
+        let (original, mut linkedit) = shared_linkedit();
+        let locals = [
+            nlist64(1, 0x0e, 2, 0, 0x2000),
+            nlist64(5, 0x0e, 1, 0, 0x2010),
+        ]
+        .concat();
+        let changes = SymbolChanges {
+            locals: &locals,
+            local_strings: b"\0_s1\0_s2\0",
+            sections: &[0, 2, 1],
+        };
+        let symbols_of = |cmds: &[u8], rebuilt: &RebuiltLinkedit| -> Vec<(String, u8, u8)> {
+            let pos = |field: usize| {
+                let fixup = rebuilt.fixups.iter().find(|f| f.0 == field).unwrap();
+                fixup.1 as usize
+            };
+            let strings = &rebuilt.data[pos(SYMTAB + 16)..];
+            let count = u32_at(cmds, SYMTAB + 12) as usize;
+            rebuilt.data[pos(SYMTAB + 8)..][..16 * count]
+                .chunks_exact(16)
+                .map(|s| {
+                    let rest = &strings[u32_at(s, 0) as usize..];
+                    let len = rest.iter().position(|&c| c == 0).unwrap();
+                    (utf8_safe(&rest[..len]), s[4], s[5])
+                })
+                .collect()
+        };
+        let indirect_of = |rebuilt: &RebuiltLinkedit| -> Vec<u8> {
+            let fixup = rebuilt.fixups.iter().find(|f| f.0 == DYSYMTAB + 56);
+            rebuilt.data[fixup.unwrap().1 as usize..][..24].to_vec()
+        };
+        let sym = |name: &str, n_type: u8, sect: u8| (name.to_string(), n_type, sect);
+
+        // The image's own local symbol has a real name: it is kept, after
+        // the merged ones.
+        let mut cmds = original.clone();
+        let commands = load_commands(&cmds, NCMDS);
+        let rebuilt =
+            rebuild_linkedit(&mut cmds, &commands, true, &linkedit, LE as u64, &changes).unwrap();
+        assert_eq!(
+            (rebuilt.local_symbols_added, rebuilt.placeholders_dropped),
+            (2, 0)
+        );
+        assert_eq!(
+            symbols_of(&cmds, &rebuilt),
+            [
+                sym("_s1", 0x0e, 1),
+                sym("_s2", 0x0e, 2),
+                sym("_local", 0x0e, 2),
+                sym("_ext", 0x0f, 2),
+                sym("_alias", 0x0b, 0),
+                sym("_undef", 0x01, 0),
+                sym("_ext", 0x01, 0),
+            ]
+        );
+        let ranges: Vec<u32> = (0..6)
+            .map(|i| u32_at(&cmds, DYSYMTAB + 8 + 4 * i))
+            .collect();
+        assert_eq!(ranges, [0, 3, 3, 2, 5, 2]);
+        assert_eq!(
+            indirect_of(&rebuilt),
+            words(&[
+                5,
+                3,
+                INDIRECT_SYMBOL_LOCAL,
+                6,
+                4,
+                INDIRECT_SYMBOL_LOCAL | INDIRECT_SYMBOL_ABS
+            ])
+        );
+
+        // The image's local symbol is the builder's placeholder, and the
+        // first indirect entry names it.
+        linkedit[0xe0 + 48..0xe0 + 59].copy_from_slice(b"<redacted>\0");
+        linkedit[0x40 + 5 * 16..][..4].copy_from_slice(&48u32.to_le_bytes());
+        linkedit[0xc0..0xc4].copy_from_slice(&5u32.to_le_bytes());
+        let mut cmds = original.clone();
+        let rebuilt =
+            rebuild_linkedit(&mut cmds, &commands, true, &linkedit, LE as u64, &changes).unwrap();
+        assert_eq!(
+            (rebuilt.local_symbols_added, rebuilt.placeholders_dropped),
+            (2, 1)
+        );
+        assert_eq!(
+            symbols_of(&cmds, &rebuilt),
+            [
+                sym("_s1", 0x0e, 1),
+                sym("_s2", 0x0e, 2),
+                sym("_ext", 0x0f, 2),
+                sym("_alias", 0x0b, 0),
+                sym("_undef", 0x01, 0),
+                sym("_ext", 0x01, 0),
+            ]
+        );
+        let ranges: Vec<u32> = (0..6)
+            .map(|i| u32_at(&cmds, DYSYMTAB + 8 + 4 * i))
+            .collect();
+        assert_eq!(ranges, [0, 2, 2, 2, 4, 2]);
+        assert_eq!(
+            indirect_of(&rebuilt),
+            words(&[
+                INDIRECT_SYMBOL_LOCAL,
+                2,
+                INDIRECT_SYMBOL_LOCAL,
+                5,
+                3,
+                INDIRECT_SYMBOL_LOCAL | INDIRECT_SYMBOL_ABS
+            ])
+        );
+
+        // Without symbols to put in its place the placeholder stays.
+        let mut cmds = original.clone();
+        let rebuilt = rebuild(&mut cmds, &linkedit).unwrap();
+        assert_eq!(symbols_of(&cmds, &rebuilt)[0], sym("<redacted>", 0x0e, 1));
+        assert_eq!(u32_at(&cmds, SYMTAB + 12), 5);
+
+        // A merged symbol whose name is not in its string pool.
+        let bad = nlist64(40, 0x0e, 1, 0, 0);
+        let changes = SymbolChanges {
+            locals: &bad,
+            local_strings: b"\0_s1\0",
+            sections: &[],
+        };
+        let mut cmds = original.clone();
+        assert_eq!(
+            rebuild_linkedit(&mut cmds, &commands, true, &linkedit, LE as u64, &changes)
+                .unwrap_err(),
+            "symbol name outside the string table"
+        );
+    }
+
+    /// Local symbols info with out-of-range fields is refused or yields no
+    /// symbols; it never panics.
+    #[test]
+    fn hostile_local_symbols_do_not_panic() {
+        let info = local_symbols_info(
+            &[nlist64(1, 0x0e, 1, 0, BASE + 0x1010)],
+            b"\0_x\0",
+            &[(0x1000, 0, 1)],
+            false,
+        );
+        let options = ExtractOptions {
+            compact: true,
+            dry_run: true,
+        };
+        let out = tmp("never-written.macho");
+        let exercise = |data: Vec<u8>| -> Result<u32, String> {
+            let cache = parse(data).unwrap();
+            let Some(locals) = LocalSymbols::open(&cache, None)? else {
+                return Ok(0);
+            };
+            let mut added = 0;
+            for image in cache.images() {
+                for is64 in [true, false] {
+                    let _ = locals.of_image(&cache, &image, is64);
+                }
+                if let Ok(plan) = plan_extraction(&cache, &image, &options, Some(&locals)) {
+                    added += plan.linkedit.local_symbols_added;
+                }
+            }
+            Ok(added)
+        };
+        let size = info.len() as u64;
+        assert_eq!(
+            exercise(sample_cache_with_local_symbols(&info, size)),
+            Ok(1)
+        );
+        for field in 0..6 {
+            for value in [0, 1, 23, 0x7fff_ffff, u32::MAX, info.len() as u32] {
+                let mut bad = info.clone();
+                bad[4 * field..4 * field + 4].copy_from_slice(&value.to_le_bytes());
+                for claimed in [size, 24, 0x1800] {
+                    let _ = exercise(sample_cache_with_local_symbols(&bad, claimed));
+                }
+            }
+        }
+        for (size, why) in [
+            (8, "local symbols info truncated"),
+            (0x1801, "local symbols info outside the file"),
+            (u64::MAX, "local symbols info outside the file"),
+            (24, "local symbols entries outside the info"),
+            (size - 12, "local symbols entries outside the info"),
+        ] {
+            assert_eq!(
+                exercise(sample_cache_with_local_symbols(&info, size)),
+                Err(format!("local symbols of the cache not used: {why}"))
+            );
+        }
+        let mut data = sample_cache_with_local_symbols(&info, size);
+        data[72..80].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert!(exercise(data).is_err());
+        // The strings end before the entries do.
+        let mut bad = info.clone();
+        bad[12..16].copy_from_slice(&0x100u32.to_le_bytes());
+        assert_eq!(
+            exercise(sample_cache_with_local_symbols(&bad, size)),
+            Err(
+                "local symbols of the cache not used: local symbols strings outside the info"
+                    .into()
+            )
+        );
+        // More symbols claimed for the image than the array has, a first
+        // index past it, a name outside the pool: no symbols, or an error
+        // from the rebuild, for that image.
+        for (at, value) in [(52, 2u32), (48, 1), (24, 0x100)] {
+            let mut bad = info.clone();
+            bad[at..at + 4].copy_from_slice(&value.to_le_bytes());
+            assert_eq!(exercise(sample_cache_with_local_symbols(&bad, size)), Ok(0));
+        }
+        let mut bad = info.clone();
+        bad[24..28].copy_from_slice(&0x100u32.to_le_bytes());
+        let cache = parse(sample_cache_with_local_symbols(&bad, size)).unwrap();
+        let locals = LocalSymbols::open(&cache, None).unwrap().unwrap();
+        let image = cache.images().next().unwrap();
+        let e = extract_image(
+            &cache,
+            &image,
+            &out,
+            &options,
+            Some(&locals),
+            &AtomicBool::new(false),
+            &mut |_| {},
+        )
+        .unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "cannot rebuild __LINKEDIT (symbol name outside the string table): /usr/lib/libfoo.dylib"
+        );
+        assert!(!out.exists());
     }
 }

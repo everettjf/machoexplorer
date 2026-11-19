@@ -178,31 +178,15 @@ fn every_code_section_is_disassembled() {
 
 #[test]
 fn big_endian_object_file() {
-    // A PowerPC object: everything is stored big-endian. The instructions
-    // were checked against `llvm-objdump -d`, the relocations against
-    // `llvm-objdump -r`.
+    // A PowerPC object: everything is stored big-endian. Its structure is
+    // read like that of any other file; its code is not disassembled.
     let root = open("tests/corpus/bin/hello_ppc.o");
     assert_eq!(root.children()[0].name(), "Mach Header (ppc)");
-    let (_, code) = &tables(&root, "Disassembly (Capstone)")[0];
-    let text: Vec<&str> = code.rows.iter().map(|r| r.cells[2].as_str()).collect();
-    assert_eq!(
-        text,
-        [
-            "mflr r0",
-            "stw r0, 8(r1)",
-            "stwu r1, -0x40(r1)",
-            "bl 0x24",
-            "bl 0x10",
-            "addi r1, r1, 0x40",
-            "lwz r0, 8(r1)",
-            "mtlr r0",
-            "blr",
-            "li r3, 0x2a",
-            "blr"
-        ]
-    );
-    assert_eq!(row(code, "00000000")[3], "_main");
-    assert_eq!(row(code, "00000024")[3], "_helper");
+    let unsupported = |root: &ViewNode| {
+        let (_, code) = &tables(root, "Disassembly (Capstone)")[0];
+        code.rows.len() == 1 && code.rows[0].cells[2].starts_with("Unsupported architecture")
+    };
+    assert!(unsupported(&root));
     let cell = |name: &str, r: usize, c: usize| tables(&root, name)[0].1.rows[r].cells[c].clone();
     assert_eq!(cell("C String Literals", 1, 3), "ppc");
     assert_eq!(cell("Floating Point Literals", 0, 2), "2.5");
@@ -212,18 +196,26 @@ fn big_endian_object_file() {
     let referrers: Vec<&str> = xrefs
         .rows
         .iter()
-        .filter(|r| r.cells[0] == "00000024" && r.cells[3].contains(" @ raw "))
+        .filter(|r| r.cells[3].contains(" @ raw "))
         .map(|r| r.cells[3].as_str())
         .collect();
-    assert_eq!(
-        referrers,
-        [
-            "__DATA/__mod_init_func [pointer] @ raw 0x20C",
-            "__TEXT/__text [call] @ raw 0x1D8 vm 0xC"
-        ]
-    );
-    // The call to the undefined `_puts` has no address to refer to.
-    assert!(xrefs.rows.iter().all(|r| !r.cells[3].contains("vm 0x10")));
+    assert_eq!(referrers, ["__DATA/__mod_init_func [pointer] @ raw 0x20C"]);
+
+    // Objects a PowerPC compiler made, 32 and 64 bit.
+    for (file, arch, pointer) in [
+        ("tests/corpus/bin/llvm_trivial_ppc.o", "ppc", "00000278"),
+        ("tests/corpus/bin/llvm_trivial_ppc64.o", "ppc64", "000002CC"),
+    ] {
+        let root = open(file);
+        assert_eq!(root.children()[0].name(), format!("Mach Header ({arch})"));
+        assert!(unsupported(&root), "{file}");
+        let (_, lazy) = &tables(&root, "Lazy Symbol Pointers")[0];
+        assert_eq!(
+            lazy.rows[0].cells,
+            [pointer, "Indirect Pointer", "dyld_stub_binding_helper"],
+            "{file}"
+        );
+    }
 }
 
 #[test]

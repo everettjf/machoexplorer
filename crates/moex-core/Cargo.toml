@@ -12,12 +12,12 @@ serde_json.workspace = true
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 sha1 = "0.10"
 sha2 = "0.10"
-# Swift's own demangler (bundled C++ sources, built with `cc`); pinned
-# because the demangled text is part of the dump output.
-symbolic-common = "=13.9.0"
-symbolic-demangle = { version = "=13.9.0", default-features = false, features = ["swift"] }
 flate2.workspace = true
-capstone = { version = "0.14", default-features = false, features = ["full", "std", "arch_arm", "arch_arm64", "arch_powerpc", "arch_x86"] }
+capstone = { version = "0.14", default-features = false, features = ["full", "std", "arch_arm", "arch_arm64", "arch_x86"] }
+
+[build-dependencies]
+# Compiles the bundled Swift demangler (vendor/swift).
+cc = "1"
 
 [target.'cfg(not(any(target_os = "macos", target_os = "linux")))'.dependencies]
 cpp_demangle = "0.5"

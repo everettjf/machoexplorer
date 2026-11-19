@@ -1,6 +1,6 @@
 //! x86 and x86-64 instructions as the sweep sees them.
 
-use super::{bit, Def, Flow, Groups, Mem, MemUse, Reg, Step, Target};
+use super::{bit, Cond, Def, Flow, Groups, Mem, MemUse, Reg, Step, Target};
 use capstone::arch::x86::{X86Insn, X86OpMem, X86Operand, X86OperandType, X86Reg};
 use capstone::arch::{ArchDetail, DetailsArchInsn};
 use capstone::{Insn, InsnDetail, RegId};
@@ -108,6 +108,15 @@ pub(super) fn step(insn: &Insn<'_>, detail: &InsnDetail<'_>) -> Step {
         if let Some((r, _)) = gpr(*reg) {
             step.writes |= bit(r);
         }
+        step.flags |= reg.0 as u32 == X86Reg::X86_REG_EFLAGS;
+    }
+    // `cmp eax, 5`
+    if let (true, 2, Some((reg, 4 | 8)), Some(imm)) =
+        (is(X86Insn::X86_INS_CMP), ops.len(), reg_at(0), imm_at(1))
+    {
+        step.compare = Some((reg, imm));
+        step.flags = true;
+        return step;
     }
     for op in &ops {
         if let (X86OperandType::Reg(r), true) =
@@ -164,6 +173,17 @@ pub(super) fn step(insn: &Insn<'_>, detail: &InsnDetail<'_>) -> Step {
             Some(X86OperandType::Mem(_)) if step.mem.is_some() => Target::Mem,
             _ => Target::None,
         };
+        step.cond = if is(X86Insn::X86_INS_JA) {
+            Some(Cond::Above)
+        } else if is(X86Insn::X86_INS_JBE) {
+            Some(Cond::NotAbove)
+        } else if is(X86Insn::X86_INS_JAE) {
+            Some(Cond::NotBelow)
+        } else if is(X86Insn::X86_INS_JB) {
+            Some(Cond::Below)
+        } else {
+            None
+        };
         return step;
     }
 
@@ -193,8 +213,8 @@ pub(super) fn step(insn: &Insn<'_>, detail: &InsnDetail<'_>) -> Step {
             _ => Def::None,
         }
     } else if is(X86Insn::X86_INS_ADD) || is(X86Insn::X86_INS_SUB) {
-        match (ops.len(), imm_at(1)) {
-            (2, Some(imm)) => Def::Add {
+        match (ops.len(), imm_at(1), reg_at(1)) {
+            (2, Some(imm), _) => Def::Add {
                 src: dst,
                 imm: if is(X86Insn::X86_INS_SUB) {
                     imm.wrapping_neg()
@@ -202,6 +222,31 @@ pub(super) fn step(insn: &Insn<'_>, detail: &InsnDetail<'_>) -> Step {
                     imm
                 },
             },
+            // `add rax, rcx`
+            (2, None, Some((src, 8))) if width == 8 && is(X86Insn::X86_INS_ADD) => Def::AddReg {
+                a: dst,
+                b: src,
+                shift: 0,
+            },
+            _ => Def::None,
+        }
+    } else if is(X86Insn::X86_INS_MOVSXD) {
+        // `movsxd rax, dword ptr [rcx + rax*4]`: an entry of a table of
+        // 32-bit values.
+        match ops.get(1).map(|op| &op.op_type) {
+            Some(X86OperandType::Mem(mem))
+                if width == 8 && mem.segment().0 == 0 && mem.scale() == 4 && mem.disp() == 0 =>
+            {
+                match (gpr(mem.base()), gpr(mem.index())) {
+                    (Some((base, 8)), Some((index, 8))) => Def::LoadIndex {
+                        base,
+                        index,
+                        size: 4,
+                        signed: true,
+                    },
+                    _ => Def::None,
+                }
+            }
             _ => Def::None,
         }
     } else if is(X86Insn::X86_INS_POP) {

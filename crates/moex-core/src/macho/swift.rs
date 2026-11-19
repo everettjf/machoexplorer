@@ -6,7 +6,7 @@ use super::MachHeader;
 use crate::hex::{as_address, utf8_safe};
 use crate::image::Image;
 use std::cell::{Cell, OnceCell};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// Leading fields of every Swift context descriptor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -495,14 +495,22 @@ pub fn builtin_type_records(data: &[u8]) -> Records<BuiltinTypeDescriptor> {
 
 /// One `__swift5_mpenum` record: a type name followed by 32-bit words, the
 /// first of which holds their number (itself included) in its high half
-/// and flags in its low half. The words after it describe the spare bits
-/// of the payload and are not decoded.
+/// and flags in its low half. With flag bit 0, a second word follows with
+/// the byte offset in the payload (high half) and the byte count (low
+/// half) of a mask of the payload's spare bits, and then the mask itself,
+/// least significant byte first, padded to whole words.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MultiPayloadEnumDescriptor {
     /// Relative pointer from +0 to the mangled type name.
     pub type_name: i32,
     pub size_and_flags: u32,
+    /// The word after `size_and_flags`, when the descriptor has a spare
+    /// bit mask and room for the word.
+    pub spare_bits: Option<u32>,
 }
+
+/// Bytes from the start of a `__swift5_mpenum` record to its mask.
+const SPARE_BIT_MASK_AT: u64 = 12;
 
 impl MultiPayloadEnumDescriptor {
     /// Number of 32-bit words after the type name.
@@ -522,6 +530,20 @@ impl MultiPayloadEnumDescriptor {
     /// Bytes the descriptor occupies.
     pub fn size(&self) -> u64 {
         4 + 4 * u64::from(self.words())
+    }
+
+    /// Byte offset in the payload at which the spare bit mask applies.
+    pub fn spare_bit_mask_offset(&self) -> Option<u32> {
+        self.spare_bits.map(|word| word >> 16)
+    }
+
+    /// The spare bit mask, given the bytes of the record: as many bytes
+    /// as the descriptor says, or as it has room for when that is fewer.
+    pub fn spare_bit_mask<'a>(&self, record: &'a [u8]) -> Option<&'a [u8]> {
+        let count = u64::from(self.spare_bits? & 0xffff);
+        let room = self.size().saturating_sub(SPARE_BIT_MASK_AT);
+        let end = SPARE_BIT_MASK_AT + count.min(room);
+        record.get(SPARE_BIT_MASK_AT as usize..end as usize)
     }
 
     /// The size and flags as `name=value` text.
@@ -550,10 +572,14 @@ pub fn multi_payload_enum_records(data: &[u8]) -> Records<MultiPayloadEnumDescri
             out.error = Some("truncated multi-payload enum descriptor");
             break;
         };
-        let desc = MultiPayloadEnumDescriptor {
+        let mut desc = MultiPayloadEnumDescriptor {
             type_name: name as i32,
             size_and_flags,
+            spare_bits: None,
         };
+        if desc.uses_payload_spare_bits() && desc.words() >= 2 {
+            desc.spare_bits = le32(data, cursor + 8);
+        }
         if desc.words() == 0 {
             // The size word counts itself.
             out.error = Some("invalid multi-payload enum descriptor size");
@@ -686,153 +712,96 @@ impl TypeName {
 struct Context {
     /// Qualified name, `Module.Outer.Inner`.
     name: String,
-    is_protocol: bool,
-    /// False when the context cannot stand for a type in a mangled name
+    /// Mangling of the declaration without symbolic references, which the
+    /// manglings of what is declared in it build on. `None` when it has
+    /// none that could be written down.
+    mangling: Option<Vec<u8>>,
+    /// The module the declaration is in, when known.
+    module: Option<String>,
+    /// What the demangler is told a reference to this context stands for.
+    /// `None` when the context cannot stand for a type in a mangled name
     /// (a module, an extension, an anonymous context).
-    is_type: bool,
-    /// The names of the nominal types the context is nested in, outermost
-    /// first and ending with its own; the first carries the module name.
-    /// Empty for a module, `None` when the nesting is not known.
-    levels: Option<Vec<String>>,
+    referent: Option<Referent>,
 }
 
 impl Context {
-    /// A type `name` declared in `parent`.
-    fn nested(parent: Option<Context>, name: String, is_protocol: bool) -> Context {
-        let (qualified, levels) = match parent {
-            None => (name.clone(), Some(vec![name])),
-            Some(parent) => {
-                let qualified = format!("{}.{name}", parent.name);
-                let levels = parent.levels.map(|mut levels| {
-                    levels.push(if levels.is_empty() {
-                        qualified.clone()
-                    } else {
-                        name
-                    });
-                    levels
-                });
-                (qualified, levels)
-            }
-        };
+    /// A context that has a name to show and nothing else.
+    fn named(name: String) -> Context {
         Context {
-            name: qualified,
-            is_protocol,
-            is_type: true,
-            levels,
+            name,
+            mangling: None,
+            module: None,
+            referent: None,
         }
     }
-}
 
-/// The placeholder types put in a mangled name in place of its symbolic
-/// references, so that the demangler can read it, and what each one
-/// stands for.
-#[derive(Default)]
-struct Placeholders {
-    /// `(demangled placeholder, what to show in its place)`.
-    replacements: Vec<(String, String)>,
-}
-
-/// The builtin types whose combinations make up the exact placeholders:
-/// `(mangling, demangled form)`.
-const PLACEHOLDER_DIGITS: [(&str, &str); 4] = [
-    ("Bw", "Builtin.Word"),
-    ("Bp", "Builtin.RawPointer"),
-    ("Bb", "Builtin.BridgeObject"),
-    ("Bo", "Builtin.NativeObject"),
-];
-
-impl Placeholders {
-    /// Mangling of a new placeholder that is exact: like the symbolic
-    /// reference it stands for, it adds one substitution to the
-    /// demangler's table (and no word), so the back-references in the
-    /// rest of the name keep their meaning. It is `Swift.Array` bound to
-    /// two or more builtin types that spell the placeholder's number,
-    /// which no real name holds. Being a bound type, it cannot stand where
-    /// the demangler wants a declaration: at the head of a bound generic
-    /// type or for a protocol. `None` when the numbers have run out.
-    fn exact(&mut self, shown: &str) -> Option<String> {
-        let id = self.replacements.len();
-        if id >= 1 << 16 {
-            return None;
+    /// The same context where it cannot stand for a type.
+    fn not_a_type(self) -> Context {
+        Context {
+            referent: None,
+            ..self
         }
-        // As few digits as the number needs (the demangler's output is
-        // limited to 4095 bytes), but two at least.
-        let count = (2..8).find(|count| id >> (2 * count) == 0).unwrap_or(8);
-        let digits = (0..count)
-            .rev()
-            .filter_map(|digit| PLACEHOLDER_DIGITS.get((id >> (2 * digit)) & 3));
-        let (mangled, demangled): (Vec<&str>, Vec<&str>) = digits.copied().unzip();
-        self.replacements.push((
-            format!("Swift.Array<{}>", demangled.join(", ")),
-            shown.to_string(),
-        ));
-        Some(format!("Say{}G", mangled.concat()))
     }
 
-    /// Mangling of a new placeholder that is a declaration: a struct or
-    /// protocol named `_NNNNNN`, declared in the Swift module (`parent`
-    /// false) or in the type mangled just before. It adds two
-    /// substitutions (its name and itself) where the reference adds one,
-    /// so it must not be followed by a back-reference.
-    fn declaration(&mut self, parent: bool, is_protocol: bool, shown: &str) -> String {
-        let id = self.replacements.len();
-        let (demangled, shown) = if parent {
-            (format!("._{id:06}"), format!(".{shown}"))
-        } else {
-            (format!("Swift._{id:06}"), shown.to_string())
+    /// The nominal type or protocol `name` of mangling kind `kind` (`C`,
+    /// `V`, `O`, `P`) declared in `parent`.
+    fn nested(parent: Option<Context>, name: String, kind: u8) -> Context {
+        let mangling = parent.as_ref().and_then(|parent| {
+            let mut mangling = parent.mangling.clone()?;
+            mangling.extend(mangled_identifier(&name)?);
+            mangling.push(kind);
+            Some(mangling)
+        });
+        Context {
+            name: match &parent {
+                Some(parent) => format!("{}.{name}", parent.name),
+                None => name,
+            },
+            referent: mangling.clone().map(Referent::Mangling),
+            module: parent.and_then(|parent| parent.module),
+            mangling,
+        }
+    }
+
+    /// What is declared in an extension, made in `module`, of the type
+    /// this context is.
+    fn extended_in(self, module: Option<&str>) -> Context {
+        let Some(module) = module.filter(|module| self.module.as_deref() != Some(module)) else {
+            // An extension in the type's own module is not part of the
+            // names of what it declares.
+            return self.not_a_type();
         };
-        self.replacements.push((demangled, shown));
-        format!(
-            "{}7_{id:06}{}",
-            if parent { "" } else { "s" },
-            if is_protocol { 'P' } else { 'V' }
-        )
-    }
-
-    /// Demangles `mangled` and puts the names in place of the
-    /// placeholders.
-    fn demangle(&self, mangled: &str) -> Option<String> {
-        let mut text = if has_swift_prefix(mangled.as_bytes()) {
-            demangle(mangled.as_bytes())?
-        } else {
-            demangle(format!("$s{mangled}").as_bytes())?
-        };
-        for (placeholder, shown) in self.replacements.iter().rev() {
-            text = text.replace(placeholder, shown);
+        let mangling = self.mangling.and_then(|mut mangling| {
+            mangling.extend(mangled_identifier(module)?);
+            mangling.push(b'E');
+            Some(mangling)
+        });
+        Context {
+            name: format!("(extension in {module}):{}", self.name),
+            mangling,
+            module: Some(module.to_string()),
+            referent: None,
         }
-        // A placeholder that was printed in some other way than expected
-        // must not be taken for a type of the image.
-        let digits = |s: &str| s.len() >= 6 && s.bytes().take(6).all(|c| c.is_ascii_digit());
-        let left_over = text.contains("Swift.Array<Builtin.")
-            || text
-                .match_indices("._")
-                .any(|(at, _)| text.get(at + 2..).is_some_and(digits));
-        (!left_over).then_some(text)
     }
 }
 
-/// A mangled name being rewritten with placeholders.
-#[derive(Default)]
-struct Rewritten {
-    text: String,
-    /// Length of `text` after the first declaration placeholder.
-    declaration_end: Option<usize>,
+/// `name` as an identifier of a mangled name (`<length><name>`); `None`
+/// for a name that cannot be written that way.
+fn mangled_identifier(name: &str) -> Option<Vec<u8>> {
+    let first = *name.as_bytes().first()?;
+    if first.is_ascii_digit() || name.len() > MAX_CSTRING as usize || name.contains('\0') {
+        return None;
+    }
+    Some(format!("{}{name}", name.len()).into_bytes())
 }
 
-impl Rewritten {
-    fn declaration(&mut self, mangled: &str) {
-        self.text.push_str(mangled);
-        self.declaration_end.get_or_insert(self.text.len());
-    }
-
-    /// The text, unless a back-reference (`A…`) may follow a declaration
-    /// placeholder. Any `A` counts: telling a back-reference from other
-    /// uses of the letter would take a parser of the mangling.
-    fn checked(&self) -> Option<&str> {
-        let rest = self
-            .text
-            .get(self.declaration_end.unwrap_or(self.text.len())..)?;
-        (!rest.contains('A')).then_some(self.text.as_str())
+/// Mangling of the module `name`.
+fn mangled_module(name: &str) -> Option<Vec<u8>> {
+    match name {
+        "Swift" => Some(b"s".to_vec()),
+        "__C" => Some(b"So".to_vec()),
+        "__C_Synthesized" => Some(b"SC".to_vec()),
+        _ => mangled_identifier(name),
     }
 }
 
@@ -847,6 +816,8 @@ impl Rewritten {
 pub struct TypeNames<'a> {
     reader: SliceReader<'a>,
     pointers: OnceCell<PointerDecoder<'a>>,
+    /// Address → name of the opaque type descriptor symbols (`…MQ`).
+    opaque_types: OnceCell<HashMap<u64, &'a [u8]>>,
     budget: Cell<u64>,
 }
 
@@ -860,6 +831,7 @@ impl<'a> TypeNames<'a> {
         TypeNames {
             reader,
             pointers: OnceCell::new(),
+            opaque_types: OnceCell::new(),
             budget: Cell::new(budget),
         }
     }
@@ -944,15 +916,10 @@ impl<'a> TypeNames<'a> {
             return None;
         }
         let mut stored = String::new();
-        // The name with a placeholder type for each symbolic reference, as
-        // long as every part of it is something the demangler takes.
-        // `nested` differs from `flat` in that a type declared in another
-        // type gets a placeholder declared in a placeholder, which generic
-        // arguments bound at several levels (`Outer<Int>.Inner`) need.
-        let mut plain =
-            (name.len() <= MAX_MANGLED_LEN).then(|| (Rewritten::default(), Rewritten::default()));
-        let mut placeholders = Placeholders::default();
-        let mut has_nested = false;
+        // What each symbolic reference stands for, as long as the name is
+        // something the demangler can be given: every reference resolved,
+        // nothing unprintable between them.
+        let mut referents = (name.len() <= MAX_MANGLED_LEN).then(Vec::new);
         let mut references = Vec::new();
         let mut i = 0usize;
         while let Some(&c) = name.get(i) {
@@ -960,21 +927,18 @@ impl<'a> TypeNames<'a> {
             let Some(len) = symbolic_reference_len(c, self.pointer_size()) else {
                 if is_printable(c) {
                     stored.push(c as char);
-                    if let Some((flat, nested)) = plain.as_mut() {
-                        flat.text.push(c as char);
-                        nested.text.push(c as char);
-                    }
                 } else {
                     stored.push_str(&format!("\\x{c:02x}"));
-                    plain = None;
+                    referents = None;
                 }
                 continue;
             };
             let Some(operand) = name.get(i..i + len) else {
                 stored.push_str("{truncated}");
-                plain = None;
+                referents = None;
                 break;
             };
+            let position = i as u32;
             let field = vmaddr.wrapping_add(i as u64);
             i += len;
             let mut value = [0u8; 8];
@@ -994,47 +958,26 @@ impl<'a> TypeNames<'a> {
             stored.push('{');
             stored.push_str(&shown);
             stored.push('}');
-            let Some(context) = context.filter(|context| context.is_type) else {
-                plain = None;
-                continue;
+            let referent = match (context, target) {
+                (Some(context), _) => context.referent,
+                // The demangler prints these with their address.
+                (None, Some(target)) if matches!(c, 0x0a | 0x0b) => Some(Referent::Address(target)),
+                _ => None,
             };
-            let Some((flat, nested)) = plain.as_mut() else {
-                continue;
-            };
-            // A protocol, or the head of a bound generic type (`y` starts
-            // the arguments), has to be a declaration.
-            let protocol = context.is_protocol;
-            let declaration = protocol || name.get(i) == Some(&b'y');
-            let exact = if declaration {
-                None
-            } else {
-                placeholders.exact(&context.name)
-            };
-            match &exact {
-                Some(exact) => flat.text.push_str(exact),
-                None => flat.declaration(&placeholders.declaration(false, protocol, &context.name)),
-            }
-            match (context.levels.as_deref(), &exact) {
-                (Some(levels @ [_, _, ..]), _) => {
-                    has_nested = true;
-                    for (level, shown) in levels.iter().enumerate() {
-                        let last = level + 1 == levels.len();
-                        nested.declaration(&placeholders.declaration(
-                            level != 0,
-                            last && protocol,
-                            shown,
-                        ));
-                    }
-                }
-                (_, Some(exact)) => nested.text.push_str(exact),
-                (_, None) => {
-                    nested.declaration(&placeholders.declaration(false, protocol, &context.name));
-                }
+            match (referents.as_mut(), referent) {
+                (Some(referents), Some(referent)) => referents.push((position, referent)),
+                _ => referents = None,
             }
         }
-        let demangled = plain.and_then(|(flat, nested)| {
-            let demangle = |name: &Rewritten| placeholders.demangle(name.checked()?);
-            demangle(&flat).or_else(|| has_nested.then(|| demangle(&nested)).flatten())
+        let demangled = referents.and_then(|referents| {
+            if !has_swift_prefix(name) {
+                demangle_type(name, referents)
+            } else if referents.is_empty() {
+                // Stored as a whole symbol.
+                demangle(name)
+            } else {
+                None
+            }
         });
         Some(TypeName {
             address: vmaddr,
@@ -1062,6 +1005,7 @@ impl<'a> TypeNames<'a> {
         let context = match kind {
             0x01 => self.context(target, depth + 1),
             0x02 => self.context_through_pointer(target, depth + 1),
+            0x0c => self.objc_protocol(target),
             _ => None,
         };
         (Some(target), context)
@@ -1078,22 +1022,176 @@ impl<'a> TypeNames<'a> {
             .get_or_init(|| PointerDecoder::new(self.reader.mh));
         match pointers.read(offset, pointer_size == 8)? {
             Pointer::Address(address) => self.context(address, depth),
-            Pointer::Import { name, .. } => imported_context(name),
+            Pointer::Import { name, .. } => descriptor_symbol_context(name),
         }
     }
 
-    /// The context that the mangled name at `vmaddr` refers to, when the
-    /// name is nothing but one symbolic reference to a context.
-    fn sole_reference(&self, vmaddr: u64, depth: u32) -> Option<Context> {
-        let bytes = self.reader.bytes(vmaddr, 6)?;
-        let (&kind, operand) = bytes.split_first()?;
-        if !matches!(kind, 0x01 | 0x02) || bytes.get(5) != Some(&0) {
+    /// `(conforming type, protocol)` of the protocol conformance descriptor
+    /// at `vmaddr` (what `__swift5_proto` points at): a relative pointer to
+    /// the protocol's descriptor, one to the type, one to the witness
+    /// table and flags, whose bits 3-5 say how the type is referred to.
+    /// A part that cannot be read is `None`.
+    pub fn conformance(&self, vmaddr: u64) -> Option<(Option<String>, Option<String>)> {
+        let offset = self.reader.object_offset(vmaddr, 16)?;
+        let image = self.reader.image();
+        let protocol = image.u32(offset)? as i32;
+        let type_ref = image.u32(offset + 4)? as i32;
+        let flags = image.u32(offset + 12)?;
+        // The low bit marks a pointer to the descriptor's address.
+        let protocol = match protocol {
+            0 => None,
+            rel if rel & 1 != 0 => {
+                self.context_through_pointer(relative_target(vmaddr, rel & !1), 0)
+            }
+            rel => self.context(relative_target(vmaddr, rel), 0),
+        };
+        let field = vmaddr.wrapping_add(4);
+        let target = relative_target(field, type_ref);
+        let conforming = match (flags >> 3) & 7 {
+            _ if type_ref == 0 => None,
+            0 => self.context(target, 0).map(|context| context.name),
+            1 => self
+                .context_through_pointer(target, 0)
+                .map(|context| context.name),
+            // The name of an Objective-C class.
+            2 => self.cstring(target),
+            // A pointer to an Objective-C class.
+            3 => self.objc_class(target),
+            _ => None,
+        };
+        Some((conforming, protocol.map(|context| context.name)))
+    }
+
+    /// The name of the Objective-C class that the pointer stored at `slot`
+    /// refers to, when it is an imported one.
+    fn objc_class(&self, slot: u64) -> Option<String> {
+        let pointer_size = self.pointer_size() as u64;
+        let offset = self.reader.object_offset(slot, pointer_size)?;
+        let pointers = self
+            .pointers
+            .get_or_init(|| PointerDecoder::new(self.reader.mh));
+        match pointers.read(offset, pointer_size == 8)? {
+            Pointer::Import { name, .. } => {
+                Some(utf8_safe(name.strip_prefix(b"_OBJC_CLASS_$_").unwrap_or(name)))
+            }
+            Pointer::Address(address) => Some(format!("class {}", as_address(address))),
+        }
+    }
+
+    /// The Objective-C protocol named through `vmaddr`: a relative pointer
+    /// to a protocol reference (a pointer to a `protocol_t`, as in
+    /// `__objc_protorefs`).
+    fn objc_protocol(&self, vmaddr: u64) -> Option<Context> {
+        if !self.charge(REFERENCE_COST) {
             return None;
         }
-        let rel = u32::from_le_bytes(operand.get(..4)?.try_into().ok()?);
-        let field = vmaddr.wrapping_add(1);
-        self.symbolic_reference(kind, field, u64::from(rel), depth)
-            .1
+        let rel = self.reader.image().u32(self.reader.object_offset(vmaddr, 4)?)?;
+        let slot = relative_target(vmaddr, rel as i32);
+        let pointer_size = self.pointer_size() as u64;
+        let offset = self.reader.object_offset(slot, pointer_size)?;
+        let pointers = self
+            .pointers
+            .get_or_init(|| PointerDecoder::new(self.reader.mh));
+        let name = match pointers.read(offset, pointer_size == 8)? {
+            // `protocol_t`: `isa`, then the name.
+            Pointer::Address(protocol) => {
+                let field = self
+                    .reader
+                    .object_offset(protocol.checked_add(pointer_size)?, pointer_size)?;
+                let Pointer::Address(name) = pointers.read(field, pointer_size == 8)? else {
+                    return None;
+                };
+                self.cstring(name)?
+            }
+            Pointer::Import { name, .. } => {
+                utf8_safe(name.strip_prefix(b"__OBJC_PROTOCOL_$_")?)
+            }
+        };
+        let mut mangling = b"So".to_vec();
+        mangling.extend(mangled_identifier(&name)?);
+        mangling.push(b'P');
+        Some(Context {
+            name: format!("__C.{name}"),
+            referent: Some(Referent::Mangling(mangling.clone())),
+            mangling: Some(mangling),
+            module: Some("__C".to_string()),
+        })
+    }
+
+    /// The context that the mangled name at `vmaddr` refers to, when the
+    /// name is one symbolic reference to a context, alone or as the head
+    /// of a bound generic type (`{Foo}y…G`): the type that an extension
+    /// extends.
+    fn extended_type(&self, vmaddr: u64, depth: u32) -> Option<Context> {
+        let bytes = self.reader.bytes(vmaddr, MAX_MANGLED_LEN as u64 + 1)?;
+        let (&kind, operand) = bytes.split_first()?;
+        if matches!(kind, 0x01 | 0x02) {
+            let len = mangled_name_len(bytes, self.pointer_size())?;
+            let rest = bytes.get(5..len)?;
+            let generic = rest.first() == Some(&b'y') && rest.last() == Some(&b'G');
+            if !rest.is_empty() && !generic {
+                return None;
+            }
+            let rel = u32::from_le_bytes(operand.get(..4)?.try_into().ok()?);
+            let field = vmaddr.wrapping_add(1);
+            return self
+                .symbolic_reference(kind, field, u64::from(rel), depth)
+                .1;
+        }
+        // A name without references (`Sa`, `SayxG`, `So8NSObjectC`): the
+        // declaration is the whole name or, of a bound generic type, what
+        // comes before the `y` that starts its arguments.
+        let len = mangled_name_len(bytes, self.pointer_size())?;
+        let name = bytes.get(..len)?;
+        if len > MAX_CSTRING as usize || !name.iter().all(|&c| is_printable(c)) {
+            return None;
+        }
+        let generic = name.last() == Some(&b'G');
+        let heads = (0..len).filter(|&at| name.get(at) == Some(&b'y')).take(8);
+        let candidates: Vec<&[u8]> = if generic {
+            heads.filter_map(|at| name.get(..at)).collect()
+        } else {
+            vec![name]
+        };
+        candidates.into_iter().find_map(|mangling| {
+            if !self.charge(REFERENCE_COST) {
+                return None;
+            }
+            let shown = demangle_type(mangling, Vec::new())?;
+            // A declaration prints as a dotted name and nothing else.
+            let (module, rest) = shown.split_once('.')?;
+            let plain = |text: &str| text.chars().all(|c| c == '_' || c.is_alphanumeric());
+            if !plain(module) || !rest.split('.').all(plain) {
+                return None;
+            }
+            Some(Context {
+                module: Some(module.to_string()),
+                name: shown,
+                referent: Some(Referent::Mangling(mangling.to_vec())),
+                mangling: Some(mangling.to_vec()),
+            })
+        })
+    }
+
+    /// The opaque type descriptor at `vmaddr`, by its symbol.
+    fn opaque_type(&self, vmaddr: u64) -> Option<Context> {
+        let symbols = self.opaque_types.get_or_init(|| {
+            let mut map = HashMap::new();
+            if let Some(symtab) = self.reader.mh.symtab() {
+                for symbol in symtab.symbols() {
+                    // Defined in a section (`N_SECT`), not a debug entry.
+                    if symbol.n_type & 0xe0 != 0 || symbol.n_type & 0x0e != 0x0e {
+                        continue;
+                    }
+                    let name = symtab.string_bytes(symbol.n_strx);
+                    if name.ends_with(b"MQ") {
+                        map.entry(symbol.n_value).or_insert(name);
+                    }
+                }
+            }
+            map
+        });
+        descriptor_symbol_context(symbols.get(&vmaddr)?)
     }
 
     /// The context described by the descriptor at `vmaddr`.
@@ -1120,89 +1218,95 @@ impl<'a> TypeNames<'a> {
         let kind = desc.kind();
         match kind {
             // Module.
-            0 => Some(Context {
-                name: self.relative_cstring(name_field, desc.name)?,
-                is_protocol: false,
-                is_type: false,
-                levels: Some(Vec::new()),
-            }),
+            0 => {
+                let name = self.relative_cstring(name_field, desc.name)?;
+                Some(Context {
+                    mangling: mangled_module(&name),
+                    module: Some(name.clone()),
+                    name,
+                    referent: None,
+                })
+            }
             // Extension: named by the mangled name of the extended type.
             1 if desc.name != 0 => {
                 let extended = relative_target(name_field, desc.name);
-                let context = match self.sole_reference(extended, depth + 1) {
-                    Some(context) => context,
-                    None => Context {
-                        name: self.read_at(extended, depth + 1)?.text().to_string(),
-                        is_protocol: false,
-                        is_type: false,
-                        levels: None,
-                    },
-                };
-                Some(Context {
-                    is_type: false,
-                    ..context
+                let module = parent().and_then(|parent| parent.module);
+                Some(match self.extended_type(extended, depth + 1) {
+                    Some(context) => context.extended_in(module.as_deref()),
+                    None => {
+                        Context::named(self.read_at(extended, depth + 1)?.text().to_string())
+                    }
                 })
             }
             // Anonymous (a function body, a file's private scope): what it
             // holds is shown as a member of its parent.
-            2 => parent().map(|p| Context {
-                is_type: false,
-                ..p
-            }),
+            2 => parent().map(Context::not_a_type),
+            // Protocol, class, struct, enum.
             3 | 16..=18 => {
                 let name = self.relative_cstring(name_field, desc.name)?;
-                Some(Context::nested(parent(), name, kind == 3))
+                let kind = match kind {
+                    3 => b'P',
+                    16 => b'C',
+                    17 => b'V',
+                    _ => b'O',
+                };
+                Some(Context::nested(parent(), name, kind))
             }
+            // Opaque type: the result type (`some P`) of a declaration.
+            4 => Some(self.opaque_type(vmaddr).unwrap_or_else(|| Context {
+                referent: Some(Referent::Address(vmaddr)),
+                ..Context::named(format!("opaque type {}", as_address(vmaddr)))
+            })),
             _ => None,
         }
     }
 }
 
-/// The context that an imported descriptor symbol (`_$s…Mn`, `_$s…Mp`)
-/// stands for.
-fn imported_context(symbol: &[u8]) -> Option<Context> {
-    let is_protocol = symbol.ends_with(b"Mp");
+/// The context that a descriptor symbol stands for: `…Mn` (nominal type),
+/// `…Mp` (protocol) or `…MQ` (opaque type), with or without the Mach-O
+/// underscore.
+fn descriptor_symbol_context(symbol: &[u8]) -> Option<Context> {
+    let text = demangle(symbol)?;
+    let bare = symbol.strip_prefix(b"_").unwrap_or(symbol);
+    let body = bare
+        .strip_prefix(b"$s")
+        .or_else(|| bare.strip_prefix(b"$S"))
+        .and_then(|body| body.get(..body.len().checked_sub(2)?));
     if symbol.ends_with(b"MQ") {
-        // An opaque result type: it has a name to show, but no mangling
-        // that could stand in for it.
-        let text = demangle(symbol)?;
+        // The symbol is `<declaration>QOMQ`, and `<declaration>QO` is the
+        // opaque result type of the declaration.
+        let name = text.strip_prefix("opaque type descriptor for ")?;
         return Some(Context {
-            name: text
-                .strip_prefix("opaque type descriptor for ")?
-                .to_string(),
-            is_protocol: false,
-            is_type: false,
-            levels: None,
+            referent: body
+                .filter(|body| body.ends_with(b"QO"))
+                .map(|body| Referent::Mangling(body.to_vec())),
+            ..Context::named(name.to_string())
         });
     }
-    if !is_protocol && !symbol.ends_with(b"Mn") {
-        return None;
-    }
-    let text = demangle(symbol)?;
-    let prefix = if is_protocol {
-        "protocol descriptor for "
+    // A protocol is mangled without its kind where only a protocol can
+    // stand, as before `Mp`.
+    let (prefix, body) = if symbol.ends_with(b"Mp") {
+        (
+            "protocol descriptor for ",
+            body.map(|body| [body, b"P"].concat()),
+        )
+    } else if symbol.ends_with(b"Mn") {
+        ("nominal type descriptor for ", body.map(<[u8]>::to_vec))
     } else {
-        "nominal type descriptor for "
+        return None;
     };
     let name = text.strip_prefix(prefix)?;
-    // `Module.Outer.Inner`; anything else (a type in an extension or in a
-    // function) does not show its nesting.
-    let simple = name
-        .chars()
-        .all(|c| c == '.' || c == '_' || c.is_alphanumeric());
-    let levels = match name.split('.').collect::<Vec<_>>().as_slice() {
-        [module, first, rest @ ..] if simple => Some(
-            std::iter::once(format!("{module}.{first}"))
-                .chain(rest.iter().map(|part| part.to_string()))
-                .collect(),
-        ),
-        _ => None,
-    };
+    // `Module.Type…`; anything else (a type in an extension or in a
+    // function) does not show its module first.
+    let module = name
+        .split_once('.')
+        .map(|(module, _)| module)
+        .filter(|module| module.chars().all(|c| c == '_' || c.is_alphanumeric()));
     Some(Context {
         name: name.to_string(),
-        is_protocol,
-        is_type: true,
-        levels,
+        referent: body.clone().map(Referent::Mangling),
+        mangling: body,
+        module: module.map(str::to_string),
     })
 }
 
@@ -1302,8 +1406,8 @@ const MAX_MANGLED_LEN: usize = 16 * 1024;
 /// Demangled form of a Swift symbol name (`$s…`, `_$s…`, `$S…`, `_T0…`);
 /// `None` when `name` is not one or the demangler does not understand it.
 ///
-/// This is Swift's own demangler as bundled by the `symbolic-demangle`
-/// crate, so it works on every platform and starts no process. Unlike the
+/// This is Swift's own demangler, bundled as source (`vendor/swift`), so it
+/// works on every platform and starts no process. Unlike the
 /// `swift-demangle` tool it prints types without sugar
 /// (`Swift.Optional<Swift.Int>`, not `Swift.Int?`), and manglings newer
 /// than the bundled demangler are not understood.
@@ -1314,20 +1418,48 @@ pub fn demangle(name: &[u8]) -> Option<String> {
 /// [`demangle`] for many names at once (one hand-over to the demangler
 /// thread instead of one per name); results are in input order.
 pub fn demangle_all<N: AsRef<[u8]>>(names: &[N]) -> Vec<Option<String>> {
-    let candidates: Vec<Option<String>> = names
+    let candidates: Vec<Option<worker::Job>> = names
         .iter()
         .map(|name| {
             let name = name.as_ref();
             if !looks_mangled(name) || name.len() > MAX_MANGLED_LEN || name.contains(&0) {
                 return None;
             }
-            std::str::from_utf8(name).ok().map(str::to_string)
+            // The demangler takes any bytes, but what is shown must be text.
+            std::str::from_utf8(name)
+                .ok()
+                .map(|_| worker::Job::Symbol(name.to_vec()))
         })
         .collect();
     if candidates.iter().all(Option::is_none) {
-        return candidates;
+        return vec![None; candidates.len()];
     }
     worker::run(candidates)
+}
+
+/// What a symbolic reference in a type name stands for, as the demangler
+/// is told.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Referent {
+    /// A mangling without references that demangles to the same thing: a
+    /// type or protocol declaration, or `<declaration>QO` for the opaque
+    /// result type of a declaration.
+    Mangling(Vec<u8>),
+    /// Only the address referred to is known.
+    Address(u64),
+}
+
+/// Demangled form of the type name `name` (as stored: no prefix, symbolic
+/// references in place), where the reference whose operand is at offset
+/// `position` stands for the paired [`Referent`]. `None` when the demangler
+/// does not understand the name or a reference has no referent.
+pub(crate) fn demangle_type(name: &[u8], referents: Vec<(u32, Referent)>) -> Option<String> {
+    if name.len() > MAX_MANGLED_LEN {
+        return None;
+    }
+    worker::run(vec![Some(worker::Job::Type(name.to_vec(), referents))])
+        .pop()
+        .flatten()
 }
 
 /// The mangling prefixes the demangler accepts, optionally after the
@@ -1347,24 +1479,120 @@ fn looks_mangled(name: &[u8]) -> bool {
 /// takes far more stack than an arbitrary caller is sure to have left,
 /// above all in unoptimised builds.
 mod worker {
+    use super::Referent;
+    use std::ffi::c_char;
     use std::sync::mpsc::{channel, Sender};
     use std::sync::{Mutex, OnceLock};
-    use symbolic_common::{Language, Name, NameMangling};
-    use symbolic_demangle::{Demangle, DemangleOptions};
 
     /// The deepest nesting the demangler follows needs about 16 MiB in an
     /// unoptimised build (under 1 MiB optimised). Only the pages that are
     /// touched get committed.
     const STACK_SIZE: usize = 48 * 1024 * 1024;
 
-    type Names = Vec<Option<String>>;
-    type Request = (Names, Sender<Names>);
+    /// Longer results are dropped: a short crafted name can demangle to an
+    /// enormous text (each back-reference repeats a whole type).
+    const MAX_DEMANGLED_LEN: usize = 64 * 1024;
 
-    fn demangle_one(mangled: &str) -> Option<String> {
-        let name = Name::new(mangled, NameMangling::Mangled, Language::Swift);
-        // A name the demangler does not understand comes back unchanged.
-        name.demangle(DemangleOptions::complete())
-            .filter(|out| out != mangled)
+    pub(super) enum Job {
+        Symbol(Vec<u8>),
+        Type(Vec<u8>, Vec<(u32, Referent)>),
+    }
+
+    type Jobs = Vec<Option<Job>>;
+    type Names = Vec<Option<String>>;
+    type Request = (Jobs, Sender<Names>);
+
+    /// `moex_swift_ref` of `src/swift_demangle.cpp`.
+    #[repr(C)]
+    struct RawRef {
+        position: u32,
+        kind: u32,
+        text: *const c_char,
+        text_len: usize,
+        address: u64,
+    }
+
+    extern "C" {
+        fn moex_swift_demangle_symbol(
+            name: *const c_char,
+            len: usize,
+            out_len: *mut usize,
+        ) -> *mut c_char;
+        fn moex_swift_demangle_type(
+            name: *const c_char,
+            len: usize,
+            refs: *const RawRef,
+            nrefs: usize,
+            out_len: *mut usize,
+        ) -> *mut c_char;
+        fn moex_swift_free(text: *mut c_char);
+    }
+
+    /// Takes over a result of the C interface.
+    ///
+    /// # Safety
+    /// `text` is null or a result of one of the `moex_swift_demangle_*`
+    /// functions that set `len`, not yet released.
+    unsafe fn take(text: *mut c_char, len: usize) -> Option<String> {
+        if text.is_null() {
+            return None;
+        }
+        // SAFETY: the C side returned `len` bytes at `text`.
+        let bytes = unsafe { std::slice::from_raw_parts(text.cast::<u8>(), len) };
+        let out = (len <= MAX_DEMANGLED_LEN).then(|| crate::hex::utf8_safe(bytes));
+        // SAFETY: `text` came from the C side's allocator and is not used
+        // after this.
+        unsafe { moex_swift_free(text) };
+        out
+    }
+
+    fn demangle_one(job: &Job) -> Option<String> {
+        let mut len = 0usize;
+        match job {
+            Job::Symbol(name) => {
+                // SAFETY: `name` is valid for `name.len()` bytes during the
+                // call, which keeps no pointer to it.
+                unsafe {
+                    let text =
+                        moex_swift_demangle_symbol(name.as_ptr().cast(), name.len(), &mut len);
+                    take(text, len)
+                }
+            }
+            Job::Type(name, referents) => {
+                let refs: Vec<RawRef> = referents
+                    .iter()
+                    .map(|(position, referent)| match referent {
+                        Referent::Mangling(text) => RawRef {
+                            position: *position,
+                            kind: 1,
+                            text: text.as_ptr().cast(),
+                            text_len: text.len(),
+                            address: 0,
+                        },
+                        Referent::Address(address) => RawRef {
+                            position: *position,
+                            kind: 2,
+                            text: std::ptr::null(),
+                            text_len: 0,
+                            address: *address,
+                        },
+                    })
+                    .collect();
+                // SAFETY: `name`, `refs` and the texts `refs` points into
+                // (owned by `referents`) are valid during the call, which
+                // keeps no pointer to them.
+                unsafe {
+                    let text = moex_swift_demangle_type(
+                        name.as_ptr().cast(),
+                        name.len(),
+                        refs.as_ptr(),
+                        refs.len(),
+                        &mut len,
+                    );
+                    take(text, len)
+                }
+            }
+        }
     }
 
     /// The queue of the demangler thread, which is started on first use and
@@ -1377,10 +1605,10 @@ mod worker {
                 .name("swift-demangle".to_string())
                 .stack_size(STACK_SIZE)
                 .spawn(move || {
-                    for (names, reply) in rx {
-                        let out = names
+                    for (jobs, reply) in rx {
+                        let out = jobs
                             .iter()
-                            .map(|n| n.as_deref().and_then(demangle_one))
+                            .map(|job| job.as_ref().and_then(demangle_one))
                             .collect();
                         let _ = reply.send(out);
                     }
@@ -1393,11 +1621,11 @@ mod worker {
 
     /// Demangles every `Some` entry. Nothing is demangled when the thread
     /// is not available.
-    pub(super) fn run(names: Names) -> Names {
-        let count = names.len();
+    pub(super) fn run(jobs: Jobs) -> Names {
+        let count = jobs.len();
         let (reply, result) = channel();
         queue()
-            .and_then(|queue| queue.send((names, reply)).ok())
+            .and_then(|queue| queue.send((jobs, reply)).ok())
             .and_then(|()| result.recv().ok())
             .unwrap_or_else(|| vec![None; count])
     }
@@ -1807,6 +2035,24 @@ pub(crate) mod tests {
                 ),
             ]
         );
+        // The second has a mask of two bytes for offset 4 of the payload.
+        let masks: Vec<_> = walk
+            .items
+            .iter()
+            .map(|(o, d)| {
+                let record = data.get(*o as usize..).unwrap();
+                (d.spare_bit_mask_offset(), d.spare_bit_mask(record))
+            })
+            .collect();
+        assert_eq!(masks, [(None, None), (Some(4), Some(&[0xff, 0][..]))]);
+        // A mask said to be longer than the record ends with the record.
+        let long = words(&[0x10, 0x0003_0001, 0x0004_0040, 0xff]);
+        let walk = multi_payload_enum_records(&long);
+        let (_, desc) = walk.items.first().unwrap();
+        assert_eq!(desc.spare_bit_mask(&long), Some(&[0xff, 0, 0, 0][..]));
+        // The flag without room for the word.
+        let short = multi_payload_enum_records(&words(&[0x10, 0x0001_0001]));
+        assert_eq!(short.items.first().unwrap().1.spare_bits, None);
         for len in 1..data.len() {
             let cut = multi_payload_enum_records(data.get(..len).unwrap());
             assert_eq!(
@@ -1942,7 +2188,9 @@ pub(crate) mod tests {
     /// struct `Demo.Shape` (0x810), struct `Demo.Shape.Inner` (0x820),
     /// protocol `Demo.Proto` (0x830), a struct that is its own parent
     /// (0x840), an extension of `Demo.Shape` (0x850) holding struct
-    /// `Deep` (0x860), and at 0x8f0 a pointer to 0x1810.
+    /// `Deep` (0x860), module `Other` (0x870) with an extension of
+    /// `Demo.Shape` (0x880) holding struct `Far` (0x890), and at 0x8f0 a
+    /// pointer to 0x1810.
     pub(crate) fn put_contexts(f: &mut [u8]) {
         let mut descriptor = |at: usize, flags: u32, parent: Option<usize>, name: usize| {
             put(f, at, &flags.to_le_bytes());
@@ -1958,12 +2206,17 @@ pub(crate) mod tests {
         descriptor(0x840, 17, Some(0x840), 0x8c0);
         descriptor(0x850, 1, Some(0x800), 0x8d0);
         descriptor(0x860, 17, Some(0x850), 0x8c8);
+        descriptor(0x870, 0, None, 0x8d8);
+        descriptor(0x880, 1, Some(0x870), 0x8d0);
+        descriptor(0x890, 17, Some(0x880), 0x8e0);
         put(f, 0x8a0, b"Demo\0");
         put(f, 0x8a8, b"Shape\0");
         put(f, 0x8b0, b"Inner\0");
         put(f, 0x8b8, b"Proto\0");
         put(f, 0x8c0, b"Loop\0");
         put(f, 0x8c8, b"Deep\0");
+        put(f, 0x8d8, b"Other\0");
+        put(f, 0x8e0, b"Far\0");
         put_ref(f, 0x8d0, 1, 0x810);
         put(f, 0x8f0, &0x1810u64.to_le_bytes());
     }
@@ -2058,6 +2311,13 @@ pub(crate) mod tests {
             // 0x4b0: no reference at all; 0x4b8: a full symbol.
             put(f, 0x4b0, b"SaySSG");
             put(f, 0x4b8, b"$s4Demo5ShapeV");
+            // 0x4c8: a type in an extension made in another module, as
+            // the head of a generic type and referred back to.
+            let at = put_ref(f, 0x4c8, 1, 0x890);
+            put(f, at, b"ySiG_AAt");
+            // 0x4e0: a protocol and a back-reference to its existential.
+            let at = put_ref(f, 0x4e0, 1, 0x830);
+            put(f, at, b"_p_AAt");
             // The last bytes of the file: no terminator.
             put(f, 0xffe, b"Si");
         });
@@ -2087,9 +2347,14 @@ pub(crate) mod tests {
             read(0x430),
             both("{Demo.Shape}ySiG", "Demo.Shape<Swift.Int>")
         );
-        // The placeholder for a head shifts what `AA` refers to, so the
-        // name is left as stored rather than demangled wrongly.
-        assert_eq!(read(0x440), stored_only("{Demo.Shape}ySiG_AAt"));
+        // `AA` is the first substitution: the type referred to.
+        assert_eq!(
+            read(0x440),
+            both(
+                "{Demo.Shape}ySiG_AAt",
+                "(Demo.Shape<Swift.Int>, Demo.Shape)"
+            )
+        );
         assert_eq!(read(0x450), both("{Demo.Proto}_p", "Demo.Proto"));
         assert_eq!(
             read(0x460),
@@ -2104,7 +2369,8 @@ pub(crate) mod tests {
         assert_eq!(read(0x490), both("{Demo.Shape.Deep}", "Demo.Shape.Deep"));
         let (stored, demangled) = read(0x498);
         assert!(stored.starts_with("{Loop.Loop.") && stored.ends_with(".Loop}"));
-        assert_eq!(demangled.as_deref(), stored.get(1..stored.len() - 1));
+        // Its outermost parent is not known, so neither is its mangling.
+        assert_eq!(demangled, None);
         assert_eq!(
             read(0x4a0),
             both(
@@ -2114,6 +2380,17 @@ pub(crate) mod tests {
         );
         assert_eq!(read(0x4b0), both("SaySSG", "Swift.Array<Swift.String>"));
         assert_eq!(read(0x4b8), both("$s4Demo5ShapeV", "Demo.Shape"));
+        assert_eq!(
+            read(0x4c8),
+            both(
+                "{(extension in Other):Demo.Shape.Far}ySiG_AAt",
+                "((extension in Other):Demo.Shape.Far<Swift.Int>, (extension in Other):Demo.Shape.Far)"
+            )
+        );
+        assert_eq!(
+            read(0x4e0),
+            both("{Demo.Proto}_p_AAt", "(Demo.Proto, Demo.Proto)")
+        );
 
         let name = names.read(0x1460).unwrap();
         assert_eq!(name.references, [0x18f0]);
@@ -2159,42 +2436,114 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn placeholders_keep_back_references() {
-        // 40 exact placeholders in one name: all different, each one
-        // substitution.
-        let mut placeholders = Placeholders::default();
-        let mut mangled = String::new();
+    fn referents_of_symbolic_references() {
+        let reference = |kind: u8, rest: &[u8]| [&[kind, 0, 0, 0, 0][..], rest].concat();
+        let mangling = |text: &[u8]| Referent::Mangling(text.to_vec());
+        let shape = || vec![(1, mangling(b"4Demo5ShapeV"))];
+        // A reference is one substitution, whatever it stands for.
+        assert_eq!(
+            demangle_type(&reference(1, b"ySiG_AAt"), shape()).as_deref(),
+            Some("(Demo.Shape<Swift.Int>, Demo.Shape)")
+        );
+        // 40 references in one name, then back-references to the first
+        // two.
+        let mut name = Vec::new();
+        let mut referents = Vec::new();
         for i in 0..40 {
             if i == 1 {
-                mangled.push('_');
+                name.push(b'_');
             }
-            mangled.push_str(&placeholders.exact(&format!("T{i}")).unwrap());
+            referents.push((
+                name.len() as u32 + 1,
+                mangling(format!("4Demo3T{i:02}V").as_bytes()),
+            ));
+            name.extend(reference(1, b""));
         }
-        mangled.push_str("AAABt");
-        let text = placeholders.demangle(&mangled).unwrap();
+        name.extend(b"AAABt");
         let expected: Vec<String> = (0..40)
-            .map(|i| format!("T{i}"))
-            .chain(["T0".to_string(), "T1".to_string()])
+            .map(|i| format!("Demo.T{i:02}"))
+            .chain(["Demo.T00".to_string(), "Demo.T01".to_string()])
             .collect();
-        assert_eq!(text, format!("({})", expected.join(", ")));
+        assert_eq!(
+            demangle_type(&name, referents).as_deref(),
+            Some(format!("({})", expected.join(", ")).as_str())
+        );
+        // The opaque result type of a declaration, bound to arguments.
+        assert_eq!(
+            demangle_type(
+                &reference(2, b"ySi_Qo_"),
+                vec![(1, mangling(b"4Demo3fooQryFQO"))]
+            )
+            .as_deref(),
+            Some("<<opaque return type of Demo.foo() -> some>>.0")
+        );
+        // Known by address only.
+        assert_eq!(
+            demangle_type(
+                &reference(1, b"ySi_Qo_"),
+                vec![(1, Referent::Address(0x1234))]
+            )
+            .as_deref(),
+            Some("opaque type symbolic reference 0x1234.0")
+        );
+        // A reference without a referent, a referent that is no mangling,
+        // a name the demangler rejects.
+        assert_eq!(demangle_type(&reference(1, b"Sg"), Vec::new()), None);
+        assert_eq!(
+            demangle_type(&reference(1, b"Sg"), vec![(1, mangling(b"4Demo5Sha"))]),
+            None
+        );
+        assert_eq!(demangle_type(&reference(1, b"G"), shape()), None);
+        assert_eq!(demangle_type(b"", Vec::new()), None);
+    }
 
-        // A declaration followed by any `A` is not demangled.
-        let mut name = Rewritten::default();
-        name.text.push_str("SayAAG");
-        assert_eq!(name.checked(), Some("SayAAG"));
-        name.declaration("s7_000000V");
-        assert_eq!(name.checked(), Some("SayAAGs7_000000V"));
-        name.text.push_str("ySiG");
-        assert!(name.checked().is_some());
-        name.text.push_str("7AlphaXX");
-        assert_eq!(name.checked(), None);
+    #[test]
+    fn descriptor_symbols() {
+        let context = |symbol: &[u8]| {
+            let context = descriptor_symbol_context(symbol).unwrap();
+            (context.name, context.module, context.referent)
+        };
+        let mangling = |text: &[u8]| Some(Referent::Mangling(text.to_vec()));
+        assert_eq!(
+            context(b"_$s7SwiftUI4TextVMn"),
+            (
+                "SwiftUI.Text".to_string(),
+                Some("SwiftUI".to_string()),
+                mangling(b"7SwiftUI4TextV")
+            )
+        );
+        // A protocol's symbol leaves out the `P`.
+        assert_eq!(
+            context(b"$s7SwiftUI4ViewMp"),
+            (
+                "SwiftUI.View".to_string(),
+                Some("SwiftUI".to_string()),
+                mangling(b"7SwiftUI4ViewP")
+            )
+        );
+        // Declared in an extension: the module is not the first word.
+        let (name, module, referent) =
+            context(b"_$sSo20NSNotificationCenterC10FoundationE9PublisherVMn");
+        assert_eq!(
+            name,
+            "(extension in Foundation):__C.NSNotificationCenter.Publisher"
+        );
+        assert_eq!(module, None);
+        assert_eq!(
+            referent,
+            mangling(b"So20NSNotificationCenterC10FoundationE9PublisherV")
+        );
+        let (name, _, referent) = context(b"_$s4Demo3fooQryFQOMQ");
+        assert_eq!(name, "<<opaque return type of Demo.foo() -> some>>");
+        assert_eq!(referent, mangling(b"4Demo3fooQryFQO"));
+        assert!(descriptor_symbol_context(b"_$s7SwiftUI4TextVN").is_none());
+        assert!(descriptor_symbol_context(b"_main").is_none());
 
-        // A placeholder that comes out unreplaced fails the name.
-        let mut stray = Placeholders::default();
-        stray.exact("T").unwrap();
-        assert_eq!(stray.demangle("SayBwBwG").as_deref(), Some("T"));
-        assert_eq!(stray.demangle("SayBwBpG"), None);
-        assert_eq!(Placeholders::default().demangle("s7_000000V"), None);
+        assert_eq!(mangled_identifier("Shape").as_deref(), Some(&b"5Shape"[..]));
+        assert_eq!(mangled_identifier(""), None);
+        assert_eq!(mangled_identifier("1st"), None);
+        assert_eq!(mangled_module("Swift").as_deref(), Some(&b"s"[..]));
+        assert_eq!(mangled_module("__C").as_deref(), Some(&b"So"[..]));
     }
 
     #[test]

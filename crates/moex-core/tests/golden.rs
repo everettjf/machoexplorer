@@ -54,11 +54,32 @@ const CASES: &[(&str, &str)] = &[
         "tests/corpus/bin/libmoex_x86_64.dylib",
         "libmoex_x86_64.dylib",
     ),
+    ("tests/corpus/bin/llvm_trivial_ppc.o", "llvm_trivial_ppc.o"),
+    (
+        "tests/corpus/bin/llvm_trivial_ppc64.o",
+        "llvm_trivial_ppc64.o",
+    ),
     ("tests/corpus/bin/objc_arm64", "objc_arm64"),
+    (
+        "tests/corpus/bin/objc_threaded_arm64e",
+        "objc_threaded_arm64e",
+    ),
+    ("tests/corpus/bin/objc_zlib_arm64", "objc_zlib_arm64"),
     ("tests/corpus/bin/objc_x86_64", "objc_x86_64"),
+    ("tests/corpus/bin/reloc_armv7.o", "reloc_armv7.o"),
+    ("tests/corpus/bin/reloc_armv7_arm.o", "reloc_armv7_arm.o"),
+    ("tests/corpus/bin/reloc_armv7_nopic.o", "reloc_armv7_nopic.o"),
+    ("tests/corpus/bin/reloc_i386.o", "reloc_i386.o"),
+    ("tests/corpus/bin/reloc_i386_nopic.o", "reloc_i386_nopic.o"),
     ("tests/corpus/bin/sw_arm64", "sw_arm64"),
     ("tests/corpus/bin/sw_x86_64", "sw_x86_64"),
     ("tests/corpus/bin/swift_arm64", "swift_arm64"),
+    ("tests/corpus/bin/swiftrefs_arm64", "swiftrefs_arm64"),
+    ("tests/corpus/bin/switch_arm64", "switch_arm64"),
+    ("tests/corpus/bin/switch_arm64.o", "switch_arm64.o"),
+    ("tests/corpus/bin/switch_arm64e", "switch_arm64e"),
+    ("tests/corpus/bin/switch_x86_64", "switch_x86_64"),
+    ("tests/corpus/bin/switch_x86_64.o", "switch_x86_64.o"),
 ];
 
 fn repo_root() -> PathBuf {

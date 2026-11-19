@@ -39,6 +39,9 @@ struct Walk<'a> {
     /// The image's preferred load address.
     base: u64,
     steps: u64,
+    /// The symbols pool inflated, when it is stored as a zlib stream
+    /// (`symbols_format` 1) that could be read.
+    inflated: Option<Vec<u8>>,
 }
 
 impl Walk<'_> {
@@ -89,10 +92,17 @@ impl Walk<'_> {
     }
 
     /// Name of `import` from the symbols pool: the bytes up to the
-    /// terminator, searched no further than the end of the blob. `None`
-    /// when the pool is compressed, the offset is outside the blob or the
-    /// name is unterminated.
+    /// terminator, searched no further than the end of the blob (of the
+    /// inflated pool when it is compressed). `None` when the pool's format
+    /// is not known or it cannot be inflated, the offset is outside the
+    /// pool or the name is unterminated.
     fn import_name(&self, import: &ChainedImport) -> Option<String> {
+        if self.header.symbols_format == 1 {
+            let pool = self.inflated.as_deref()?;
+            let bytes = pool.get(usize::try_from(import.name_offset).ok()?..)?;
+            let len = bytes.iter().position(|&c| c == 0)?;
+            return Some(utf8_safe(bytes.get(..len)?));
+        }
         if self.header.symbols_format != 0 {
             return None;
         }
@@ -381,12 +391,22 @@ impl Walk<'_> {
         let Some(entry_size) = ChainedImport::entry_size(header.imports_format) else {
             return;
         };
-        if header.symbols_format != 0 {
-            self.note(
+        match (header.symbols_format, &self.inflated) {
+            (0, _) => {}
+            (1, Some(pool)) => {
+                let size = format!("zlib, {} bytes inflated", pool.len());
+                self.note("imports", "symbols".to_string(), &size);
+            }
+            (1, None) => self.note(
                 "imports",
                 "symbols".to_string(),
-                "compressed symbol names are not decoded",
-            );
+                "the zlib stream of symbol names cannot be read",
+            ),
+            _ => self.note(
+                "imports",
+                "symbols".to_string(),
+                "symbol names are in a format that is not known",
+            ),
         }
         for i in 0..header.imports_count {
             if i >= MAX_IMPORTS {
@@ -443,7 +463,16 @@ pub(super) fn content(mh: &MachHeader, data: &LinkeditData) -> Content {
         header,
         base: mh.base_address(),
         steps: 0,
+        inflated: None,
     };
+    if header.symbols_format == 1 {
+        // The stream runs from the start of the pool to the end of the blob.
+        let pool = u64::from(header.symbols_offset);
+        w.inflated = w
+            .blob_at(pool, 0)
+            .and_then(|at| mh.image.slice(at, w.datasize - pool))
+            .and_then(crate::macho::ptr::inflate);
+    }
     let fields = [
         ("fixups_version", as_string(header.fixups_version)),
         (

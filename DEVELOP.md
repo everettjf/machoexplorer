@@ -16,7 +16,7 @@ has been removed; Qt, CMake and a system Capstone are no longer needed.
 Platform-specific behaviour:
 - Attach by PID (Memory Snapshot) works on macOS only. Attach by PID (Executable Path) is implemented for macOS and Linux.
 - C++ symbol demangling uses the C++ runtime (`libc++abi` on macOS, `libstdc++` on Linux) and the `cpp_demangle` crate on Windows, where the text can differ.
-- Swift demangling uses Swift's own demangler as bundled by the `symbolic-demangle` crate (C++ sources compiled by `cc`, so a C++ compiler is needed to build). It works on every platform and starts no process. Type sugar is not synthesised (`Swift.Optional<Swift.Int>`, not `Swift.Int?`), and manglings newer than the bundled demangler stay mangled.
+- Swift demangling uses Swift's own demangler, bundled as source in `crates/moex-core/vendor/swift` (the subset the `symbolic-demangle` crate ships; see `crates/moex-core/vendor/README.md`) and compiled by `crates/moex-core/build.rs` with `cc`, so a C++ compiler is needed to build. It works on every platform and starts no process. Type sugar is not synthesised (`Swift.Optional<Swift.Int>`, not `Swift.Int?`), and manglings newer than the bundled demangler stay mangled.
 
 ## Workspace layout
 | Path | Contents |

@@ -312,7 +312,7 @@ const MAX_INFLATED_NAMES: u64 = 64 << 20;
 
 /// Inflates a zlib stream; `None` when it is not one. A stream that ends
 /// early or exceeds the bound yields what was read.
-fn inflate(compressed: &[u8]) -> Option<Vec<u8>> {
+pub(crate) fn inflate(compressed: &[u8]) -> Option<Vec<u8>> {
     let mut out = Vec::new();
     let mut decoder = flate2::read::ZlibDecoder::new(compressed).take(MAX_INFLATED_NAMES);
     match decoder.read_to_end(&mut out) {

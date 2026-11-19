@@ -249,11 +249,23 @@ copied from the file that holds it. A sub-cache file that is missing or
 belongs to another cache (different UUID) is skipped; images that need it
 fail with exit code `1` (`segment not in any cache file: ...`).
 
+Local symbols that the cache builder moved out of the images are looked for
+in the cache file itself (old caches) and otherwise in `<cache>.symbols`,
+when the cache's header names such a file (see "Local symbols" below). No
+option is needed. If that file is missing, is not a cache file, has another
+UUID than the header's `symbolFileUUID`, or its data is malformed, a
+`warning: local symbols file not used (...): <path>` line (with `--json`:
+`{"event":"warning","message":"..."}`) goes to stderr and the images are
+extracted without those symbols; the exit code is not affected. When symbols
+were merged into an image, its report line ends with ` local-symbols=N`
+(JSON: `"local_symbols":N`).
+
 What the output file is:
 
 - **Layout.** With `--compact` the segment that holds the Mach-O header
   (`__TEXT`) is at offset 0, the other segments follow in load command
-  order, each at the next 4 KiB boundary, and `__LINKEDIT` is last. Without
+  order (which is address order, see below), each at the next 4 KiB
+  boundary, and `__LINKEDIT` is last. Without
   it (`mode: raw-fileoff`) every segment keeps the file offset recorded in
   its load command. That is only done when the whole image is in one cache
   file and the recorded ranges overlap neither each other nor the header at
@@ -270,6 +282,19 @@ What the output file is:
   the segment before it. `MH_DYLIB_IN_CACHE` is cleared from the header
   flags. Addresses are not changed: segments
   keep the `vmaddr` they have in the cache.
+- **Segment order and attributes.** The cache builder places an image's
+  segments in the cache's regions in another order than its load commands
+  list them (`__AUTH` above `__DATA`, for example). The segment load
+  commands are put in ascending `vmaddr` order, so that addresses and file
+  offsets ascend the way they do in a linked file; the other load commands
+  stay where they are, and the section number (`n_sect`) of every symbol is
+  changed to match. `__DATA_CONST` gets the `SG_READ_ONLY` flag that the
+  builder cleared. A section whose address is not a multiple of its
+  alignment (the builder packs sections without regard to it) gets the
+  largest alignment its address has. The segment order is left alone for an
+  image that has `LC_DYLD_INFO` rebase or bind opcodes, chained fixups or
+  split-segment info, because those name segments or sections by index and
+  are not rewritten; images in a cache normally have none of them.
 - **`__LINKEDIT`.** The cache's shared `__LINKEDIT` (over 1.5 GB on a
   current macOS) is not copied. The output gets a new one with only this
   image's data: the `LC_DYLD_INFO[_ONLY]` tables, the data of
@@ -287,9 +312,35 @@ What the output file is:
   reference table and relocation tables of `LC_DYSYMTAB`, and section
   relocations.
 - **Local symbols.** The symbols are the ones the image's `LC_SYMTAB`
-  points at in the cache. When the cache builder moved local symbols to the
-  separate `.symbols` file, that file is not read and the output has no
-  local symbols.
+  points at in the cache, plus the local symbols the cache builder moved out
+  of the image, if the cache has such data: a
+  `dyld_cache_local_symbols_info` in the cache file (`localSymbolsOffset` /
+  `localSymbolsSize` of the header; old caches) or in the `<cache>.symbols`
+  file whose UUID is the header's `symbolFileUUID` (current iOS-family
+  caches). The image's entry there is found by the file offset of its header
+  (32-bit entries, old caches) or by the offset of its address from the
+  cache's base address (64-bit entries). Those symbols go first in the
+  symbol table, with their names added to the string table; the image's own
+  local symbols named `<redacted>` (the placeholder the builder leaves) are
+  left out, and an indirect symbol table entry that named one becomes
+  `INDIRECT_SYMBOL_LOCAL`. `LC_SYMTAB` and the `LC_DYSYMTAB` ranges count
+  the result. A macOS cache has no such data: its images keep their local
+  symbols, and nothing is merged.
+- **Apple's tools.** `otool`, `nm`, `size`, `lipo` and `dyld_info` read the
+  output. `dyld_info` checks a file before it prints anything; with the
+  segment order and attributes above it accepts the extracted images
+  (`-segments`, `-exports`, `-imports`, `-objc`, `-function_starts`,
+  `-disassemble`, ...). `dyld_info -fixups` prints an empty table, which is
+  what the image has: see the next point.
+- **What is not undone.** The output is for analysis, not for loading.
+  Segments keep their cache addresses, so they are gigabytes apart and need
+  not start or end on a page boundary. The cache builder applied the
+  image's rebases and binds and removed that information; pointers in the
+  data segments are stored the way the cache stores them, and no fixup
+  table describes them. Stub sections the builder emptied
+  (`__auth_stubs`, `__objc_stubs`, size 0) stay empty: calls go where the
+  builder pointed them, often into other images. There is no code
+  signature.
 
 An image whose linkedit data is not inside its `__LINKEDIT` segment, or
 whose symbol, string or indirect symbol tables are inconsistent, is not

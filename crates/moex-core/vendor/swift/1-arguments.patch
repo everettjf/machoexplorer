@@ -1,0 +1,45 @@
+commit 7dddbd0e4b5ba23e640c1a4d531dc148f6d18aca
+Author: David Herberth <david.herberth@sentry.io>
+Date:   Mon May 18 14:50:49 2026 +0200
+
+    patch
+
+diff --git a/symbolic-demangle/vendor/swift/include/swift/Demangling/Demangle.h b/symbolic-demangle/vendor/swift/include/swift/Demangling/Demangle.h
+index 7a1b6c4a..3df6b0b9 100644
+--- a/symbolic-demangle/vendor/swift/include/swift/Demangling/Demangle.h
++++ b/symbolic-demangle/vendor/swift/include/swift/Demangling/Demangle.h
+@@ -62,6 +62,7 @@ struct DemangleOptions {
+   bool ShortenArchetype = false;
+   bool ShowPrivateDiscriminators = true;
+   bool ShowFunctionArgumentTypes = true;
++  bool ShowFunctionReturnType = true;
+   bool DisplayDebuggerGeneratedModule = true;
+   bool DisplayStdlibModule = true;
+   bool DisplayObjCModule = true;
+@@ -94,6 +95,7 @@ struct DemangleOptions {
+     Opt.ShortenArchetype = true;
+     Opt.ShowPrivateDiscriminators = false;
+     Opt.ShowFunctionArgumentTypes = false;
++    Opt.ShowFunctionReturnType = false;
+     Opt.ShowAsyncResumePartial = false;
+     return Opt;
+   };
+diff --git a/symbolic-demangle/vendor/swift/lib/Demangling/NodePrinter.cpp b/symbolic-demangle/vendor/swift/lib/Demangling/NodePrinter.cpp
+index 66840b56..7430062a 100644
+--- a/symbolic-demangle/vendor/swift/lib/Demangling/NodePrinter.cpp
++++ b/symbolic-demangle/vendor/swift/lib/Demangling/NodePrinter.cpp
+@@ -945,10 +945,11 @@ void NodePrinter::printFunctionType(NodePointer LabelList, NodePointer node,
+   if (isSendable)
+     Printer << "@Sendable ";
+
+-  printFunctionParameters(LabelList, node->getChild(argIndex), depth,
+-                          Options.ShowFunctionArgumentTypes);
++  if (Options.ShowFunctionArgumentTypes) {
++    printFunctionParameters(LabelList, node->getChild(argIndex), depth, true);
++  }
+
+-  if (!Options.ShowFunctionArgumentTypes)
++  if (!Options.ShowFunctionReturnType)
+     return;
+
+   if (isAsync)

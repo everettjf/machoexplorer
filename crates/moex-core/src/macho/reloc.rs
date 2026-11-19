@@ -11,6 +11,17 @@ pub const ENTRY_SIZE: u64 = 8;
 // `r_type` values this crate interprets.
 /// Every architecture: a plain pointer (`*_RELOC_VANILLA` / `_UNSIGNED`).
 pub const RELOC_UNSIGNED: u8 = 0;
+/// Every architecture with scattered entries: the second entry of a pair.
+pub const RELOC_PAIR: u8 = 1;
+pub const GENERIC_RELOC_SECTDIFF: u8 = 2;
+pub const GENERIC_RELOC_PB_LA_PTR: u8 = 3;
+pub const GENERIC_RELOC_LOCAL_SECTDIFF: u8 = 4;
+pub const ARM_RELOC_SECTDIFF: u8 = 2;
+pub const ARM_RELOC_LOCAL_SECTDIFF: u8 = 3;
+pub const ARM_RELOC_BR24: u8 = 5;
+pub const ARM_THUMB_RELOC_BR22: u8 = 6;
+pub const ARM_RELOC_HALF: u8 = 8;
+pub const ARM_RELOC_HALF_SECTDIFF: u8 = 9;
 pub const X86_64_RELOC_SIGNED: u8 = 1;
 pub const X86_64_RELOC_BRANCH: u8 = 2;
 pub const X86_64_RELOC_GOT_LOAD: u8 = 3;

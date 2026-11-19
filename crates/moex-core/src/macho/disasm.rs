@@ -6,15 +6,16 @@ pub mod extra;
 use super::{MachHeader, Section};
 use crate::consts::{
     CPU_SUBTYPE_MASK, CPU_TYPE_ARM, CPU_TYPE_ARM64, CPU_TYPE_ARM64_32, CPU_TYPE_I386,
-    CPU_TYPE_POWERPC, CPU_TYPE_POWERPC64, CPU_TYPE_X86_64,
+    CPU_TYPE_X86_64, MH_OBJECT,
 };
 use crate::hex::{as_short_hex_string, utf8_safe};
-use capstone::{Arch, Capstone, Endian, ExtraMode, Insn, Mode};
+use capstone::{Arch, Capstone, ExtraMode, Insn, Mode};
 use std::collections::HashMap;
 
 const N_STAB: u8 = 0xe0;
 const N_TYPE: u8 = 0x0e;
 const N_SECT: u8 = 0x0e;
+const N_ABS: u8 = 0x02;
 /// `n_desc` bit of a symbol that names a Thumb function.
 const N_ARM_THUMB_DEF: u16 = 0x0008;
 
@@ -158,8 +159,14 @@ pub fn regions(mh: &MachHeader, section: &Section, len: usize) -> Vec<Region> {
         .iter()
         .filter_map(|d| {
             // Entry offsets are relative to the Mach-O header, like the
-            // section's own `offset` field.
-            let start = (d.offset as u64).checked_sub(section.offset as u64)?;
+            // section's own `offset` field. In an object file they are
+            // addresses instead (the assembler writes the address of the
+            // label that starts the range).
+            let start = if mh.filetype == MH_OBJECT {
+                (d.offset as u64).checked_sub(section.addr)?
+            } else {
+                (d.offset as u64).checked_sub(section.offset as u64)?
+            };
             let end = (start + d.length as u64).min(len as u64);
             (start < end).then_some((start as usize, end as usize, d.kind))
         })
@@ -377,24 +384,19 @@ impl ExtraSet {
 
 impl Disassembler {
     /// Engines for a Mach-O CPU type: x86 (32/64), ARM (ARM and Thumb),
-    /// ARM64 (also for arm64_32) and big-endian PowerPC (32/64). `detail`
-    /// turns on operand details.
+    /// ARM64 (also for arm64_32). `detail` turns on operand details.
     pub fn new(cputype: u32, cpusubtype: u32, detail: bool) -> Result<Self, DisasmError> {
         let (arch, mode, unit) = match cputype {
             CPU_TYPE_I386 => (Arch::X86, Mode::Mode32, 1),
             CPU_TYPE_X86_64 => (Arch::X86, Mode::Mode64, 1),
             CPU_TYPE_ARM => (Arch::ARM, Mode::Arm, 4),
             CPU_TYPE_ARM64 | CPU_TYPE_ARM64_32 => (Arch::ARM64, Mode::Arm, 4),
-            CPU_TYPE_POWERPC => (Arch::PPC, Mode::Mode32, 4),
-            CPU_TYPE_POWERPC64 => (Arch::PPC, Mode::Mode64, 4),
             _ => return Err(DisasmError::UnsupportedArch),
         };
-        // Mach-O PowerPC is big-endian; everything else here is little.
-        let endian = (arch == Arch::PPC).then_some(Endian::Big);
         let engine = |mode: Mode| {
             let extra =
                 (cputype == CPU_TYPE_ARM && is_m_profile(cpusubtype)).then_some(ExtraMode::MClass);
-            let mut cs = Capstone::new_raw(arch, mode, extra.into_iter(), endian)
+            let mut cs = Capstone::new_raw(arch, mode, extra.into_iter(), None)
                 .map_err(|_| DisasmError::Init)?;
             cs.set_detail(detail).map_err(|_| DisasmError::Init)?;
             // Undecodable bytes come back as data instead of ending the run.
@@ -581,7 +583,14 @@ impl SymbolLookup {
         };
         for sym in symtab.symbols() {
             let defined = sym.n_type & N_STAB == 0 && sym.n_type & N_TYPE == N_SECT;
-            if (sym.n_value == 0 && !(defined_at_zero && defined)) || sym.n_strx == 0 {
+            // Only a symbol defined in a section or absolute has an
+            // address: the value of an undefined one is the size of a
+            // common symbol, that of a debug entry need not be an address.
+            let has_address = defined || (sym.n_type & N_STAB == 0 && sym.n_type & N_TYPE == N_ABS);
+            if !has_address
+                || (sym.n_value == 0 && !(defined_at_zero && defined))
+                || sym.n_strx == 0
+            {
                 continue;
             }
             let name = symtab.string_bytes(sym.n_strx);
@@ -815,25 +824,9 @@ mod tests {
     }
 
     #[test]
-    fn powerpc_is_big_endian() {
-        // mflr r0 ; bl 0x100c ; (not an instruction) ; blr
-        let code = [
-            0x7c, 0x08, 0x02, 0xa6, 0x48, 0x00, 0x00, 0x09, 0x00, 0x00, 0x00, 0x01, 0x4e, 0x80,
-            0x00, 0x20,
-        ];
-        let mut out = Vec::new();
-        Disassembler::new(CPU_TYPE_POWERPC, 0, false)
-            .unwrap()
-            .run(&code, 0x1000, &[code_region(0, 16, false)], |item| {
-                out.push(match item {
-                    Item::Code { insn, .. } => insn_text(insn),
-                    Item::Extra { insn, .. } => insn.text(),
-                    Item::Data { bytes, .. } => data_text_in(bytes, true),
-                })
-            })
-            .unwrap();
-        assert_eq!(out, ["mflr r0", "bl 0x100c", ".long 0x00000001", "blr"]);
-        assert!(Disassembler::new(CPU_TYPE_POWERPC64, 0, false).is_ok());
+    fn data_rows_follow_the_byte_order() {
+        // A CPU type without an engine (PowerPC).
+        assert!(Disassembler::new(18, 0, false).is_err());
         assert_eq!(data_text_in(&[0x12, 0x34], true), ".short 0x1234");
         assert_eq!(data_text_in(&[0x12, 0x34], false), ".short 0x3412");
         assert_eq!(data_text_in(&[1, 2, 3], true), ".byte 0x01, 0x02, 0x03");

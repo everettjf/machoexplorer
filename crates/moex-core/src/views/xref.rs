@@ -33,7 +33,11 @@ impl Symbols {
             // (the first function of an object file).
             let in_section = sym.n_type & 0xe0 == 0 && sym.n_type & 0x0e == 0x0e;
             let external = sym.n_type & 0x01 != 0;
-            if sym.n_strx == 0 || (sym.n_value == 0 && !in_section) {
+            // An undefined symbol has no address (the value of a common
+            // symbol is its size), and a debug entry's value need not be
+            // one.
+            let absolute = sym.n_type & 0xe0 == 0 && sym.n_type & 0x0e == 0x02;
+            if sym.n_strx == 0 || !(in_section || (absolute && sym.n_value != 0)) {
                 continue;
             }
             // The first named symbol at an address wins, except that an

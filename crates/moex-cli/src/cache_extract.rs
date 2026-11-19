@@ -110,9 +110,36 @@ pub fn run(args: &[String]) -> ExitCode {
         compact: o.compact,
         dry_run: o.dry_run,
     };
+    // Local symbols the cache builder moved out of the images (old caches:
+    // in the cache file; current ones: `<cache>.symbols`). Extraction goes
+    // on without them when the data cannot be used.
+    let locals = match LocalSymbols::open(&cache, Some(Path::new(&o.cache))) {
+        Ok(locals) => locals,
+        Err(why) => {
+            let mut line = Vec::new();
+            if o.json {
+                line.extend_from_slice(b"{\"event\":\"warning\",\"message\":\"");
+                line.extend_from_slice(&json_escape(why.as_bytes()));
+                line.extend_from_slice(b"\"}");
+            } else {
+                line.extend_from_slice(format!("warning: {why}").as_bytes());
+            }
+            err_line(&line);
+            None
+        }
+    };
     let cancel = AtomicBool::new(false);
     let extract_one = |image: &CacheImage, output: &Path| -> bool {
-        match extract_image(&cache, image, output, &options, &cancel, &mut |_| {}) {
+        let locals = locals.as_ref();
+        match extract_image(
+            &cache,
+            image,
+            output,
+            &options,
+            locals,
+            &cancel,
+            &mut |_| {},
+        ) {
             Ok(outcome) => {
                 out(&if o.json {
                     outcome.json()
